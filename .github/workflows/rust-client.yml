@@ -1,0 +1,47 @@
+name: Rust client
+on:
+  push:
+    paths: ['clients/rust/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/rust-client.yml']
+  pull_request:
+    paths: ['clients/rust/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/rust-client.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+          - runner: ubuntu-24.04-arm
+          - runner: macos-15-intel
+          - runner: macos-15
+          - runner: windows-2022
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Linux compiler dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
+      - name: Build server binary
+        shell: bash
+        run: |
+          cargo build --locked --features replication --bin murmur-server --bin murmur-admin
+          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/target/debug/murmur-server${{ runner.os == 'Windows' && '.exe' || '' }}" >> $GITHUB_ENV
+      - name: Clippy
+        working-directory: clients/rust
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Tests
+        working-directory: clients/rust
+        run: cargo test --locked -- --test-threads=2
+      - name: Examples
+        working-directory: clients/rust
+        shell: bash
+        run: |
+          for ex in basic tables backup metrics files tls keys replication policies bridge json search; do
+            cargo run --locked --example $ex
+          done

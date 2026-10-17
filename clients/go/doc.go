@@ -1,9 +1,13 @@
-// Package murmur embeds the Murmur Rust database through cgo. Managed databases
-// keep one SQLite database in memory and persist/replicate through native workers.
+// Package murmur connects to a Murmur server over the PostgreSQL wire
+// protocol using database/sql. SQL is the SQLite dialect; parameters use $N.
 //
-// Obtain Options with DefaultOptions, open a database, migrate its schema, and
-// execute application SQL with DB.Read or DB.Transaction. SQL, statements and rows
-// are scoped to the callback's OS thread. Return errors from callbacks; do not call
-// runtime.Goexit. Call Flush for a durability barrier and explicitly close owned
-// handles. Native binaries must first be built with build.sh or build.ps1.
+// Every physical connection unlocks itself with the configured encryption
+// key before use (see MURMUR UNLOCK in the server manual). DDL runs through
+// server-side migrations, DML autocommits per statement, and MURMUR FLUSH
+// provides a durability barrier. Use SetTableReplicated and TableReplication
+// for per-table replication flags stored in the server's config.toml.
+// SetColumnFTS changes persistent column schema declarations; ColumnFTS reports
+// local index status and RefreshIndexes waits for local search maintenance.
+// SetColumnVector and ColumnVectors provide equivalent vector declarations
+// and status; embeddings are application-supplied little-endian float32 BLOBs.
 package murmur

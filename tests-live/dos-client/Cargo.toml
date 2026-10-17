@@ -4,7 +4,9 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-murmur-live-harness = { path = "../harness" }
+murmur-live-harness = { package = "murmur-live-sql-harness", path = "../sql-harness" }
+murmur-client = { path = "../../clients/rust" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-tokio = { version = "1", features = ["rt", "time"] }
+rustls-pemfile = "2"

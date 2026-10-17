@@ -49,11 +49,11 @@ honest snapshot path with bit-identical digests.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
+- Multi-process `murmur-server` cluster over PostgreSQL wire SQL and QUIC
+  replication instead of `testnode` daemon processes over HTTPS+mTLS.
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`) instead of the
   managed typed-records HTTP API; digests are newline-joined names.
-- Close/reopen replaces process stop/start (no SIGKILL leg in this scenario).
+- Process stop/start via harness `stop_node`/`start_node`.
 - Snapshot trust is configured up front (every node trusts every node; the
   victim additionally trusts the attacker id and origin key) instead of by
   editing the victim's config file before restart. The empty-trust default
@@ -75,7 +75,7 @@ honest snapshot path with bit-identical digests.
   snapshot is staged`). The honest leg succeeding proves the discard.
 - The attacker collects patiently across quiet 500 ms slices (Go returns on
   the first quiet slice); strictly more waiting, same assertions.
-- Commit cursor (`Database::status().committed`) stands in for the Go state
+- Commit cursor from `MURMUR SHOW REPLICATION` stands in for the Go state
   generation metric.
 - Survivor writes flush per row: the product mints one replication log entry
   per flush batch rather than per SQL transaction, so the 60 writes need 60
@@ -84,5 +84,9 @@ honest snapshot path with bit-identical digests.
 ## Compile check (only gate; never run here)
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/corrupt-snapshot/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/corrupt-snapshot/Cargo.toml
 ```
+
+The raw-QUIC attacker is the shared harness fixture
+(`murmur_live_harness::attacker`), which reuses the product
+wire-format/crypto implementation instead of forking it.

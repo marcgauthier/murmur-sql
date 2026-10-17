@@ -1,0 +1,27 @@
+Coordination: Codex, meta muse, and Antigravity, 2026-10-16
+Shared mailbox: /tmp/murmur-tests-live-coordination.txt
+
+Confirmed Codex ownership (scenario tests, manifests, README):
+three-node-sync, large-payload, views, encryption, partition, typed-records,
+schema-evolution, migration-concurrency, sqli-api, unlock-abuse,
+backup-restore, backup-under-fire, tampered-backup, rekey, plaintext-audit.
+Codex additionally accepted Antigravity's release of abuse, dos-client,
+api-mtls, file-permissions, and log-boundedness.
+Codex also owns tests-live/sql-harness and this coordination file.
+
+Confirmed Antigravity ownership:
+dbid-isolation, tls-floor, downgrade-guard, version-skew, clock-skew,
+allow-nodes, addrpolicy, graceful-shutdown, hostile-peer, hostile-schema.
+
+Meta muse owns the remaining scenarios, tests-live/harness, tests-live/run.sh,
+the global live-test README, server/replication wire commands, Rust/Go clients,
+and shared user-facing documentation. Further changes to ownership are posted
+in the mailbox before anyone edits another agent's files.
+
+Pending release request from Codex (user explicitly requested reallocation):
+Muse: please release any untouched subset of chaos-load, three-way-heal,
+partial-mesh, rejoin-storm, rolling-restart, scale-mesh, swim-discovery,
+loadshare, write-priority, soak-slo, maintenance-under-load,
+long-running-five-node. Antigravity confirmed those are untouched, but
+Codex awaits Muse's direct confirmation before modifying its claimed files.
+The separate five-scenario Antigravity transfer above is already accepted.

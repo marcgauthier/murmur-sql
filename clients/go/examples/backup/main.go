@@ -1,75 +1,72 @@
+// Example backup saves a datetime-named archive, lists it, downloads and
+// re-uploads it, then restores from it.
 package main
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+
 	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/demo"
+	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
 )
 
-func run(ctx context.Context, e *demo.Env) error {
-	db, err := e.Open("db", demo.Options())
-	if err != nil {
-		return err
-	}
-	if err = db.Migrate(murmur.NewMigration("CREATE TABLE docs(id INTEGER PRIMARY KEY,title TEXT)")); err != nil {
-		return err
-	}
-	if _, err = db.Exec("INSERT INTO docs VALUES(1,'point in time')"); err != nil {
-		return err
-	}
-	backup := e.Path("backup")
-	if err = db.Backup(backup); err != nil {
-		return err
-	}
-	if err = murmur.VerifyBackup(backup, e.Key[:]); err != nil {
-		return err
-	}
-	if _, err = db.Exec("UPDATE docs SET title='newer write'"); err != nil {
-		return err
-	}
-	freshDB, err := demo.ID()
-	if err != nil {
-		return err
-	}
-	freshNode, err := demo.ID()
-	if err != nil {
-		return err
-	}
-	for _, name := range []string{"restored", "fresh"} {
-		restore := murmur.RestoreOptions{}
-		if name == "fresh" {
-			restore.NewDatabaseID = &freshDB
-			restore.NewNodeID = &freshNode
-		}
-		if err = murmur.Restore(backup, e.Path(name), e.Key[:], restore); err != nil {
-			return err
-		}
-		recovered, err := e.Open(name, murmur.DefaultOptions())
+func main() {
+	run.Main(func(t servertest.TB, dir string) {
+		ctx := context.Background()
+		server := servertest.Start(t, dir, servertest.Options{})
+		db, err := murmur.Open(ctx, murmur.Config{
+			Host: "127.0.0.1", Port: server.Port,
+			User: "admin", Password: "test-password", Key: "example-key",
+		})
 		if err != nil {
-			return err
+			t.Fatalf("open: %v", err)
 		}
-		title, err := demo.Text(recovered, "SELECT title FROM docs")
-		if err != nil {
-			return err
-		}
-		if err = demo.Require(title == "point in time", "backup was not point-in-time"); err != nil {
-			return err
-		}
-		if name == "fresh" {
-			id, err := recovered.DatabaseID()
+		defer db.Close()
+		must := func(err error) {
 			if err != nil {
-				return err
-			}
-			node, err := recovered.NodeID()
-			if err != nil {
-				return err
-			}
-			if err = demo.Require(id == freshDB && node == freshNode, "restore identity mismatch"); err != nil {
-				return err
+				t.Fatalf("%v", err)
 			}
 		}
-	}
-	e.Print("Verified point-in-time backup; restored original and fresh identities")
-	return nil
+
+		_, err = db.ExecContext(ctx,
+			`CREATE TABLE docs(id INTEGER PRIMARY KEY, v TEXT NOT NULL)`)
+		must(err)
+		_, err = db.ExecContext(ctx, "INSERT INTO docs VALUES (1, 'v1')")
+		must(err)
+
+		saved, err := db.BackupSave(ctx)
+		must(err)
+		fmt.Printf("saved %s (%d bytes)\n", saved.Name, saved.Size)
+
+		files, err := db.BackupList(ctx)
+		must(err)
+		if len(files) != 1 || files[0].Name != saved.Name {
+			t.Fatalf("list = %+v", files)
+		}
+
+		var downloaded bytes.Buffer
+		must(db.BackupDownload(ctx, saved.Name, &downloaded))
+		if int64(downloaded.Len()) != saved.Size {
+			t.Fatalf("downloaded %d bytes, want %d", downloaded.Len(), saved.Size)
+		}
+		copyName := "copy-" + saved.Name
+		must(db.BackupUpload(ctx, copyName, bytes.NewReader(downloaded.Bytes())))
+		files, err = db.BackupList(ctx)
+		must(err)
+		if len(files) != 2 {
+			t.Fatalf("list after upload = %+v", files)
+		}
+
+		_, err = db.ExecContext(ctx, "INSERT INTO docs VALUES (2, 'v2')")
+		must(err)
+		must(db.Restore(ctx, saved.Name, "example-key"))
+		var count int
+		must(db.QueryRowContext(ctx, "SELECT count(*) FROM docs").Scan(&count))
+		if count != 1 {
+			t.Fatalf("count after restore = %d, want 1", count)
+		}
+		fmt.Println("backup: verified save, list, download, upload, restore")
+	})
 }
-func main() { demo.Main("backup", run) }

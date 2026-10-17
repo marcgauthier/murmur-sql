@@ -63,11 +63,9 @@ normally throughout.
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`,
   `ORDER BY name`) instead of the managed typed-records HTTP API
   (`TypedInsert`, `TypedNames`).
-- Session counts come from the replication `Handle::status().peers`
-  instead of `/v1/status` `connected_peers`; the Go refusal-counter
-  legs are ported as latched `last_error` probes (no per-cause
-  refusal counters exist), sampled every round.
-- No shared-harness addition was required by this scenario.
+- Session counts and refusal causes come from `MURMUR SHOW REPLICATION` (`peers` and `last_error`
+  columns) instead of embedded handles; peer adding uses `MURMUR PEER ADD`.
+- Ran against separate `murmur-server` process nodes via `murmur-live-sql-harness`.
 
 ## Compile check (only gate; never run here)
 

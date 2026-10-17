@@ -233,14 +233,13 @@ fn collect_at(backend: &dyn Backend, config: &Config, now: u64) -> Result<u64> {
         b"07/replication/retention/last".to_vec(),
         encode(&now)?,
     )])?;
-    // Reclaim only after a pruning pass: quiet passes delete nothing, so
-    // there is nothing new to release, and segment compaction costs ~1s.
-    // Reclaiming on every collect would saturate the storage worker under
-    // frequent collection cadences (e.g. 1s test intervals). Backends
-    // additionally rate-limit reclaims; see `reclaim_retention`.
-    if count > 0 {
-        backend.reclaim_retention()?;
-    }
+    // Reclaim after every pass, including quiet ones: deleting a sealed
+    // file can unblock tombstone drops (and further file deletions)
+    // whose older values lived in that file, so a cross-file delete
+    // cascade needs reclaims with no fresh prunes to drain. Skipping
+    // quiet passes strands that debt forever once pruning completes.
+    // Backends rate-limit physical reclaims; see `reclaim_retention`.
+    backend.reclaim_retention()?;
     Ok(count)
 }
 
@@ -450,11 +449,12 @@ mod tests {
             assert_eq!(collect_at(&b, &config(), NOW).unwrap(), expected);
             let events = b.events.lock().unwrap();
             if expected > 0 {
-                assert_eq!(&events[..2], ["snapshot", "prune:3:4"]);
+                assert_eq!(&events[..], ["snapshot", "prune:3:4", "reclaim"]);
             } else {
-                assert!(
-                    events.is_empty(),
-                    "quiet pass must skip snapshot/prune/reclaim, got {events:?}"
+                assert_eq!(
+                    &events[..],
+                    ["reclaim"],
+                    "quiet pass must skip snapshot/prune but still reclaim"
                 );
             }
         }

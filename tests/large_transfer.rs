@@ -74,6 +74,7 @@ fn single_large_transaction_converges() {
             "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
         ))
         .unwrap();
+    db.set_replication("items", true).unwrap();
         db.flush().unwrap();
     }
     // One ~4 MiB checkpoint: forces the chunked (multi-message) path.
@@ -136,7 +137,8 @@ fn transaction_above_spool_value_limit_replicates_and_reopens() {
     let first=cfg.remove(0);let second=cfg.remove(0);
     let a=Database::open(temp.path().join("a"),[9;32],opts(first.clone(),OpenMode::CreateNew)).unwrap();
     let b=Database::open(temp.path().join("b"),[9;32],opts(second.clone(),OpenMode::CreateNew)).unwrap();
-    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB NOT NULL)")).unwrap();db.flush().unwrap();}
+    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB NOT NULL)")).unwrap();
+    db.set_replication("items", true).unwrap();db.flush().unwrap();}
     a.transaction(|s|{for id in 0..10 {s.execute("INSERT INTO items VALUES(?,zeroblob(2100000))",[id])?;}Ok(())}).unwrap();a.flush().unwrap();
     b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
     let deadline=Instant::now()+Duration::from_secs(60);while count(&b)!=10 {assert!(Instant::now()<deadline,"large transfer stalled: {:?}",b.replication().unwrap().status());std::thread::sleep(Duration::from_millis(20));}
@@ -167,6 +169,7 @@ fn large_transfer_boundaries_and_oversized_row_recover() {
         let b = Database::open(temp.path().join("b"), [9; 32], opts(second.clone(), OpenMode::CreateNew)).unwrap();
         for db in [&a, &b] {
             db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB NOT NULL)")).unwrap();
+    db.set_replication("items", true).unwrap();
             db.flush().unwrap();
         }
         a.transaction(move |sql| {

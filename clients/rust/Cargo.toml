@@ -1,0 +1,25 @@
+[package]
+name = "murmur-client"
+version = "0.1.0"
+edition = "2024"
+description = "Pure-Rust async client for the Murmur in-memory SQLite server (PostgreSQL wire protocol)"
+publish = false
+
+# Standalone crate (own lockfile), like tests-benchmark: it does not link the
+# Murmur engine, only speaks the wire protocol.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "io-util", "net", "time"] }
+tokio-postgres = "0.7"
+tokio-postgres-rustls = "0.13"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2"
+base64 = "0.22"
+thiserror = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time"] }
+rcgen = "=0.13.2"
+tempfile = "3"
+ed25519-dalek = "2"

@@ -179,3 +179,23 @@ fn test_cli_lifecycle_status_inspect_keys_verify_backup_restore() {
     assert_eq!(count, 2);
     db_restored.close().expect("close restored db");
 }
+
+#[test]
+fn hash_password_prints_argon2_hash() {
+    let out = Command::new(admin_bin())
+        .args(["hash-password", "--password", "s3cret"])
+        .output()
+        .expect("hash-password");
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let hash = String::from_utf8_lossy(&out.stdout);
+    assert!(hash.trim_start().starts_with("$argon2id$"), "output: {hash}");
+    assert!(sqlite_session::server::auth::verify_password(hash.trim(), b"s3cret"));
+    assert!(!sqlite_session::server::auth::verify_password(hash.trim(), b"other"));
+
+    // Empty passwords are rejected rather than hashed.
+    let out = Command::new(admin_bin())
+        .args(["hash-password", "--password", ""])
+        .output()
+        .expect("hash-password empty");
+    assert!(!out.status.success());
+}

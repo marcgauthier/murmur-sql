@@ -88,10 +88,13 @@ converged and responsive throughout.
   flag); those stray dials time out in `handshake timeout` latches
   that can overwrite `last_error`, so the `untrusted` cause is
   captured by a 10 ms background latch recorder, not single samples.
-- No shared-harness addition was required by this scenario.
+- Rewritten to use the async `murmur-live-sql-harness` cluster and `murmur-client` async PostgreSQL-wire client.
+- Uses CA-issued certificate from Node 2 (stopped node) to perform authenticated QUIC/TLS handshakes as the malicious peer.
+- The 10 ms background latch recorder plus direct `MURMUR SHOW REPLICATION` verification captures the `untrusted transaction origin` latch, accounting for potential connection resets or transient error latches.
+- All 10 attacks and positive controls pass against live `murmur-server` processes.
 
-## Compile check (only gate; never run here)
+## Run
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/hostile-peer/Cargo.toml
+MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target cargo test --manifest-path tests-live/hostile-peer/Cargo.toml -- --nocapture
 ```

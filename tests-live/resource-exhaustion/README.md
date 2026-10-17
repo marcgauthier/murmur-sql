@@ -9,11 +9,13 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/resource-exhaustion/`
 Each ported leg squeezes real nodes and demands the same contract: fail
 closed under pressure, stay exactly converged after.
 
-- `stalled_compaction_stays_correct`: a 32 MiB-segment victim piles sealed
-  `.spool` debt under 64 KiB update churn while the 256 MiB control does
-  not (stall proof: victim >= 3 segments and ahead); exact convergence
-  holds under the stall; after dropping the override + restart + retention
-  collection, dead segments drain and the digest is stable.
+- `stalled_compaction_stays_correct`: background reclamation stalled
+  (`retention_interval` 3600 s, Go: `ReclaimIntervalSeconds`), a
+  66 MiB-segment victim piles sealed `.spool` debt under 64 KiB update
+  churn while the 256 MiB control does not (stall proof: victim >= 3
+  segments and ahead); exact convergence holds under the stall; after
+  dropping the override + restart + retention collection, dead segments
+  drain and the digest is stable.
 - `slow_peer_converges_without_wedge`: replication crosses userspace UDP
   throttle proxies both directions (default 256 KiB/s, no privileges);
   the slow node must make steady progress (90 s without progress = wedge
@@ -51,26 +53,45 @@ closed under pressure, stay exactly converged after.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` clusters instead of daemon processes; plain
-  SQL replaces the typed-contention HTTP API (`contention(id, name)`).
-- Ordered-vec equality replaces SHA-256 digests (identical strength), and
-  in-process reads have no client timeout, so huge tables need no
-  digest segmenting.
-- The Database layer runs no background spool reclaim
-  (`reclaim_interval = None`), so the stall is purely segment-size debt
-  and "re-enable" maps to explicit retention collection (which drives
-  the internal reclaim) after dropping the override + restart.
-- Rejection trips the default 64 MiB *transaction* budget via one 9 x 8
-  MiB transaction (Rust has no per-value limit; each value stays under
-  the 16 MiB spool value cap so only the transaction budget trips).
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS (per
+  design); plain SQL replaces the typed-contention HTTP API
+  (`contention(id, name)`). Tables are explicitly flagged replicated on
+  each node. The rejection surfaces as a PG-wire error (SQLSTATE 54000)
+  whose message still names `budget exceeded`.
+- Ordered-vec equality replaces SHA-256 digests (identical strength).
+- Go's victim-only `ReclaimIntervalSeconds: 3600` stall maps to a global
+  `retention_interval` of 3600 s: every retention checkpoint, prune, and
+  physical reclaim is collect-gated (the capture-path snapshot
+  thresholds, 128 deltas / 256 MiB, never fire here), so the hourly
+  cadence piles debt on both nodes while "re-enable" maps to explicit
+  `MURMUR RETENTION COLLECT` (which drives the internal reclaim and
+  ignores the cadence) after dropping the override + restart.
+- Rejection trips the default 64 MiB *transaction* budget via one
+  statement carrying a 64 MiB + 1 B value (Rust has no per-value
+  limit). A multi-row BEGIN/COMMIT cannot express this: wire
+  transaction words are accepted no-ops, so each statement would
+  autocommit and only trip retryable 40001 pressure mid-stream.
 - The UDP proxy sender polls its two lane channels (std has no `select`;
   1 ms park when empty; priority preference is otherwise exact) and uses
   kernel-default socket buffers (std has no read-buffer API).
 - Deterministic xorshift64* replaces `math/rand` for incompressible
   values (no new dependencies).
-- This scenario needed two small harness additions (same as Go's
-  `SpoolByNode`): `SpoolOptions`/`spool_by_node` + `set_spool_options`,
-  and `add_peer_addr` for proxied dialing.
+- The compaction leg uses the harness `SpoolOptions`/`spool_by_node` +
+  `set_spool_options` overlays (same as Go's `SpoolByNode`); the
+  slow-peer leg dials through the proxies with `add_peer_addr`.
+- The compaction victim uses 66 MiB segments (Go: 32 MiB): the Rust
+  product rejects `segment_bytes <= 64 MiB`. Spool write overhead
+  lands ~3x logical bytes, so 1000 updates of 64 KiB churn
+  (~77 MiB, Go: 2000) still seal ~4 victim segments while the
+  256 MiB control holds ~1 (the count is a means to pile debt, not
+  a pass criterion). Writes flush every 20 instead of per-write
+  (same bytes and supersede pattern; each ~1.3 MiB capture stays
+  far under budget): per-write barriers would cost past the 600 s
+  run cap at debug-build flush throughput. Each batch paces to
+  the control's applied counter (lag 5) so the debug-build control
+  never faces an unbounded backlog (background retention is stalled,
+  so the backlog is pruned only by the explicit drain collects).
 
 ## Compile check (only gate; never run here)
 

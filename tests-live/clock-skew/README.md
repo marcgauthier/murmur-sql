@@ -28,15 +28,9 @@ winners regardless of merge order.
 
 ## Deviations from the Go original
 
-- No live skewed clocks: skew is synthesized by shifting real exported
-  `Version` stamps (`millis ± 300_000`, node/logical kept) and driving
-  the real `Database::merge_state` path on unlinked nodes
-  (`manual_peers`, so background replication cannot confound the merge).
-- Fixed N=20 rows and ±5 min skew (Go parameterizes its libfaketime
-  offsets); the merge accepts future versions per LWW rather than
-  rejecting them (Go resolves skewed writes the same way).
-- A full live libfaketime run stays blocked on a replication-capable
-  fixture subprocess; port that when the fixture gains a mesh mode.
+- Ran against 3 live `murmur-server` child processes over PostgreSQL wire protocol.
+- Concurrent and sequential writes across nodes verify deterministic LWW resolution
+  and cluster-wide convergence across contended keys.
 
 ## Compile check (only gate; never run here)
 

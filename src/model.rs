@@ -89,6 +89,12 @@ pub(crate) enum PolicyOperation {Counter(i64),Add(Value),Remove(Value),Min(Value
 pub(crate) struct PolicyIntent {pub table:String,pub column:String,pub key:Vec<Value>,pub before:Value,pub operation:PolicyOperation,pub id:[u8;16]}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
+    /// Persistent vector-search declaration; index contents are disposable.
+    #[serde(default)]
+    pub vector: Option<crate::VectorColumnConfig>,
+    /// Include this TEXT column in the table's managed FTS5 index.
+    #[serde(default)]
+    pub fts: bool,
     pub policy: MergePolicy,
     pub id: String,
     pub name: String,
@@ -96,18 +102,28 @@ pub struct Column {
     pub declared_type: String,
     pub not_null: bool,
 }
+/// Original application key retained while SQLite uses the managed UUID key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplicationKey {
+    pub columns: Vec<String>,
+    pub collations: Vec<String>,
+    pub descending: Vec<bool>,
+    pub without_rowid: bool,
+    pub strict: bool,
+    pub conflict: Option<String>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Table {
+    pub application_key: Option<ApplicationKey>,
     pub id: String,
     pub name: String,
     pub sql: String,
     pub columns: Vec<Column>,
 }
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Schema {
     /// Local table replication settings, keyed by stable table ID. Missing means
-    /// enabled. Persisted alongside the schema in Spool, excluded from wire data.
-    #[serde(skip)]
+    /// local-only. Persisted alongside the schema in Spool, excluded from wire data.
     pub table_replication: std::collections::BTreeMap<String, bool>,
     pub tables: Vec<Table>,
     pub indexes: Vec<String>,

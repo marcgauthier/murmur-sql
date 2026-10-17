@@ -1,13 +1,13 @@
 //! Rust port of the Go `impaired-network` live scenario.
 //!
 //! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/impaired-network/`
-//! (`impaired_network_test.go`). A 3-node mesh keeps converging while
-//! tc/netem impairs ONLY the replication ports: (a) +150 ms latency,
-//! (b) 3% packet loss, (c) a 1 Mbit cap during a stale-node snapshot
-//! resync under sustained writes. Membership must stay stable (no false
-//! evictions) and per-row visibility latencies are recorded with relaxed
-//! p95 bounds. Plain SQL replaces the Go typed-contention HTTP API (see
-//! the scenario README.md for deviations).
+//! (`impaired_network_test.go`). A 3-node mesh of `murmur-server` processes
+//! keeps converging while tc/netem impairs ONLY the replication ports:
+//! (a) +150 ms latency, (b) 3% packet loss, (c) a 1 Mbit cap during a
+//! stale-node snapshot resync under sustained writes. Membership must stay
+//! stable (no false evictions) and per-row visibility latencies are recorded
+//! with relaxed p95 bounds. Plain SQL replaces the Go typed-contention HTTP
+//! API (see the scenario README.md for deviations).
 //!
 //! Env-gated like Go: SKIPs without tc/netem + CAP_NET_ADMIN on lo;
 //! `MURMUR_IMPAIRED_NETWORK_FORCE=1` runs the same write/converge
@@ -16,8 +16,7 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use murmur_live_harness::sqlite_session::{Database, Migration};
-use murmur_live_harness::{wait_until, Cluster, ClusterOptions, ReplicationOptions};
+use murmur_live_harness::{wait_until_async, Cluster, ClusterOptions, ReplicationOptions};
 
 /// Contention table DDL (Go: typed contention rows).
 const TABLE_DDL: &str = "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)";
@@ -51,134 +50,166 @@ const EXPIRY_SLEEP: Duration = Duration::from_secs(12);
 const GC_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Ordered contention rows on one node (Go: `TypedContentionRows`).
-fn rows(db: &Database) -> Vec<(String, String)> {
-    db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT id, name FROM contention ORDER BY id")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-    .expect("read contention rows failed")
+async fn rows(cluster: &Cluster, idx: usize) -> Result<Vec<(String, String)>, String> {
+    let db_rows = cluster
+        .node(idx)
+        .query("SELECT id, name FROM contention ORDER BY id", &[])
+        .await
+        .map_err(|e| format!("node{} read contention rows: {e}", idx + 1))?;
+    db_rows
+        .iter()
+        .map(|row| {
+            let id = row
+                .try_get::<_, String>(0)
+                .map_err(|e| format!("node{} decode id: {e}", idx + 1))?;
+            let name = row
+                .try_get::<_, String>(1)
+                .map_err(|e| format!("node{} decode name: {e}", idx + 1))?;
+            Ok((id, name))
+        })
+        .collect()
 }
 
 /// Insert one row (Go: `TypedContentionInsert`).
-fn insert_row(db: &Database, node: usize, id: String, name: &str) {
-    let name = name.to_owned();
-    db.transaction(move |sql| {
-        sql.execute("INSERT INTO contention(id, name) VALUES(?, ?)", (id, name))?;
-        Ok(())
-    })
-    .unwrap_or_else(|e| panic!("node{node} insert failed: {e}"));
-    db.flush()
-        .unwrap_or_else(|e| panic!("node{node} flush after insert failed: {e}"));
+async fn insert_row(cluster: &Cluster, idx: usize, id: String, name: &str) -> Result<(), String> {
+    cluster
+        .node(idx)
+        .execute("INSERT INTO contention(id, name) VALUES($1, $2)", &[&id, &name])
+        .await
+        .map_err(|e| format!("node{} insert failed: {e}", idx + 1))?;
+    cluster
+        .node(idx)
+        .flush()
+        .await
+        .map_err(|e| format!("node{} flush after insert failed: {e}", idx + 1))?;
+    Ok(())
 }
 
 /// Rows named `name` on one node (Go: `countWhere`).
-fn count_where(db: &Database, name: &str) -> usize {
-    rows(db).iter().filter(|(_, n)| n == name).count()
+async fn count_where(cluster: &Cluster, idx: usize, name: &str) -> Result<usize, String> {
+    Ok(rows(cluster, idx).await?.iter().filter(|(_, n)| n == name).count())
 }
 
-/// Discovered-member count, excluding self (Go `membership_count` minus
-/// one; established `swim-discovery` port pattern).
-fn member_count(cluster: &Cluster, node: usize) -> usize {
-    cluster
+/// Discovered-member count, excluding self (Go `membership_count` minus one).
+async fn member_count(cluster: &Cluster, node: usize) -> Result<u64, String> {
+    let rows = cluster
         .node(node)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .members
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", node + 1))?;
+    let cell = rows
+        .first()
+        .and_then(|r| r.get(3).cloned())
+        .ok_or_else(|| format!("node{} SHOW REPLICATION returned no members", node + 1))?;
+    cell.parse::<u64>()
+        .map_err(|e| format!("node{} members {cell:?}: {e}", node + 1))
 }
 
 /// Wait until every node sees `want` discovered members (Go: `waitMembership`).
-fn wait_membership(cluster: &Cluster, want: usize, timeout: Duration) {
-    let converged = wait_until(timeout, MEMBERSHIP_POLL, || {
-        (0..cluster.len()).all(|i| member_count(cluster, i) == want)
-    });
-    assert!(
-        converged,
-        "nodes did not reach membership {want} (excl. self) within {timeout:?}"
-    );
+async fn wait_membership(cluster: &Cluster, want: u64, timeout: Duration) -> Result<(), String> {
+    let converged = wait_until_async(timeout, MEMBERSHIP_POLL, || async {
+        for i in 0..cluster.len() {
+            if member_count(cluster, i).await.unwrap_or(u64::MAX) != want {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    if !converged {
+        return Err(format!("nodes did not reach membership {want} (excl. self) within {timeout:?}"));
+    }
+    Ok(())
 }
 
 /// Require a full healthy membership view on every node: all members
 /// present (Go also checks alive == 2, which has no Rust equivalent;
 /// any eviction still drops the member view and fails here).
-fn assert_stable_membership(cluster: &Cluster) {
+async fn assert_stable_membership(cluster: &Cluster) -> Result<(), String> {
     for i in 0..cluster.len() {
-        assert_eq!(
-            member_count(cluster, i),
-            2,
-            "node{} members = {} during impairment, want 2 (false eviction?)",
-            i + 1,
-            member_count(cluster, i)
-        );
+        let got = member_count(cluster, i).await?;
+        if got != 2 {
+            return Err(format!(
+                "node{} members = {got} during impairment, want 2 (false eviction?)",
+                i + 1
+            ));
+        }
     }
+    Ok(())
 }
 
 /// Wait until `name` is visible exactly once on every node (Go: `waitRowVisible`).
-fn wait_row_visible(cluster: &Cluster, name: &str, timeout: Duration) {
-    let converged = wait_until(timeout, VISIBILITY_POLL, || {
-        (0..cluster.len()).all(|i| count_where(cluster.node(i), name) == 1)
-    });
-    assert!(
-        converged,
-        "row {name:?} not visible on all nodes within {timeout:?}"
-    );
+async fn wait_row_visible(cluster: &Cluster, name: &str, timeout: Duration) -> Result<(), String> {
+    let converged = wait_until_async(timeout, VISIBILITY_POLL, || async {
+        for i in 0..cluster.len() {
+            if count_where(cluster, i, name).await.unwrap_or(usize::MAX) != 1 {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
+    if !converged {
+        return Err(format!("row {name:?} not visible on all nodes within {timeout:?}"));
+    }
+    Ok(())
 }
 
 /// Poll exact counts plus ordered-digest equality, logging counts every
 /// 10 s while waiting (Go: `waitConverged`).
-fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) {
+async fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) -> Result<(), String> {
     let mut last_log = Instant::now();
-    let converged = wait_until(timeout, POLL, || {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
         let mut first: Option<Vec<(String, String)>> = None;
         let mut ok = true;
         for i in 0..cluster.len() {
-            let got = rows(cluster.node(i));
-            if got.len() != want {
-                ok = false;
-                break;
-            }
-            match &first {
-                None => first = Some(got),
-                Some(prev) if *prev == got => {}
+            match rows(cluster, i).await {
+                Ok(got) if got.len() == want => match &first {
+                    None => first = Some(got),
+                    Some(prev) if *prev == got => {}
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                },
                 _ => {
                     ok = false;
                     break;
                 }
             }
         }
-        if !ok && last_log.elapsed() > Duration::from_secs(10) {
+        if ok {
+            return Ok(());
+        }
+        if last_log.elapsed() > Duration::from_secs(10) {
             last_log = Instant::now();
-            let counts: Vec<_> = (0..cluster.len())
-                .map(|i| rows(cluster.node(i)).len())
-                .collect();
+            let mut counts = Vec::new();
+            for i in 0..cluster.len() {
+                counts.push(rows(cluster, i).await.map(|r| r.len()).unwrap_or(usize::MAX));
+            }
             eprintln!("converge progress: counts={counts:?} want={want}");
         }
-        ok
-    });
-    assert!(
-        converged,
-        "nodes did not converge on {want} rows with equal digests within {timeout:?}"
-    );
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!(
+                "nodes did not converge on {want} rows with equal digests within {timeout:?}"
+            ));
+        }
+        tokio::time::sleep(POLL).await;
+    }
 }
 
 /// Wait until one node holds exactly `want` rows (Go: `waitRowCount`).
-fn wait_row_count(cluster: &Cluster, idx: usize, want: usize, timeout: Duration) {
-    let converged = wait_until(timeout, POLL, || {
-        rows(cluster.node(idx)).len() == want
-    });
-    assert!(
-        converged,
-        "node{} count = {}, want {want} within {timeout:?}",
-        idx + 1,
-        rows(cluster.node(idx)).len()
-    );
+async fn wait_row_count(cluster: &Cluster, idx: usize, want: usize, timeout: Duration) -> Result<(), String> {
+    let converged = wait_until_async(timeout, POLL, || async {
+        rows(cluster, idx).await.map(|r| r.len()).unwrap_or(usize::MAX) == want
+    })
+    .await;
+    if !converged {
+        let got = rows(cluster, idx).await.map(|r| r.len()).unwrap_or(usize::MAX);
+        return Err(format!("node{} count = {got}, want {want} within {timeout:?}", idx + 1));
+    }
+    Ok(())
 }
 
 /// Nearest-rank percentile (Go: `percentile`; k = ceil(len*p/100)).
@@ -201,18 +232,13 @@ fn tc_capable() -> (bool, String) {
         return (false, "tc binary not found".into());
     }
     for _ in 0..2 {
-        let show = Command::new("tc")
-            .args(["qdisc", "show", "dev", "lo"])
-            .output();
+        let show = Command::new("tc").args(["qdisc", "show", "dev", "lo"]).output();
         let out = match show {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).into_owned(),
             Ok(o) => {
                 return (
                     false,
-                    format!(
-                        "tc qdisc show failed: {}",
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
+                    format!("tc qdisc show failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
                 )
             }
             Err(e) => return (false, format!("tc qdisc show failed: {e}")),
@@ -259,18 +285,12 @@ fn tc_capable() -> (bool, String) {
 
 /// Remove qdisc 77: when present (Go: `clearImpairment`; always runs).
 fn clear_impairment() {
-    let show = Command::new("tc")
-        .args(["qdisc", "show", "dev", "lo"])
-        .output();
+    let show = Command::new("tc").args(["qdisc", "show", "dev", "lo"]).output();
     match show {
-        Ok(o)
-            if o.status.success()
-                && String::from_utf8_lossy(&o.stdout).contains("77:") => {}
+        Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).contains("77:") => {}
         _ => return,
     }
-    let _ = Command::new("tc")
-        .args(["qdisc", "del", "dev", "lo", "root"])
-        .status();
+    let _ = Command::new("tc").args(["qdisc", "del", "dev", "lo", "root"]).status();
 }
 
 /// Run one tc command; on failure clears the impairment and panics
@@ -281,10 +301,7 @@ fn tc_run(what: &str, args: &[&str]) {
         Ok(o) if o.status.success() => {}
         Ok(o) => {
             clear_impairment();
-            panic!(
-                "tc {what} failed ({})",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
+            panic!("tc {what} failed ({})", String::from_utf8_lossy(&o.stderr).trim());
         }
         Err(e) => {
             clear_impairment();
@@ -300,9 +317,7 @@ fn tc_run(what: &str, args: &[&str]) {
 fn apply_impairment(ports: &[u16], child: &str, args: &[&str]) {
     tc_run(
         "root",
-        &[
-            "qdisc", "replace", "dev", "lo", "root", "handle", "77:", "prio", "bands", "3",
-        ],
+        &["qdisc", "replace", "dev", "lo", "root", "handle", "77:", "prio", "bands", "3"],
     );
     let mut child_args = vec![
         "qdisc".to_owned(),
@@ -339,70 +354,224 @@ fn apply_impairment(ports: &[u16], child: &str, args: &[&str]) {
     }
 }
 
-/// GC run counter on one node (Go: `spedsql_gc_runs_total`).
-fn gc_runs(cluster: &Cluster, idx: usize) -> u64 {
-    cluster
+/// Retention-collection marker on one node: max `last_collection_millis`
+/// across `MURMUR SHOW RETENTION` rows (node-global; repeated per row).
+async fn retention_marker(cluster: &Cluster, idx: usize) -> Result<u64, String> {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .metrics
-        .retention_runs
+        .simple("MURMUR SHOW RETENTION")
+        .await
+        .map_err(|e| format!("node{} SHOW RETENTION: {e}", idx + 1))?;
+    let mut best = 0_u64;
+    let mut seen = false;
+    for row in &rows {
+        if let Some(cell) = row.get(6) {
+            if let Ok(v) = cell.parse::<u64>() {
+                seen = true;
+                best = best.max(v);
+            }
+        }
+    }
+    if !seen {
+        return Err(format!("node{} SHOW RETENTION has no collection marker", idx + 1));
+    }
+    Ok(best)
 }
 
 /// Run on-demand retention passes until one completes past the baseline
-/// (Go: `waitGCPass` on the background ticker; Rust exposes the pass
-/// directly — established `graceful-shutdown` port pattern).
-fn wait_gc_pass(cluster: &Cluster, idx: usize, timeout: Duration) {
-    let base = gc_runs(cluster, idx);
-    let converged = wait_until(timeout, Duration::from_secs(1), || {
+/// (Go: `waitGCPass` on the background ticker; the wire exposes the pass
+/// directly via `MURMUR RETENTION COLLECT`).
+async fn wait_gc_pass(cluster: &Cluster, idx: usize, timeout: Duration) -> Result<(), String> {
+    let base = retention_marker(cluster, idx).await?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
         cluster
             .node(idx)
-            .collect_retention()
-            .expect("retention collection pass");
-        gc_runs(cluster, idx) > base
-    });
-    assert!(converged, "no GC pass observed within {timeout:?}");
+            .simple("MURMUR RETENTION COLLECT")
+            .await
+            .map_err(|e| format!("node{} RETENTION COLLECT: {e}", idx + 1))?;
+        if retention_marker(cluster, idx).await? > base {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("no GC pass observed within {timeout:?}"));
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
 }
 
-/// Log-path activity counters `(received, applied)`: snapshot application
-/// bypasses both, so a flat pair proves the snapshot path (established
-/// `snapshot-resync` port pattern; Go reads
+/// Log-path activity counters `(staged, applied)`: snapshot application
+/// bypasses both, so a flat pair proves the snapshot path (Go reads
 /// `spedsql_repl_snapshots_received_total`, which has no Rust equivalent).
-fn log_counters(cluster: &Cluster, idx: usize) -> (u64, u64) {
-    let metrics = cluster
+async fn log_counters(cluster: &Cluster, idx: usize) -> Result<(u64, u64), String> {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .metrics;
-    (metrics.received_transactions, metrics.applied_transactions)
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", idx + 1))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("node{} SHOW REPLICATION returned no rows", idx + 1))?;
+    if row.len() < 6 {
+        return Err(format!("node{} SHOW REPLICATION has {} columns, want >= 6", idx + 1, row.len()));
+    }
+    let staged = row[4]
+        .parse::<u64>()
+        .map_err(|e| format!("node{} staged {:?}: {e}", idx + 1, row[4]))?;
+    let applied = row[5]
+        .parse::<u64>()
+        .map_err(|e| format!("node{} applied {:?}: {e}", idx + 1, row[5]))?;
+    Ok((staged, applied))
 }
 
 /// Insert rows round-robin and record per-row full-mesh visibility
 /// latency; every row also samples stable membership (Go: `timedWrites`).
-fn timed_writes(
+async fn timed_writes(
     cluster: &Cluster,
     prefix: &str,
     base: usize,
     n: usize,
     per_row: Duration,
-) -> Vec<Duration> {
+) -> Result<Vec<Duration>, String> {
     let mut lat = Vec::with_capacity(n);
     for i in 0..n {
         let name = format!("{prefix}-{i}");
         let id = format!("{:032x}", (base + 1) * 100000 + i);
         let start = Instant::now();
-        insert_row(cluster.node(i % cluster.len()), i % cluster.len() + 1, id, &name);
-        wait_row_visible(cluster, &name, per_row);
+        insert_row(cluster, i % cluster.len(), id, &name).await?;
+        wait_row_visible(cluster, &name, per_row).await?;
         lat.push(start.elapsed());
-        assert_stable_membership(cluster);
+        assert_stable_membership(cluster).await?;
     }
-    lat
+    Ok(lat)
 }
 
-#[test]
-fn impaired_network_converges() {
+fn repl_ports(cluster: &Cluster) -> Vec<u16> {
+    (0..cluster.len()).map(|i| cluster.node_info(i).repl_addr.port()).collect()
+}
+
+async fn run_body(cluster: &mut Cluster, force: bool, rows_n: usize) -> Result<(), String> {
+    // Same schema on every node (Go: typed contention fixture tables),
+    // flagged replicated on each node (row convergence needs the per-node
+    // flag).
+    for i in 0..cluster.len() {
+        cluster
+            .ensure_migrated(i, TABLE_DDL)
+            .await
+            .map_err(|e| format!("migrate node{}: {e}", i + 1))?;
+    }
+    for i in 0..cluster.len() {
+        cluster
+            .node(i)
+            .simple("MURMUR SET TABLE contention REPLICATED true")
+            .await
+            .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
+        cluster
+            .node(i)
+            .flush()
+            .await
+            .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
+    }
+    wait_membership(cluster, 2, MEMBERSHIP_TIMEOUT).await?;
+
+    // Baseline converges unimpaired (honest-path control).
+    let mut base = BASELINE_ROWS;
+    for i in 0..base {
+        insert_row(cluster, 0, format!("{:032x}", 1000 + i), &format!("base-{i}")).await?;
+    }
+    wait_converged(cluster, base, BASELINE_TIMEOUT).await?;
+
+    // Phase (a): +150 ms latency on replication traffic.
+    if force {
+        eprintln!("FORCE mode: NO 150ms latency applied; green here proves the workload only, not impairment tolerance");
+    } else {
+        apply_impairment(&repl_ports(cluster), "netem", &["delay", "150ms"]);
+    }
+    let mut lat = timed_writes(cluster, "lat", base, rows_n, LAT_ROW_TIMEOUT).await?;
+    let p95 = percentile(&mut lat, 95);
+    eprintln!("latency phase: {} rows p95 visibility={p95:?} (bound 15s)", lat.len());
+    if p95 > LAT_P95_BOUND {
+        return Err(format!("p95 visibility {p95:?} exceeds 15s bound"));
+    }
+    if !force {
+        clear_impairment();
+    }
+    base += rows_n;
+
+    // Phase (b): 3% packet loss on replication traffic.
+    if force {
+        eprintln!("FORCE mode: NO 3% loss applied; green here proves the workload only, not impairment tolerance");
+    } else {
+        apply_impairment(&repl_ports(cluster), "netem", &["loss", "3%"]);
+    }
+    let mut lat = timed_writes(cluster, "loss", base, rows_n, LOSS_ROW_TIMEOUT).await?;
+    let p95 = percentile(&mut lat, 95);
+    eprintln!("loss phase: {} rows p95 visibility={p95:?} (bound 30s)", lat.len());
+    if p95 > LOSS_P95_BOUND {
+        return Err(format!("p95 visibility {p95:?} exceeds 30s bound"));
+    }
+    if !force {
+        clear_impairment();
+    }
+    base += rows_n;
+
+    // Phase (c): 1 Mbit cap during a stale-node snapshot resync under
+    // sustained writes.
+    if force {
+        eprintln!("FORCE mode: NO bandwidth cap applied; green here proves the workload only, not impairment tolerance");
+    }
+    for i in 0..5 {
+        insert_row(cluster, 2, format!("{:032x}", 5000 + i), &format!("stale-{i}")).await?;
+    }
+    wait_converged(cluster, base + 5, BASELINE_TIMEOUT).await?;
+    cluster.stop_node(2).await;
+
+    // Survivors write far past the short retention while node 3 is
+    // offline (sustained writes continue below).
+    for i in 0..60 {
+        insert_row(cluster, 0, format!("{:032x}", 6000 + i), &format!("fresh-{i}")).await?;
+    }
+    wait_row_count(cluster, 0, base + 65, COUNT_TIMEOUT).await?;
+    wait_row_count(cluster, 1, base + 65, COUNT_TIMEOUT).await?;
+
+    // Node 3's 10 s retention pin must lapse, then one GC pass must
+    // collect its ranges so the rejoin needs a snapshot. Poll the GC
+    // marker instead of a fixed sleep.
+    tokio::time::sleep(EXPIRY_SLEEP).await;
+    wait_gc_pass(cluster, 0, GC_TIMEOUT).await?;
+
+    // Cap replication throughput, then restart node 3 into it and
+    // keep writing while the snapshot transfers. The restart rebinds a
+    // fresh replication port, so the filters are re-steered after the
+    // restart (replace semantics make the re-apply cheap).
+    if !force {
+        apply_impairment(&repl_ports(cluster), "tbf", &["rate", "1mbit", "burst", "32kbit", "latency", "400ms"]);
+    }
+    cluster.start_node(2).await.map_err(|e| format!("restart stale node3: {e}"))?;
+    if !force {
+        apply_impairment(&repl_ports(cluster), "tbf", &["rate", "1mbit", "burst", "32kbit", "latency", "400ms"]);
+    }
+    cluster.mesh().await.map_err(|e| format!("re-mesh stale node3: {e}"))?;
+    for i in 0..20 {
+        insert_row(cluster, 1, format!("{:032x}", 8000 + i), &format!("sustain-{i}")).await?;
+    }
+    wait_converged(cluster, base + 85, CAPPED_TIMEOUT).await?;
+    let (received, applied) = log_counters(cluster, 2).await?;
+    if (received, applied) != (0, 0) {
+        return Err(format!(
+            "node3 rejoin arrived over the log path (received={received} applied={applied}), want snapshot (log catch-up would hide a snapshot-path regression)"
+        ));
+    }
+    wait_membership(cluster, 2, MEMBERSHIP_TIMEOUT).await?;
+    eprintln!("capped resync converged with snapshot path proven");
+    if !force {
+        clear_impairment();
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn impaired_network_converges() {
     let force = std::env::var(FORCE_ENV).as_deref() == Ok("1");
     let (tc_ok, skip_reason) = tc_capable();
     if !force && !tc_ok {
@@ -414,7 +583,7 @@ fn impaired_network_converges() {
     if force && !tc_ok {
         eprintln!("FORCE mode: tc unusable ({skip_reason}); running workload WITHOUT impairment");
     }
-    let rows: usize = std::env::var(ROWS_ENV)
+    let rows_n: usize = std::env::var(ROWS_ENV)
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
@@ -434,149 +603,30 @@ fn impaired_network_converges() {
         bootstrap_seeds: vec![0],
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
     for i in 0..cluster.len() {
         let info = cluster.node_info(i);
         eprintln!(
-            "{} dir={} repl={}",
+            "{} dir={} sql={} repl={}",
             info.label,
             info.dir.display(),
+            info.sql_addr,
             info.repl_addr
         );
     }
-    let repl_ports: Vec<u16> = (0..cluster.len())
-        .map(|i| cluster.node_info(i).repl_addr.port())
-        .collect();
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Same schema on every node (Go: typed contention fixture tables).
-        for i in 0..cluster.len() {
-            cluster
-                .node(i)
-                .migrate(Migration::new(TABLE_DDL))
-                .expect("migrate contention table");
-            cluster.node(i).flush().expect("flush schema");
-        }
-        wait_membership(&cluster, 2, MEMBERSHIP_TIMEOUT);
-
-        // Baseline converges unimpaired (honest-path control).
-        let mut base = BASELINE_ROWS;
-        for i in 0..base {
-            insert_row(
-                cluster.node(0),
-                1,
-                format!("{:032x}", 1000 + i),
-                &format!("base-{i}"),
-            );
-        }
-        wait_converged(&cluster, base, BASELINE_TIMEOUT);
-
-        // Phase (a): +150 ms latency on replication traffic.
-        if force {
-            eprintln!("FORCE mode: NO 150ms latency applied; green here proves the workload only, not impairment tolerance");
-        } else {
-            apply_impairment(&repl_ports, "netem", &["delay", "150ms"]);
-        }
-        let mut lat = timed_writes(&cluster, "lat", base, rows, LAT_ROW_TIMEOUT);
-        let p95 = percentile(&mut lat, 95);
-        eprintln!("latency phase: {} rows p95 visibility={p95:?} (bound 15s)", lat.len());
-        assert!(p95 <= LAT_P95_BOUND, "p95 visibility {p95:?} exceeds 15s bound");
-        if !force {
-            clear_impairment();
-        }
-        base += rows;
-
-        // Phase (b): 3% packet loss on replication traffic.
-        if force {
-            eprintln!("FORCE mode: NO 3% loss applied; green here proves the workload only, not impairment tolerance");
-        } else {
-            apply_impairment(&repl_ports, "netem", &["loss", "3%"]);
-        }
-        let mut lat = timed_writes(&cluster, "loss", base, rows, LOSS_ROW_TIMEOUT);
-        let p95 = percentile(&mut lat, 95);
-        eprintln!("loss phase: {} rows p95 visibility={p95:?} (bound 30s)", lat.len());
-        assert!(p95 <= LOSS_P95_BOUND, "p95 visibility {p95:?} exceeds 30s bound");
-        if !force {
-            clear_impairment();
-        }
-        base += rows;
-
-        // Phase (c): 1 Mbit cap during a stale-node snapshot resync under
-        // sustained writes.
-        if force {
-            eprintln!("FORCE mode: NO bandwidth cap applied; green here proves the workload only, not impairment tolerance");
-        }
-        for i in 0..5 {
-            insert_row(
-                cluster.node(2),
-                3,
-                format!("{:032x}", 5000 + i),
-                &format!("stale-{i}"),
-            );
-        }
-        wait_converged(&cluster, base + 5, BASELINE_TIMEOUT);
-        cluster.stop_node(2);
-
-        // Survivors write far past the short retention while node 3 is
-        // offline (sustained writes continue below).
-        for i in 0..60 {
-            insert_row(
-                cluster.node(0),
-                1,
-                format!("{:032x}", 6000 + i),
-                &format!("fresh-{i}"),
-            );
-        }
-        wait_row_count(&cluster, 0, base + 65, COUNT_TIMEOUT);
-        wait_row_count(&cluster, 1, base + 65, COUNT_TIMEOUT);
-
-        // Node 3's 10 s retention pin must lapse, then one GC pass must
-        // collect its ranges so the rejoin needs a snapshot. Poll the GC
-        // counter instead of a fixed sleep.
-        std::thread::sleep(EXPIRY_SLEEP);
-        wait_gc_pass(&cluster, 0, GC_TIMEOUT);
-
-        // Cap replication throughput, then restart node 3 into it and
-        // keep writing while the snapshot transfers.
-        if !force {
-            apply_impairment(
-                &repl_ports,
-                "tbf",
-                &["rate", "1mbit", "burst", "32kbit", "latency", "400ms"],
-            );
-        }
-        cluster.start_node(2).expect("restart stale node3");
-        cluster.mesh().expect("re-mesh stale node3");
-        for i in 0..20 {
-            insert_row(
-                cluster.node(1),
-                2,
-                format!("{:032x}", 8000 + i),
-                &format!("sustain-{i}"),
-            );
-        }
-        wait_converged(&cluster, base + 85, CAPPED_TIMEOUT);
-        let (received, applied) = log_counters(&cluster, 2);
-        assert!(
-            (received, applied) == (0, 0),
-            "node3 rejoin arrived over the log path (received={received} applied={applied}), want snapshot (log catch-up would hide a snapshot-path regression)"
-        );
-        wait_membership(&cluster, 2, MEMBERSHIP_TIMEOUT);
-        eprintln!("capped resync converged with snapshot path proven");
-        if !force {
-            clear_impairment();
-        }
-    }))
-    .is_err();
+    let result = run_body(&mut cluster, force, rows_n).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
+    }
     // The suite always removes qdisc 77:, on success and on failure.
     if !force {
         clear_impairment();
     }
     if failed {
-        cluster.dump_forensics("impaired-network-no-convergence");
+        cluster.dump_forensics("impaired-network-no-convergence").await;
     }
-    cluster.finish(failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
-    );
+    cluster.finish(failed).await;
+    assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }

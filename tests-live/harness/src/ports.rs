@@ -1,9 +1,9 @@
 //! Ephemeral port helpers.
 //!
-//! QUIC replication nodes bind `127.0.0.1:0` directly and need no
-//! coordination (the Go port-claim registry is dropped by design). These
-//! best-effort helpers exist only for fixture subprocesses that must be told
-//! a port up front; the address can be stolen between `bind` and reuse.
+//! SQL listeners take an up-front free port (best effort: the address can be
+//! stolen between `bind` and reuse). Replication binds `127.0.0.1:0`
+//! directly and needs no coordination (the Go port-claim registry is dropped
+//! by design); the bound address is discovered via `MURMUR SHOW REPLICATION`.
 
 use std::net::SocketAddr;
 

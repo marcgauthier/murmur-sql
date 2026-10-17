@@ -24,7 +24,8 @@ fn value(db:&Database)->i64{db.read(|sql|Ok(sql.query_row("SELECT n FROM items W
 #[test]
 fn quic_replication_is_durable_and_preserves_pending_local_write()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();let b=open(&temp.path().join("b"),config.remove(1))?;let a=open(&temp.path().join("a"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     b.transaction(|s|{s.execute("INSERT INTO items VALUES(1,10)",[])?;Ok(())})?;b.flush()?;
     a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();wait(||value(&a)==10);
     a.transaction(|s|{s.execute("UPDATE items SET n=99 WHERE id=1",[])?;Ok(())})?;
@@ -36,7 +37,8 @@ fn quic_replication_is_durable_and_preserves_pending_local_write()->Result<()> {
 #[test]
 fn schema_is_adopted_without_a_second_database()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    a.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;a.flush()?;
+    a.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    a.set_replication("items", true)?;a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;a.flush()?;
     b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();wait(||value(&b)==42);
     assert_eq!(b.read(|s|Ok(s.query_row("SELECT count(*) FROM sqlite_schema WHERE name LIKE '_crdt_%'",[],|r|r.get::<_,i64>(0))?))?,0);a.close()?;b.close()?;Ok(())
 }
@@ -62,6 +64,7 @@ fn managed_search_indexes_follow_network_rows_and_schema_adoption() -> Result<()
     }
     let a = &nodes[0]; let b = &nodes[1];
     a.migrate(Migration::new("CREATE TABLE docs(id INTEGER PRIMARY KEY,title TEXT,embedding BLOB)"))?;
+    a.set_replication("docs", true)?;
     a.transaction(|sql| {
         let embedding = [1f32, 0.].into_iter().flat_map(f32::to_le_bytes).collect::<Vec<_>>();
         sql.execute("INSERT INTO docs VALUES(1,'replicated',?)", [embedding])?;
@@ -73,7 +76,11 @@ fn managed_search_indexes_follow_network_rows_and_schema_adoption() -> Result<()
         let term = term.to_owned();
         db.read(move |sql| Ok(sql.query_row("SELECT count(*) FROM docs_fts WHERE docs_fts MATCH ?", [term], |r| r.get::<_, i64>(0))?)).unwrap_or(-1)
     };
-    wait(|| count(b, "replicated") == 1);
+    let deadline=Instant::now()+Duration::from_secs(25);
+    while count(b,"replicated")!=1 {
+        assert!(Instant::now()<deadline,"search adoption stalled: a={:?}, b={:?}, sqlite={:?}, rows={:?}, fts={:?}, match={:?}",a.replication().unwrap().status(),b.replication().unwrap().status(),b.status(),b.read(|c|{let mut s=c.prepare("SELECT id,title FROM docs")?;Ok(s.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}),b.read(|c|{let mut s=c.prepare("SELECT rowid,title FROM docs_fts")?;Ok(s.query_map([],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?)))?.collect::<rusqlite::Result<Vec<_>>>()?)}),b.read(|c|Ok(c.query_row("SELECT count(*) FROM docs_fts WHERE docs_fts MATCH 'replicated'",[],|r|r.get::<_,i64>(0))?)));
+        std::thread::sleep(Duration::from_millis(30));
+    }
     #[cfg(feature = "vector")]
     wait(|| b.read(|sql| Ok(sql.query_row("SELECT rowid FROM docs_vec WHERE embedding MATCH '[1,0]' AND k=1", [], |r| r.get::<_, i64>(0))?)).unwrap_or(0) == 1);
     b.set_replication("docs", false)?;
@@ -83,6 +90,7 @@ fn managed_search_indexes_follow_network_rows_and_schema_adoption() -> Result<()
     b.refresh_indexes()?;
     assert_eq!(count(b, "localonly"), 1);
     b.set_replication("docs", true)?;
+    wait(|| count(a, "localonly") == 1);
     a.transaction(|sql| { sql.execute("DELETE FROM docs", [])?; Ok(()) })?;
     a.flush()?;
     wait(|| count(b, "localonly OR updated OR replicated") == 0);
@@ -96,7 +104,8 @@ fn managed_search_indexes_follow_network_rows_and_schema_adoption() -> Result<()
 fn counter_operations_converge_after_offline_writes()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);}
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;a.flush()?;a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();wait(||value(&b)==0);
     a.replication().unwrap().remove_peer(b.node_id()).unwrap();wait(||a.replication().unwrap().status().peers==0);
     a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",5))?;b.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",7))?;a.flush()?;b.flush()?;
@@ -107,7 +116,8 @@ fn counter_operations_converge_after_offline_writes()->Result<()> {
 fn removed_peer_reconnects_after_restart_with_fresh_address()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();let bcfg=config.remove(1);let acfg=config.remove(0);
     let bpath=temp.path().join("b");let a=open(&temp.path().join("a"),acfg)?;let b=open(&bpath,bcfg.clone())?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();wait(||a.replication().unwrap().status().peers==1);
     a.replication().unwrap().remove_peer(b.node_id()).unwrap();b.replication().unwrap().remove_peer(a.node_id()).unwrap();wait(||a.replication().unwrap().status().peers==0);
     // Restart: the exclusion persists in Spool while the node rebinds a fresh
@@ -123,7 +133,8 @@ fn removed_peer_reconnects_after_restart_with_fresh_address()->Result<()> {
 fn concurrent_inserts_union_counter_and_set_ops()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);c.merge_policies.insert(("items".into(),"tags".into()),Policy::Set);}
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     for db in [&a,&b]{db.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0,x'00')",[])?;Ok(())})?;db.flush()?;}
     a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",7))?;a.flush()?;
     b.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",11))?;b.flush()?;
@@ -138,7 +149,8 @@ fn concurrent_inserts_union_counter_and_set_ops()->Result<()> {
 fn forwarded_counter_ops_union_across_three_incarnations()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);}
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;let c=open(&temp.path().join("c"),config.remove(0))?;
-    for db in [&a,&b,&c]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b,&c]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     for db in [&a,&b,&c]{db.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;db.flush()?;}
     a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",10))?;a.flush()?;
     b.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",7))?;b.flush()?;
@@ -159,7 +171,8 @@ fn forwarded_counter_ops_union_across_three_incarnations()->Result<()> {
 fn extrema_join_across_concurrent_incarnations_and_fence_deletes()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"peak".into()),Policy::Max);c.merge_policies.insert(("items".into(),"floor".into()),Policy::Min);}
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,peak INTEGER NOT NULL,floor REAL NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,peak INTEGER NOT NULL,floor REAL NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     for db in [&a,&b]{db.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0,100.0)",[])?;Ok(())})?;db.flush()?;}
     a.transaction(|s|{s.max("items",vec![Value::Integer(1)],"peak",Value::Integer(10))?;s.min("items",vec![Value::Integer(1)],"floor",Value::Real(30.0))})?;a.flush()?;
     b.transaction(|s|{s.max("items",vec![Value::Integer(1)],"peak",Value::Integer(20))?;s.min("items",vec![Value::Integer(1)],"floor",Value::Real(15.0))})?;b.flush()?;
@@ -180,7 +193,8 @@ fn extrema_join_across_concurrent_incarnations_and_fence_deletes()->Result<()> {
 fn reinserted_row_excludes_deleted_incarnation_counter_ops()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config{c.merge_policies.insert(("items".into(),"n".into()),Policy::Counter);}
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0)",[])?;Ok(())})?;a.flush()?;
     a.transaction(|s|s.counter_add("items",vec![Value::Integer(1)],"n",5))?;a.flush()?;
     a.transaction(|s|{s.execute("DELETE FROM items WHERE id=1",[])?;Ok(())})?;a.flush()?;
@@ -198,7 +212,8 @@ fn reinserted_row_excludes_deleted_incarnation_counter_ops()->Result<()> {
 fn remote_applies_wake_subscriptions()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();
     let sub=b.subscribe(|sql|{let mut st=sql.prepare("SELECT n FROM items WHERE id=1")?;let mut rows=st.query([])?;let mut out=Vec::new();while let Some(r)=rows.next()?{out.push(r.get::<_,i64>(0)?);}Ok(out)},|n:&i64|n.to_be_bytes().to_vec(),SubscriptionOptions{tables:vec!["items".into()],..Default::default()})?;
     assert!(matches!(sub.recv_timeout(Duration::from_secs(10))?,SubscriptionEvent::Initial{rows,..} if rows.is_empty()));
@@ -223,7 +238,8 @@ fn encrypted_files_are_fetched_by_the_second_endpoint()->Result<()> {
 fn sets_and_min_max_converge()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=configs();for c in &mut config {c.merge_policies.insert(("items".into(),"tags".into()),Policy::Set);c.merge_policies.insert(("items".into(),"low".into()),Policy::Min);c.merge_policies.insert(("items".into(),"high".into()),Policy::Max);}
     let a=open(&temp.path().join("a"),config.remove(0))?;let b=open(&temp.path().join("b"),config.remove(0))?;
-    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL,low INTEGER NOT NULL,high INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL,low INTEGER NOT NULL,high INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,0,x'00',100,0)",[])?;Ok(())})?;a.flush()?;a.replication().unwrap().add_peer(b.replication().unwrap().status().address.unwrap()).unwrap();wait(||value(&b)==0);
     a.transaction(|s|{s.set_add("items",vec![Value::Integer(1)],"tags",Value::Text("a".into()))?;s.min("items",vec![Value::Integer(1)],"low",Value::Integer(5))?;s.max("items",vec![Value::Integer(1)],"high",Value::Integer(8))})?;
     b.transaction(|s|{s.set_add("items",vec![Value::Integer(1)],"tags",Value::Text("b".into()))?;s.min("items",vec![Value::Integer(1)],"low",Value::Integer(9))?;s.max("items",vec![Value::Integer(1)],"high",Value::Integer(12))})?;a.flush()?;b.flush()?;
@@ -238,7 +254,8 @@ fn high_low_bridge_retains_low_shadow_and_releases_high_owned_value()->Result<()
     high.bridge=Some(replication::bridge::Config::receiver(high_domain,temp.path().join("in"),"low-east".into(),secret,std::collections::BTreeSet::from([low_domain]),signers,low.trusted_origins.clone()));
     let open_domain=|name:&str,domain,config|Database::open(temp.path().join(name),[9;32],Options{mode:OpenMode::CreateNew,database_id:Some(domain),replication:Some(config),..Options::default()});
     let low=open_domain("low",low_domain,low)?;let high=open_domain("high",high_domain,high)?;
-    for db in [&low,&high]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&low,&high]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     fn transfer(source:&std::path::Path,destination:&std::path::Path){for item in std::fs::read_dir(source).unwrap(){let path=item.unwrap().path();if path.extension().is_some_and(|e|e=="bundle"){std::fs::copy(&path,destination.join(path.file_name().unwrap())).unwrap();}}}
     low.transaction(|s|{s.execute("INSERT INTO items VALUES(1,10)",[])?;Ok(())})?;low.flush()?;low.replication().unwrap().bridge().unwrap().capture().unwrap();transfer(&temp.path().join("out"),&temp.path().join("in"));high.replication().unwrap().bridge().unwrap().process().unwrap();wait(||value(&high)==10);
     high.transaction(|s|{s.execute("UPDATE items SET n=99",[])?;Ok(())})?;high.flush()?;
@@ -250,6 +267,7 @@ fn master_schema_replicates_to_divergent_node()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=master_configs();
     let master=open(&temp.path().join("m"),config.remove(0))?;let peer=open(&temp.path().join("p"),config.remove(0))?;
     master.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL); CREATE INDEX items_n ON items(n)"))?;
+    master.set_replication("items", true)?;
     master.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;master.flush()?;
     peer.replication().unwrap().add_peer(master.replication().unwrap().status().address.unwrap()).unwrap();
     wait(||has_table(&peer,"items"));
@@ -262,12 +280,14 @@ fn master_schema_replicates_to_divergent_node()->Result<()> {
 fn master_schema_adds_column_to_existing_table()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=master_configs();
     let master=open(&temp.path().join("m"),config.remove(0))?;let peer=open(&temp.path().join("p"),config.remove(0))?;
-    for db in [&master,&peer]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&master,&peer]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     master.transaction(|s|{s.execute("INSERT INTO items VALUES(1,7)",[])?;Ok(())})?;master.flush()?;
     peer.replication().unwrap().add_peer(master.replication().unwrap().status().address.unwrap()).unwrap();
     wait(||value(&peer)==7);
     master.migrate(Migration::new("ALTER TABLE items ADD COLUMN m INTEGER"))?;master.flush()?;
-    wait(||has_column(&peer,"items","m"));
+    let deadline=Instant::now()+Duration::from_secs(25);
+    while !has_column(&peer,"items","m") {assert!(Instant::now()<deadline,"column adoption stalled: master={:?}, peer={:?}",master.replication().unwrap().status(),peer.replication().unwrap().status());std::thread::sleep(Duration::from_millis(30));}
     master.transaction(|s|{s.execute("UPDATE items SET m=9 WHERE id=1",[])?;Ok(())})?;master.flush()?;
     wait(||peer.read(|s|Ok(s.query_row("SELECT m FROM items WHERE id=1",[],|r|r.get::<_,i64>(0))?)).unwrap_or(-1)==9);
     assert_eq!(value(&peer),7);
@@ -277,13 +297,15 @@ fn master_schema_adds_column_to_existing_table()->Result<()> {
 fn non_master_schema_change_does_not_propagate()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=master_configs();
     let master=open(&temp.path().join("m"),config.remove(0))?;let peer=open(&temp.path().join("p"),config.remove(0))?;
-    for db in [&master,&peer]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&master,&peer]{db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     master.transaction(|s|{s.execute("INSERT INTO items VALUES(1,1)",[])?;Ok(())})?;master.flush()?;
     peer.replication().unwrap().add_peer(master.replication().unwrap().status().address.unwrap()).unwrap();
     wait(||value(&peer)==1);
     // Replicated DDL must originate on the master; the peer's table stays local
     // to the peer and its own writes stop applying upstream (loud mismatch).
-    peer.migrate(Migration::new("CREATE TABLE peer_only(id INTEGER PRIMARY KEY)"))?;peer.flush()?;
+    peer.migrate(Migration::new("CREATE TABLE peer_only(id INTEGER PRIMARY KEY)"))?;
+    peer.set_replication("peer_only", true)?;peer.flush()?;
     std::thread::sleep(Duration::from_secs(3));
     assert!(!has_table(&master,"peer_only"));
     // Master-to-peer flow stays healthy.
@@ -296,6 +318,7 @@ fn master_local_tables_are_excluded_from_schema_sync()->Result<()> {
     let temp=tempfile::tempdir()?;let mut config=master_configs();
     let master=open(&temp.path().join("m"),config.remove(0))?;let peer=open(&temp.path().join("p"),config.remove(0))?;
     master.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    master.set_replication("items", true)?;
     master.migrate(Migration::new("CREATE TABLE scratch(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
     master.set_replication("scratch",false)?;
     master.transaction(|s|{s.execute("INSERT INTO items VALUES(1,5)",[])?;s.execute("INSERT INTO scratch VALUES(1,6)",[])?;Ok(())})?;master.flush()?;
@@ -324,6 +347,7 @@ fn retention_collection_preserves_tombstones_and_peer_retirement_across_reopen()
     db.migrate(Migration::new(
         "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)",
     ))?;
+    db.set_replication("items", true)?;
     db.transaction(|s| {
         s.execute("INSERT INTO items VALUES(1,10)", [])?;
         Ok(())
@@ -430,6 +454,7 @@ fn seeded_counter_and_set_edits_converge_after_three_node_partition_and_restart(
         db.migrate(Migration::new(
             "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL)",
         ))?;
+    db.set_replication("items", true)?;
         db.flush()?;
         dbs.push(db);
     }
@@ -545,6 +570,8 @@ fn disabled_tables_filter_rows_tombstones_and_counter_records_in_both_directions
     let b = open(&tmp.path().join("b"), cfg.remove(0))?;
     for db in [&a, &b] {
         db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL);CREATE TABLE barrier(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;
+    db.set_replication("barrier", true)?;
         db.flush()?;
     }
     a.transaction(|s| {
@@ -629,6 +656,7 @@ fn snapshot_catches_up_pruned_history_with_concurrent_counters_sets_and_tombston
     let b = open(&tmp.path().join("b"), cfg.remove(0))?;
     for db in [&a,&b] {
         db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL,tags BLOB NOT NULL,payload BLOB)"))?;
+    db.set_replication("items", true)?;
         db.flush()?;
     }
     a.transaction(|s| {s.execute("INSERT INTO items VALUES(1,0,x'00',zeroblob(180000)),(2,0,x'00',x'')",[])?;Ok(())})?;
@@ -670,7 +698,8 @@ fn snapshot_catches_up_pruned_history_with_concurrent_counters_sets_and_tombston
 fn replication_close_interrupts_pending_sql_owner_wait() -> Result<()> {
     let temp=tempfile::tempdir()?;let mut cfg=configs();
     let a=open(&temp.path().join("a"),cfg.remove(0))?;let b=open(&temp.path().join("b"),cfg.remove(0))?;
-    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
     wait(||a.replication().unwrap().status().peers>0);
     let (entered_tx,entered_rx)=std::sync::mpsc::channel();let (release_tx,release_rx)=std::sync::mpsc::channel();
@@ -685,7 +714,8 @@ fn replication_close_interrupts_pending_sql_owner_wait() -> Result<()> {
 #[test]
 fn incoming_application_progresses_while_local_writes_continue() -> Result<()> {
     let temp=tempfile::tempdir()?;let mut cfg=configs();let a=open(&temp.path().join("a"),cfg.remove(0))?;let b=open(&temp.path().join("b"),cfg.remove(0))?;
-    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;db.flush()?;}
+    for db in [&a,&b] {db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+    db.set_replication("items", true)?;db.flush()?;}
     b.transaction(|s|{s.execute("INSERT INTO items VALUES(2,0)",[])?;Ok(())})?;b.flush()?;
     b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();wait(||b.replication().unwrap().status().peers>0);
     let stop=std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));let running=stop.clone();let local=b.clone();
@@ -693,4 +723,91 @@ fn incoming_application_progresses_while_local_writes_continue() -> Result<()> {
     a.transaction(|s|{s.execute("INSERT INTO items VALUES(1,42)",[])?;Ok(())})?;a.flush()?;
     let deadline=Instant::now()+Duration::from_secs(10);let mut converged=false;while Instant::now()<deadline {if value(&b)==42 {converged=true;break;}std::thread::sleep(Duration::from_millis(10));}
     stop.store(true,std::sync::atomic::Ordering::Release);writer.join().unwrap()?;assert!(converged,"remote publication starved during local writes");a.close()?;b.close()?;Ok(())
+}
+
+#[test]
+fn column_fts_declarations_adopt_without_sql_ddl_and_follow_source_rows() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut cfg = master_configs();
+    let a = open(&temp.path().join("fts-a"), cfg.remove(0))?;
+    let b = open(&temp.path().join("fts-b"), cfg.remove(0))?;
+    a.migrate(Migration::new("CREATE TABLE docs(id INTEGER PRIMARY KEY,body TEXT); CREATE TABLE private_docs(id INTEGER PRIMARY KEY,body TEXT)"))?;
+    a.set_replication("docs", true)?;
+    a.transaction(|c| {c.execute("INSERT INTO docs(id,body) VALUES(1,'first')",[])?;Ok(())})?;
+    a.flush()?;
+    b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+    wait(|| has_table(&b,"docs"));
+    let name = format!("murmur_fts_{}", a.schema()?.tables.iter().find(|t|t.name=="docs").unwrap().id);
+    let matches = |db: &Database, term: &str| {
+        let sql=format!("SELECT count(*) FROM temp.\"{name}\" WHERE \"{name}\" MATCH ?");
+        let term=term.to_owned();
+        db.read(move |c| Ok(c.query_row(&sql,[term],|r|r.get::<_,i64>(0))?)).unwrap_or(-1)
+    };
+    a.set_column_fts("docs","body",true)?;
+    a.set_column_fts("private_docs","body",true)?;
+    a.flush()?;
+    wait(|| matches(&b,"first")==1);
+    assert!(!has_table(&b,"private_docs"));
+    assert!(b.schema()?.tables.iter().find(|t|t.name=="docs").unwrap().columns.iter().find(|c|c.name=="body").unwrap().fts);
+    a.transaction(|c| {c.execute("UPDATE docs SET body='second' WHERE id=1",[])?;Ok(())})?;
+    a.flush()?;
+    wait(|| matches(&b,"second")==1 && matches(&b,"first")==0);
+    a.set_column_fts("docs","body",false)?;
+    a.flush()?;
+    wait(|| b.status().search_indexes.is_empty());
+    a.set_column_fts("docs","body",true)?;
+    a.flush()?;
+    let deadline=Instant::now()+Duration::from_secs(25);
+    while matches(&b,"second")!=1 {
+        assert!(Instant::now()<deadline,"re-enable failed: a={:?}, b={:?}, schema={:?}, search={:?}",a.replication().unwrap().status(),b.replication().unwrap().status(),b.schema()?,b.status().search_indexes);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    a.transaction(|c| {c.execute("DELETE FROM docs WHERE id=1",[])?;Ok(())})?;
+    a.flush()?;
+    wait(|| matches(&b,"second")==0);
+    // Settings survive a snapshot/restart even without explicit Options indexes.
+    b.flush()?;
+    let backup=temp.path().join("fts-snapshot");
+    b.backup(&backup)?;
+    let restored=temp.path().join("fts-restored");
+    Database::restore(&backup,&restored,[9;32])?;
+    let recovered=Database::open(&restored,[9;32],Options::default())?;
+    assert_eq!(recovered.status().search_indexes.len(),1);
+    recovered.close()?;
+    a.close()?;
+    b.close()
+}
+
+#[cfg(feature="vector")]
+#[test]
+fn vector_column_settings_replicate_without_ddl_and_preserve_local_filters() -> Result<()> {
+    use sqlite_session::{VectorColumnConfig,DistanceMetric};
+    let temp=tempfile::tempdir()?;let mut cfg=master_configs();
+    let a=open(&temp.path().join("vec-a"),cfg.remove(0))?;let b=open(&temp.path().join("vec-b"),cfg.remove(0))?;
+    a.migrate(Migration::new("CREATE TABLE docs(id INTEGER PRIMARY KEY,embedding BLOB); CREATE TABLE private_docs(id INTEGER PRIMARY KEY,embedding BLOB)"))?;
+    a.set_replication("docs",true)?;
+    a.transaction(|c|{c.execute("INSERT INTO docs(id,embedding) VALUES(1,x'0000803f00000000')",[])?;Ok(())})?;a.flush()?;
+    b.replication().unwrap().add_peer(a.replication().unwrap().status().address.unwrap()).unwrap();
+    wait(||has_table(&b,"docs"));
+    let conf=|distance|Some(VectorColumnConfig{dimensions:2,distance});
+    let table=a.schema()?.tables.iter().find(|t|t.name=="docs").unwrap().clone();
+    let column=table.columns.iter().find(|c|c.name=="embedding").unwrap();let name=format!("murmur_vec_{}_{}",table.id,column.id);
+    let count=|db:&Database|{let sql=format!("SELECT count(*) FROM (SELECT rowid FROM temp.\"{name}\" WHERE embedding MATCH '[1,0]' AND k=5)");db.read(move|c|Ok(c.query_row(&sql,[],|r|r.get::<_,i64>(0))?)).unwrap_or(-1)};
+    a.set_column_vector("docs","embedding",conf(DistanceMetric::L2))?;
+    a.set_column_vector("private_docs","embedding",conf(DistanceMetric::L2))?;a.flush()?;
+    wait(||count(&b)==1);assert!(!has_table(&b,"private_docs"));
+    a.set_column_vector("docs","embedding",conf(DistanceMetric::Cosine))?;a.flush()?;
+    wait(||b.schema().unwrap().tables.iter().find(|t|t.name=="docs").unwrap().columns.iter().find(|c|c.name=="embedding").unwrap().vector==conf(DistanceMetric::Cosine));
+    a.transaction(|c|{c.execute("INSERT INTO docs(id,embedding) VALUES(2,x'000000000000803f')",[])?;Ok(())})?;a.flush()?;
+    wait(||count(&b)==2);
+    a.set_column_vector("docs","embedding",None)?;a.flush()?;wait(||b.status().search_indexes.is_empty());
+    a.set_column_vector("docs","embedding",conf(DistanceMetric::L1))?;a.flush()?;wait(||count(&b)==2);
+    b.set_replication("docs",false)?;
+    a.set_column_vector("docs","embedding",None)?;a.flush()?;
+    // A schema addition provides a barrier proving the disabled table was
+    // considered in a later signed manifest without overwriting its settings.
+    a.migrate(Migration::new("CREATE TABLE barrier(id INTEGER PRIMARY KEY)"))?;a.set_replication("barrier",true)?;a.flush()?;
+    wait(||has_table(&b,"barrier"));
+    assert_eq!(b.schema()?.tables.iter().find(|t|t.name=="docs").unwrap().columns.iter().find(|c|c.name=="embedding").unwrap().vector,conf(DistanceMetric::L1));
+    a.close()?;b.close()
 }

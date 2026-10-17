@@ -1,51 +1,22 @@
-# tampered-backup (Rust port)
+# Corrupt streaming backups fail closed
 
-Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/tampered-backup/`
-(`README.md` + `tampered_test.go`).
+Create a thirty-row backup and corrupt its header, flip a payload byte, or truncate it. Upload/restore must reject each bad archive and a fresh client must still read the untouched live data. The pristine archive must restore the exact original rows.
 
-## What it proves
+Each node is a separate `murmur-server` process. Application operations use
+[`murmur-client`](../../clients/rust/README.md) over the PostgreSQL wire protocol;
+these tests do not open an embedded database.
 
-`tampered_backup` (Go `TestTamperedBackupsFailClosed`): a single node
-seeds 30 rows, stops, and is backed up offline through the library. Three
-tampered copies of the backup — a byte flip in a payload file, a manifest
-edit, and a payload truncation — must each fail both
-`Database::restore` and `Database::verify_backup` with no partial state,
-while the pristine backup verifies and restores exactly under a fresh
-writer identity (row count plus a canonical digest of the sorted record
-names).
+Run from the repository root:
 
-## Env knobs
+```sh
+CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path tests-live/tampered-backup/Cargo.toml -- --nocapture
+```
 
-Standard harness knobs only (`MURMUR_LIVE_RUNTIME`,
-`MURMUR_LIVE_FAILURES`, `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-`MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`). No scenario-specific knobs.
+The process harness builds `murmur-server` and `murmur-admin` with the
+`replication` feature, or reuses `MURMUR_SERVER_BIN` and `MURMUR_ADMIN_BIN`
+(the admin binary defaults to a sibling of the server). `MURMUR_LIVE_RUNTIME`
+selects the parent directory for unique per-test runtime folders. Successful
+tests remove their runtime folders; failures retain the config and server logs
+at the path printed in the test output.
 
-## Pass criteria
-
-- Each tampered leg: restore fails, the restore target directory does not
-  exist afterwards, `verify_backup` fails, and no `.verify-tmp-*` residue
-  remains in the backup's parent dir.
-- Positive control: pristine backup verifies, restores under a fresh node
-  id, reopens with 30 rows and a digest equal to the pre-backup digest.
-
-## Deviations from the Go original
-
-- In-process single-`Database` cluster instead of a daemon process; no
-  HTTPS/mTLS admin API exists in the Rust product.
-- Plain SQL instead of the managed typed-records HTTP API.
-- The Rust backup format is a directory (`manifest`/`keys.enc`/
-  `segments/`), not a `.tar.gz` archive: the Go gzip-magic flip becomes a
-  segment-byte flip, the `backup-metadata.json` repack becomes a manifest
-  byte flip, and the late-payload flip becomes a payload truncation. The
-  Go error-substring assertions ("gzip", "metadata") have no equivalent
-  and are replaced by failure assertions (the rejection is logged).
-- No restore-intent file exists in the Rust product: Go's
-  `assertTargetUntouched` (zero regular files under the target) becomes
-  "the restore target directory does not exist", which the product
-  guarantees by removing `dst` on verification failure.
-- The canonical digest is FNV-1a/64 over the same canonical byte stream
-  (sorted `\n`-joined names) instead of SHA-256; no hash crate is in
-  scope and only pre/post equality is asserted.
-- Extra `verify_backup` legs: the pristine backup must verify, and each
-  tampered backup must fail verification without mutating the source or
-  leaving temp residue.
+Malformed envelopes may be rejected during upload; accepted uploads must fail restore. This tests the SQL archive API rather than calling embedded backup verification.

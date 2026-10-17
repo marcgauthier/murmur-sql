@@ -239,7 +239,10 @@ pub struct Options {
     pub on_storage_error: Option<Arc<dyn Fn(Error) + Send + Sync>>,
     /// Receives segment replay advancement during open. None disables.
     pub on_replay_progress: Option<Arc<dyn Fn(ReplayProgress) + Send + Sync>>,
-    /// Compaction threshold in (0,1]. Default 0.20.
+    /// Compaction threshold in (0,1]: a sealed segment is rewritten
+    /// when its live value bytes are at most this fraction of its
+    /// total bytes. Tombstones are excluded (see `pick_compaction`).
+    /// Default 0.20.
     pub compaction_threshold: f64,
     /// Refuse rewrite passes while free space is below this. 0 disables.
     pub compaction_min_free_bytes: i64,

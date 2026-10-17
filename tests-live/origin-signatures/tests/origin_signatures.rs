@@ -3,960 +3,737 @@
 //! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/origin-signatures/`
 //! (`origin_signatures_test.go`:
 //! `TestForwardedOriginSurvivesOfflineOriginAndHostileRelay`). Three
-//! encrypted nodes share one database id; A commits, B receives, A stops,
-//! and C receives A's transaction exclusively through B. The fixture
-//! checks the actual stored origin proof, then a relay authenticated as
-//! B fires modified, fabricated, unsigned, cross-DBID and chunk-identity
-//! attacks at C. Every attack must be rejected while rows, schemas and
-//! replication counters stay unchanged. Restart and signed-duplicate
-//! replay check durability and idempotency, and an untrusted snapshot
-//! manifest must be refused.
-//!
-//! Plain SQL replaces the Go typed-records HTTP API; the Go Prometheus
-//! rejection counters map to per-leg wire + `last_error` latch evidence
-//! (the Rust engine keeps no invalid-batch counters), and each
-//! signature-failure leg uses its own relay session because an
-//! `Error::Auth` kills the session that carried it. See the scenario
-//! README.md for the full deviation list.
+//! `murmur-server` processes share one database id; A commits, B receives,
+//! A stops, and C receives A's transaction exclusively through B. A relay
+//! impersonating B (raw QUIC, product wire protocol via the shared harness
+//! attacker fixture) then serves capture plus modified / unsigned /
+//! cross-DBID / fabricated / chunk-identity attacks, all of which C must
+//! reject with rows, counters, and commit cursor untouched. Restart checks
+//! durability, a signed-duplicate replay checks idempotency, and an
+//! untrusted snapshot manifest checks donor trust. Plain SQL replaces the
+//! Go typed-records HTTP API.
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc, Mutex,
-};
 use std::time::{Duration, Instant};
 
-use murmur_live_harness::murmur_replication::{
-    protocol::{self, Chunk, Message, Transaction},
-    retention, snapshot, transport, Config as ReplConfig, Dissemination,
-};
-use murmur_live_harness::sqlite_session::{Database, Migration};
-use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
-use sha2::{Digest, Sha256};
+use murmur_live_harness::attacker::Attacker;
+use murmur_live_harness::replication::protocol::{self, Chunk, Message, Transaction};
+use murmur_live_harness::replication::{retention, snapshot};
+use murmur_live_harness::{wait_until_async, Cluster, ClusterOptions};
 
-/// Fixed node ids (Go: per-node origin keys; the harness mints the seeds).
-const NODE_A: [u8; 16] = [0x10; 16];
-const NODE_B: [u8; 16] = [0x20; 16];
-const NODE_C: [u8; 16] = [0x30; 16];
 const A: usize = 0;
 const B: usize = 1;
 const C: usize = 2;
-/// Honest origin ids; data frames on relay sessions must never carry any
-/// other origin.
-const HONEST: [[u8; 16]; 3] = [NODE_A, NODE_B, NODE_C];
-/// Re-signing key for the fabricated leg. Go re-signs with B's origin
-/// key; the harness never discloses node seeds, so a dedicated attacker
-/// key takes its place (the check exercised is identical: the signature
-/// must fail against the claimed origin's trusted key).
-const FABRICATE_SEED: [u8; 32] = [0xA1; 32];
-/// Divergent handshake schema bytes for the first relay dial (its Welcome
-/// teaches the relay the node's real schema).
-const DIVERGENT_SCHEMA: &[u8] = b"relay-divergent-schema-probe";
-/// Cross-DBID attack database id (Go: a fresh random DBID).
-const CROSS_DB: [u8; 16] = [0xDD; 16];
-/// Distinct transaction ids per attack leg (Go: fresh TxID each attack).
-const MODIFIED_ID: [u8; 16] = [0xB1; 16];
-const FABRICATED_ID: [u8; 16] = [0xB2; 16];
-const UNSIGNED_ID: [u8; 16] = [0xB3; 16];
-const CROSSDB_ID: [u8; 16] = [0xB4; 16];
-const CHUNK_ID: [u8; 16] = [0xB5; 16];
-/// Local verification cap (the product default `max_transaction_bytes`).
-const MAX_TX: usize = 64 << 20;
-
 /// Convergence deadline per phase (Go: 30 s).
 const CONVERGE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Fixture dial/stream/setup deadline (Go: 10 s).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the fixture waits for a Welcome that must arrive.
-const WELCOME_TIMEOUT: Duration = Duration::from_secs(5);
-/// Window for the served `Need` batches to arrive.
-const NEED_WINDOW: Duration = Duration::from_secs(5);
-/// How long the fixture waits for an `Error{code: 1}` reply (Go: 10 s).
-const ERROR_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the fixture waits for a Pong that must arrive (Go: 10 s).
-const PONG_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long the fixture waits for a chunk-availability page.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-/// Slice for one gradual read inside a collection window.
-const SLICE: Duration = Duration::from_millis(500);
-/// Post-fatal-probe silence window (Go: 3 s).
-const DEATH_WINDOW: Duration = Duration::from_secs(3);
-/// Session attach/teardown observation bound.
+/// Convergence poll interval (Go: 200 ms).
+const POLL: Duration = Duration::from_millis(200);
+/// Session attach/teardown observation bound (Go: 5 s).
 const PEER_TIMEOUT: Duration = Duration::from_secs(5);
+/// Settle window after the idempotent re-offer (replay legs: 3-10 s).
+const SETTLE: Duration = Duration::from_secs(5);
+/// Served-batch capture window (Need answers are immediate).
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Chunk-availability probe window.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Post-send drain asserting no `SnapshotApplied`/no `Error` (Go: 3 s).
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
+/// Per-leg rejection budget. C redials stopped B every 5 s and dial
+/// failures overwrite `last_error`, so a missed rejection text is resent
+/// on a fresh session until this budget elapses.
+const REJECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// `last_error` poll window per resend attempt.
+const ATTEMPT_WINDOW: Duration = Duration::from_secs(2);
+/// Session pump slice while polling (drains control traffic so the
+/// victim's send queue never wedges mid-leg).
+const PUMP: Duration = Duration::from_millis(100);
+/// Largest transaction the victim accepts (product default).
+const MAX_TRANSACTION: usize = 64 << 20;
+
+/// Forged transaction identity (asserted distinct from every real id).
+const FORGED_ID: [u8; 16] = [0xF0; 16];
+/// Chunk-proof identity (must differ from `CHUNK_ID`: that mismatch is the
+/// chunk-identity attack).
+const PROOF_ID: [u8; 16] = [0xF2; 16];
+/// Chunk envelope identity (tampered relative to its proof).
+const CHUNK_ID: [u8; 16] = [0xF3; 16];
+/// Wrong database id for the cross-DBID leg.
+const CROSS_DB: [u8; 16] = [0xDB; 16];
 
 /// Canonical ordered names on one node (Go: `Cluster.TypedNames`).
-fn names(db: &Database) -> Vec<String> {
-    db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT name FROM records ORDER BY name")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for name in rows {
-            out.push(name?);
-        }
-        Ok(out)
-    })
-    .expect("read names")
+async fn names(cluster: &Cluster, idx: usize) -> Result<Vec<String>, String> {
+    let rows = cluster
+        .node(idx)
+        .query("SELECT name FROM records ORDER BY name", &[])
+        .await
+        .map_err(|e| format!("node{} read names: {e}", idx + 1))?;
+    rows.iter()
+        .map(|row| {
+            row.try_get::<_, String>(0)
+                .map_err(|e| format!("node{} decode name: {e}", idx + 1))
+        })
+        .collect()
 }
 
 /// One single-row transaction (Go: `TypedInsertWithID`).
-fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) {
-    let name = name.to_string();
+async fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) -> Result<(), String> {
     cluster
         .node(node)
-        .transaction(move |sql| {
-            sql.execute("INSERT INTO records(id, name) VALUES(?, ?)", (id, name))?;
-            Ok(())
-        })
-        .unwrap_or_else(|e| panic!("node {node} insert failed: {e}"));
+        .execute("INSERT INTO records(id, name) VALUES($1, $2)", &[&id, &name])
+        .await
+        .map_err(|e| format!("node{node} insert failed: {e}"))?;
+    cluster
+        .node(node)
+        .flush()
+        .await
+        .map_err(|e| format!("node{node} flush after insert: {e}"))?;
+    Ok(())
 }
 
 /// Wait until `node` holds exactly `want` (Go: `waitRows` + `TypedNames`).
-fn wait_names(cluster: &Cluster, node: usize, want: &[&str], timeout: Duration) {
-    let ok = wait_until(timeout, Duration::from_millis(200), || {
-        names(cluster.node(node))
-            .iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            == want
-    });
-    assert!(
-        ok,
-        "node{} did not converge on {want:?} within {timeout:?} (has {:?})",
-        node + 1,
-        names(cluster.node(node))
-    );
+async fn wait_names(cluster: &Cluster, node: usize, want: &[&str], timeout: Duration) -> Result<(), String> {
+    let converged = wait_until_async(timeout, POLL, || async {
+        names(cluster, node)
+            .await
+            .map(|got| got.iter().map(String::as_str).collect::<Vec<_>>() == want)
+            .unwrap_or(false)
+    })
+    .await;
+    if !converged {
+        let got = names(cluster, node).await.unwrap_or_default();
+        return Err(format!("node{} did not converge on {want:?} within {timeout:?} (has {got:?})", node + 1));
+    }
+    Ok(())
 }
 
 /// Connected replication sessions on one node (Go: `connected_peers`).
-fn connected_peers(cluster: &Cluster, idx: usize) -> usize {
-    cluster
+async fn connected_peers(cluster: &Cluster, idx: usize) -> Result<u64, String> {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .peers
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", idx + 1))?;
+    let cell = rows
+        .first()
+        .and_then(|r| r.get(2).cloned())
+        .ok_or_else(|| format!("node{} SHOW REPLICATION returned no peers", idx + 1))?;
+    cell.parse::<u64>()
+        .map_err(|e| format!("node{} peers {cell:?}: {e}", idx + 1))
 }
 
 /// Staged (`received`) and applied counters on one node. `received`
 /// only moves when a batch passes verification into staging, so it is
 /// the Rust equivalent of Go's `batches_received_total` must-not-move
 /// assert; `applied` covers Go's nothing-applied / generation legs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Counters {
     received: u64,
     applied: u64,
 }
 
-fn counters(cluster: &Cluster, idx: usize) -> Counters {
-    let s = cluster
+async fn counters(cluster: &Cluster, idx: usize) -> Result<Counters, String> {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status();
-    Counters {
-        received: s.metrics.received_transactions,
-        applied: s.applied_transactions,
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", idx + 1))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("node{} SHOW REPLICATION returned no rows", idx + 1))?;
+    if row.len() < 6 {
+        return Err(format!("node{} SHOW REPLICATION has {} columns, want >= 6", idx + 1, row.len()));
     }
+    let received = row[4]
+        .parse::<u64>()
+        .map_err(|e| format!("node{} staged {:?}: {e}", idx + 1, row[4]))?;
+    let applied = row[5]
+        .parse::<u64>()
+        .map_err(|e| format!("node{} applied {:?}: {e}", idx + 1, row[5]))?;
+    Ok(Counters { received, applied })
 }
 
-fn assert_counters(cluster: &Cluster, idx: usize, base: &Counters, ctx: &str) {
-    let got = counters(cluster, idx);
-    assert!(
-        got.received == base.received && got.applied == base.applied,
-        "node{} counters moved {ctx}: received {} -> {}, applied {} -> {} \
-         (an attack batch staged or applied)",
-        idx + 1,
-        base.received,
-        got.received,
-        base.applied,
-        got.applied
-    );
+async fn assert_counters(cluster: &Cluster, idx: usize, base: &Counters, ctx: &str) -> Result<(), String> {
+    let got = counters(cluster, idx).await?;
+    if got.received != base.received || got.applied != base.applied {
+        return Err(format!(
+            "node{} counters moved {ctx}: received {} -> {}, applied {} -> {} (a batch staged or applied)",
+            idx + 1,
+            base.received,
+            got.received,
+            base.applied,
+            got.applied
+        ));
+    }
+    Ok(())
 }
 
-fn is_pong(nonce: u64) -> impl Fn(&Message) -> bool {
-    move |m| matches!(m, Message::Pong(n) if *n == nonce)
+/// Latest replication error on one node (attack rejections land here).
+async fn last_error(cluster: &Cluster, idx: usize) -> Result<Option<String>, String> {
+    let rows = cluster
+        .node(idx)
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", idx + 1))?;
+    Ok(rows
+        .first()
+        .and_then(|r| r.get(6))
+        .filter(|s| !s.is_empty())
+        .cloned())
 }
 
-fn is_error_code(want: u16) -> impl Fn(&Message) -> bool {
-    move |m| matches!(m, Message::Error { code: c, .. } if *c == want)
+/// Local commit cursor (Go: `state_generation` advance check).
+async fn committed(cluster: &Cluster, idx: usize) -> Result<u64, String> {
+    let rows = cluster
+        .node(idx)
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", idx + 1))?;
+    rows.first()
+        .and_then(|r| r.get(7))
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| format!("node{} SHOW REPLICATION returned no commit cursor", idx + 1))
 }
 
-/// Text of the last `Error` frame seen (Go: `DecodeError` code check).
-fn last_error_text(frames: &[Message]) -> Option<(u16, String)> {
-    frames.iter().rev().find_map(|m| match m {
-        Message::Error { code, message } => Some((*code, message.clone())),
-        _ => None,
+/// Everything a rejected attack must leave untouched.
+#[derive(Clone, Copy, Debug)]
+struct Baseline {
+    counters: Counters,
+    committed: u64,
+}
+
+async fn baseline(cluster: &Cluster, idx: usize) -> Result<Baseline, String> {
+    Ok(Baseline {
+        counters: counters(cluster, idx).await?,
+        committed: committed(cluster, idx).await?,
     })
 }
 
-fn msg_name(m: &Message) -> &'static str {
-    match m {
-        Message::Hello { .. } => "Hello",
-        Message::Welcome { .. } => "Welcome",
-        Message::Batches(_) => "Batches",
-        Message::Ack(_) => "Ack",
-        Message::Need { .. } => "Need",
-        Message::SnapshotRequest => "SnapshotRequest",
-        Message::SnapshotManifest(_) => "SnapshotManifest",
-        Message::SnapshotChunk { .. } => "SnapshotChunk",
-        Message::SnapshotDone { .. } => "SnapshotDone",
-        Message::SnapshotResume { .. } => "SnapshotResume",
-        Message::SnapshotNeed { .. } => "SnapshotNeed",
-        Message::SnapshotApplied { .. } => "SnapshotApplied",
-        Message::SnapshotUnavailable { .. } => "SnapshotUnavailable",
-        Message::SnapshotCancel { .. } => "SnapshotCancel",
-        Message::Ping(_) => "Ping",
-        Message::Pong(_) => "Pong",
-        Message::Error { .. } => "Error",
-        Message::SchemaRequest => "SchemaRequest",
-        Message::SchemaManifest(_) => "SchemaManifest",
-        Message::SchemaAck { .. } => "SchemaAck",
-        Message::PlumtreeData(_) => "PlumtreeData",
-        Message::IHave { .. } => "IHave",
-        Message::Prune => "Prune",
-        Message::Graft { .. } => "Graft",
-        Message::ProgressRequest { .. } => "ProgressRequest",
-        Message::ProgressPage { .. } => "ProgressPage",
-        Message::TransactionChunk(_) => "TransactionChunk",
-        Message::MembersRequest { .. } => "MembersRequest",
-        Message::MembersPage { .. } => "MembersPage",
-        Message::ChunkNeed { .. } => "ChunkNeed",
-        Message::ChunkAvailabilityRequest { .. } => "ChunkAvailabilityRequest",
-        Message::ChunkAvailabilityPage { .. } => "ChunkAvailabilityPage",
+/// Rows, counters, and commit cursor unchanged (Go: typed RIME state, HLC,
+/// generation, and receipts unchanged).
+async fn assert_protected(cluster: &Cluster, base: &Baseline, ctx: &str) -> Result<(), String> {
+    assert_counters(cluster, C, &base.counters, ctx).await?;
+    let got = committed(cluster, C).await?;
+    if got != base.committed {
+        return Err(format!(
+            "node{} commit cursor moved {ctx}: {} -> {got} (a forgery published)",
+            C + 1,
+            base.committed
+        ));
     }
-}
-
-fn frame_summary(frames: &[Message]) -> String {
-    if frames.is_empty() {
-        return "<none>".to_string();
+    if names(cluster, C).await? != vec!["from-A".to_string()] {
+        return Err(format!("node{} rows changed {ctx} (a forgery applied)", C + 1));
     }
-    frames
-        .iter()
-        .map(msg_name)
-        .collect::<Vec<_>>()
-        .join(",")
+    Ok(())
 }
 
-/// Every data frame on a relay session must carry honest origins only:
-/// nothing attacker-controlled is ever echoed or relayed back.
-fn assert_no_foreign_data(frames: &[Message], honest: &[[u8; 16]], ctx: &str) {
-    for f in frames {
-        match f {
-            Message::Batches(txs) => {
-                for tx in txs {
-                    assert!(
-                        honest.contains(&tx.origin),
-                        "relay received a batch with foreign origin {} {ctx}",
-                        hex(&tx.origin)
-                    );
-                }
-            }
-            Message::PlumtreeData(tx) => {
-                assert!(
-                    honest.contains(&tx.origin),
-                    "relay received plumtree data with foreign origin {} {ctx}",
-                    hex(&tx.origin)
-                );
-            }
-            Message::TransactionChunk(c) => {
-                assert!(
-                    honest.contains(&c.proof.origin),
-                    "relay received a chunk with foreign origin {} {ctx}",
-                    hex(&c.proof.origin)
-                );
-            }
-            _ => {}
-        }
+/// Wait until `idx` has no connected sessions (teardown observation, and
+/// the required gate before every relay dial: the engine closes a second
+/// inbound session for an id with a lingering entry as a duplicate).
+async fn wait_quiet(cluster: &Cluster, idx: usize, what: &str) -> Result<(), String> {
+    let converged = wait_until_async(PEER_TIMEOUT, Duration::from_millis(50), || async {
+        connected_peers(cluster, idx).await.unwrap_or(u64::MAX) == 0
+    })
+    .await;
+    if !converged {
+        return Err(format!("{what}: node{} sessions did not tear down", idx + 1));
     }
+    Ok(())
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-/// Raw QUIC relay speaking the replication wire protocol while
-/// authenticated as B (Go: `dialRelay` with B's TLS material). The
-/// harness CA issues the relay a fresh leaf for B's NodeID, so TLS can
-/// never be the refusal cause: every rejection below is origin
-/// verification, not transport auth.
-struct Relay {
-    endpoint: quinn::Endpoint,
-    db: [u8; 16],
-}
-
-/// One relay session: the handshake stream stays open for further
-/// attack frames and for observing node replies (Go: `relay`).
-struct RelaySession {
-    connection: quinn::Connection,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-    welcome_schema: Vec<u8>,
-}
-
-impl Relay {
-    fn new(config: &ReplConfig, db: [u8; 16]) -> Self {
-        let endpoint = transport::endpoint(config, NODE_B).expect("relay endpoint");
-        Self { endpoint, db }
-    }
-
-    fn hello(&self, schema: Vec<u8>) -> Message {
-        Message::Hello {
-            capabilities: protocol::CAPABILITIES,
-            required: protocol::REQUIRED,
-            version: protocol::VERSION,
-            database: self.db,
-            node: NODE_B,
-            fetch: None,
-            schema,
-            mode: Dissemination::Gossip,
-            max_transaction: 64 << 20,
-        }
-    }
-
-    /// Dial advertising the given schema identity; the Welcome assert
-    /// is the attach proof (every dial carries its own proof).
-    async fn dial(&self, addr: SocketAddr, schema: Vec<u8>, what: &str) -> RelaySession {
-        let connection = tokio::time::timeout(
-            DIAL_TIMEOUT,
-            self.endpoint
-                .connect(addr, "murmur.invalid")
-                .expect("relay connect setup"),
-        )
+/// Served-origin-proof capture (Go: reading A's committed batch from the
+/// stopped origin's store). The relay fetches A's batches from C over a
+/// `Need` session and verifies every served batch under A's origin key.
+/// Returns the row transaction (highest non-empty sequence) plus C's
+/// schema bytes from the handshake (for the untrusted-manifest leg).
+async fn capture_original(
+    cluster: &Cluster,
+    relay: &Attacker,
+) -> Result<(Transaction, Vec<u8>), String> {
+    wait_quiet(cluster, C, "origin-proof capture").await?;
+    let db = cluster.database_id();
+    let (id_a, id_c) = (cluster.node_id(A), cluster.node_id(C));
+    let addr = cluster.node_info(C).repl_addr;
+    let mut s = relay
+        .dial(addr, db, id_c)
         .await
-        .unwrap_or_else(|_| panic!("{what}: relay dial timeout"))
-        .unwrap_or_else(|e| panic!("{what}: relay connect: {e}"));
-        let (mut send, mut recv) = tokio::time::timeout(DIAL_TIMEOUT, connection.open_bi())
-            .await
-            .unwrap_or_else(|_| panic!("{what}: relay open stream timeout"))
-            .unwrap_or_else(|e| panic!("{what}: relay open stream: {e}"));
-        protocol::write(&mut send, &self.hello(schema))
-            .await
-            .unwrap_or_else(|e| panic!("{what}: relay write hello: {e}"));
-        let welcome_schema =
-            match tokio::time::timeout(WELCOME_TIMEOUT, protocol::read(&mut recv)).await {
-                Ok(Ok(Message::Welcome { schema, .. })) => schema,
-                other => panic!("{what}: relay expected Welcome, got {other:?}"),
-            };
-        RelaySession {
-            connection,
-            send,
-            recv,
-            welcome_schema,
-        }
-    }
-}
+        .map_err(|e| format!("capture dial: {e}"))?;
+    s.send(&Message::Need {
+        origin: id_a,
+        from: 1,
+        through: u64::MAX,
+    })
+    .await
+    .map_err(|e| format!("capture need: {e}"))?;
+    let mut frames = s
+        .collect_until(CAPTURE_TIMEOUT, |m| {
+            matches!(m, Message::Batches(txs) if txs.iter().any(|t| t.origin == id_a && !t.payload.is_empty()))
+        })
+        .await;
+    // Drain stragglers so the highest served sequence wins, not the first.
+    frames.extend(s.collect_until(Duration::from_secs(2), |_| false).await);
+    let schema = s.welcome_schema().to_vec();
+    s.close();
 
-impl RelaySession {
-    async fn send(&mut self, msg: &Message, what: &str) {
-        protocol::write(&mut self.send, msg)
-            .await
-            .unwrap_or_else(|e| panic!("{what}: relay send {}: {e}", msg_name(msg)));
-    }
-
-    /// Read inbound messages until `total` elapses or the stream dies.
-    async fn collect(&mut self, total: Duration) -> Vec<Message> {
-        self.collect_until(total, |_| false).await
-    }
-
-    /// Read until `want` matches, `total` elapses, or the stream dies.
-    async fn collect_until(
-        &mut self,
-        total: Duration,
-        mut want: impl FnMut(&Message) -> bool,
-    ) -> Vec<Message> {
-        let mut out = Vec::new();
-        let deadline = Instant::now() + total;
-        while Instant::now() < deadline {
-            match tokio::time::timeout(SLICE, protocol::read(&mut self.recv)).await {
-                Ok(Ok(m)) => {
-                    let hit = want(&m);
-                    out.push(m);
-                    if hit {
-                        return out;
-                    }
+    let trusted = BTreeMap::from([(id_a, cluster.node_origin_pubkey(A))]);
+    let mut by_seq: BTreeMap<u64, Transaction> = BTreeMap::new();
+    for message in &frames {
+        if let Message::Batches(txs) = message {
+            for tx in txs {
+                if tx.origin != id_a {
+                    continue;
                 }
-                Ok(Err(_)) => return out, // stream died
-                Err(_) => {}              // quiet slice, keep waiting
+                tx.verify(db, &trusted, MAX_TRANSACTION)
+                    .map_err(|e| format!("served batch failed origin verification: {e}"))?;
+                by_seq.insert(tx.sequence, tx.clone());
             }
         }
-        out
     }
-
-    fn close(self, what: &str) {
-        self.connection.close(0u32.into(), format!("{what} done").as_bytes());
+    if by_seq.is_empty() {
+        return Err("C served no batches for offline origin A".into());
     }
+    eprintln!(
+        "capture: C served verified origin-A batches at sequences {:?}",
+        by_seq.keys().collect::<Vec<_>>()
+    );
+    by_seq
+        .into_values()
+        .rev()
+        .find(|tx| !tx.payload.is_empty())
+        .map(|tx| (tx, schema))
+        .ok_or_else(|| "C served only empty origin-A batches".to_string())
 }
 
-/// Background `last_error` recorder. Stray dial-back failures can
-/// overwrite a single latch sample, so Auth-cause legs record every
-/// latch transition on a 10 ms poll and match by timestamp instead.
-struct Recorder {
-    log: Arc<Mutex<Vec<(Instant, String)>>>,
-    stop: Arc<AtomicBool>,
-    thread: Option<std::thread::JoinHandle<()>>,
-}
-
-impl Recorder {
-    fn start(cluster: &Cluster, idx: usize) -> Self {
-        let handle = cluster
-            .node(idx)
-            .replication()
-            .expect("replication handle");
-        let log: Arc<Mutex<Vec<(Instant, String)>>> = Arc::new(Mutex::new(Vec::new()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let thread = std::thread::spawn({
-            let (log, stop) = (Arc::clone(&log), Arc::clone(&stop));
-            move || {
-                let mut last = String::new();
-                while !stop.load(Ordering::Relaxed) {
-                    let cur = handle.status().last_error.unwrap_or_default();
-                    if cur != last {
-                        last = cur.clone();
-                        log.lock().expect("recorder log").push((Instant::now(), cur));
+/// Send one hostile message, retrying across fresh relay sessions until
+/// the victim records a *changed* `last_error` containing `want`
+/// (authentication failures close the session, so every attempt dials
+/// anew; redial noise can transiently overwrite `last_error`, so a miss
+/// resends instead of failing). Returns the new error for chaining.
+async fn expect_rejection(
+    cluster: &Cluster,
+    relay: &Attacker,
+    make: impl Fn() -> Message,
+    prev: &Option<String>,
+    want: &str,
+    what: &str,
+) -> Result<Option<String>, String> {
+    let db = cluster.database_id();
+    let victim = cluster.node_id(C);
+    let addr = cluster.node_info(C).repl_addr;
+    let deadline = Instant::now() + REJECT_TIMEOUT;
+    loop {
+        wait_quiet(cluster, C, what).await?;
+        let mut s = relay
+            .dial(addr, db, victim)
+            .await
+            .map_err(|e| format!("{what}: relay dial: {e}"))?;
+        if s.send(&make()).await.is_ok() {
+            let attempt_end = Instant::now() + ATTEMPT_WINDOW;
+            loop {
+                let cur = last_error(cluster, C).await?;
+                if cur != *prev && cur.as_ref().is_some_and(|e| e.contains(want)) {
+                    eprintln!("{what}: rejected with {cur:?}");
+                    s.close();
+                    return Ok(cur);
+                }
+                for message in s.collect_until(PUMP, |_| false).await {
+                    if matches!(message, Message::Error { .. }) {
+                        eprintln!("{what}: wire error frame: {message:?}");
                     }
-                    std::thread::sleep(Duration::from_millis(10));
+                }
+                if Instant::now() >= attempt_end {
+                    break;
                 }
             }
-        });
-        Self {
-            log,
-            stop,
-            thread: Some(thread),
+        }
+        drop(s);
+        if Instant::now() >= deadline {
+            let cur = last_error(cluster, C).await.ok().flatten();
+            return Err(format!(
+                "{what}: no {want:?} rejection within {REJECT_TIMEOUT:?} (last_error: {cur:?})"
+            ));
         }
     }
-
-    fn saw_since(&self, since: Instant, needle: &str) -> bool {
-        self.log
-            .lock()
-            .expect("recorder log")
-            .iter()
-            .any(|(t, s)| *t >= since && s.contains(needle))
-    }
-
-    fn stop(mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        self.thread.take().expect("recorder thread").join().expect("recorder join");
-    }
 }
 
-/// Ping a stream a fatal probe should have killed and assert the node
-/// never answers: no pong (the ping was never processed) and no
-/// foreign data.
-async fn assert_stream_dead(
-    sess: &mut RelaySession,
-    honest: &[[u8; 16]],
-    nonce: u64,
-    what: &str,
-) {
-    let _ = protocol::write(&mut sess.send, &Message::Ping(nonce)).await;
-    let frames = sess.collect(DEATH_WINDOW).await;
-    for f in &frames {
-        if matches!(f, Message::Pong(n) if *n == nonce) {
-            panic!("node answered ping after {what} (stream should be dead)");
+/// Chunk-availability probe: the forged chunk identities must have no
+/// durable staging (Go: tampering a chunk identity fails before durable
+/// staging or cleanup).
+async fn probe_availability(
+    cluster: &Cluster,
+    relay: &Attacker,
+    forged_seq: u64,
+    chunk_seq: u64,
+) -> Result<(), String> {
+    wait_quiet(cluster, C, "chunk-availability probe").await?;
+    let db = cluster.database_id();
+    let (id_a, id_c) = (cluster.node_id(A), cluster.node_id(C));
+    let addr = cluster.node_info(C).repl_addr;
+    let mut s = relay
+        .dial(addr, db, id_c)
+        .await
+        .map_err(|e| format!("probe dial: {e}"))?;
+    s.send(&Message::ChunkAvailabilityRequest { offset: 0 })
+        .await
+        .map_err(|e| format!("probe request: {e}"))?;
+    let pages = s
+        .collect_until(PROBE_TIMEOUT, |m| {
+            matches!(m, Message::ChunkAvailabilityPage { more: false, .. })
+        })
+        .await;
+    s.close();
+    if !pages
+        .iter()
+        .any(|m| matches!(m, Message::ChunkAvailabilityPage { .. }))
+    {
+        return Err("C answered no chunk-availability page".into());
+    }
+    for message in &pages {
+        if let Message::ChunkAvailabilityPage { entries, .. } = message {
+            for (origin, seq, indexes) in entries {
+                if *origin == id_a && (*seq == forged_seq || *seq == chunk_seq) {
+                    return Err(format!(
+                        "forged chunks durably staged for origin A seq {seq}: {indexes:?}"
+                    ));
+                }
+            }
         }
     }
-    assert_no_foreign_data(&frames, honest, &format!("after {what}"));
-    eprintln!("after {what} the node sent only: {}", frame_summary(&frames));
+    Ok(())
 }
 
-/// Expect one `Error{code: 1}` whose text contains `needle` on a
-/// session that must survive (Go: the non-fatal rejection legs).
-/// Returns all frames seen.
-async fn expect_protocol_error(
-    sess: &mut RelaySession,
-    needle: &str,
-    what: &str,
-) -> Vec<Message> {
-    let frames = sess.collect_until(ERROR_TIMEOUT, is_error_code(1)).await;
-    match last_error_text(&frames) {
-        Some((1, text)) if text.contains(needle) => frames,
-        other => panic!("{what} drew no Error{{code: 1, ..{needle}..}}; saw {other:?}"),
+/// Signed-duplicate replay (Go: after restart): the original batch is
+/// absorbed idempotently — no error frame, nothing counted twice, rows
+/// and cursor unchanged.
+async fn replay_original(
+    cluster: &Cluster,
+    relay: &Attacker,
+    original: &Transaction,
+) -> Result<(), String> {
+    wait_quiet(cluster, C, "signed-duplicate replay").await?;
+    let db = cluster.database_id();
+    let id_c = cluster.node_id(C);
+    let addr = cluster.node_info(C).repl_addr;
+    let mut s = relay
+        .dial(addr, db, id_c)
+        .await
+        .map_err(|e| format!("replay dial: {e}"))?;
+    s.send(&Message::Batches(vec![original.clone()]))
+        .await
+        .map_err(|e| format!("replay send: {e}"))?;
+    let tail = s.collect_until(DRAIN_TIMEOUT, |_| false).await;
+    s.close();
+    if let Some((code, text)) = tail.iter().find_map(|m| match m {
+        Message::Error { code, message } => Some((*code, message.clone())),
+        _ => None,
+    }) {
+        return Err(format!("signed duplicate drew error {code}: {text}"));
     }
+    Ok(())
 }
 
-/// Expect a pong to `nonce` (the session survived the probe).
-async fn expect_pong(sess: &mut RelaySession, nonce: u64, what: &str) -> Vec<Message> {
-    sess.send(&Message::Ping(nonce), what).await;
-    let frames = sess.collect_until(PONG_TIMEOUT, is_pong(nonce)).await;
-    assert!(
-        frames.iter().any(is_pong(nonce)),
-        "missing pong to {what}; saw {}",
-        frame_summary(&frames)
+async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
+    // Same table on every node (Go: TypedRecords fixture tables), flagged
+    // replicated on each node (forwarding needs the per-node flag).
+    for i in 0..cluster.len() {
+        cluster
+            .ensure_migrated(i, "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .map_err(|e| format!("migrate node{}: {e}", i + 1))?;
+    }
+    for i in 0..cluster.len() {
+        cluster
+            .node(i)
+            .simple("MURMUR SET TABLE records REPLICATED true")
+            .await
+            .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
+        cluster
+            .node(i)
+            .flush()
+            .await
+            .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
+    }
+
+    // A commits; B receives; A stops.
+    cluster.add_peer(A, B).await.map_err(|e| format!("mesh A->B: {e}"))?;
+    cluster.add_peer(B, A).await.map_err(|e| format!("mesh B->A: {e}"))?;
+    cluster.sync_all().await.map_err(|e| format!("sync A<->B: {e}"))?;
+    insert(cluster, A, 1, "from-A").await?;
+    wait_names(cluster, B, &["from-A"], CONVERGE_TIMEOUT).await?;
+    cluster.stop_node(A).await;
+
+    // C learns A's transaction exclusively from B while A remains stopped.
+    cluster.add_peer(B, C).await.map_err(|e| format!("mesh B->C: {e}"))?;
+    cluster.add_peer(C, B).await.map_err(|e| format!("mesh C->B: {e}"))?;
+    cluster.sync_all().await.map_err(|e| format!("sync B<->C: {e}"))?;
+    wait_names(cluster, C, &["from-A"], CONVERGE_TIMEOUT).await?;
+    let (b_names, c_names) = (names(cluster, B).await?, names(cluster, C).await?);
+    if b_names != c_names {
+        return Err("forwarded state differs between B and C".into());
+    }
+
+    // Honest baseline on C (Go: `before := status` + honest receipt).
+    // The applied row is the receipt proof: receipts commit atomically
+    // with the apply, and there is no public receipt read API.
+    let base = counters(cluster, C).await?;
+    if names(cluster, C).await? != vec!["from-A".to_string()] {
+        return Err("honest transaction missing on C".into());
+    }
+
+    // B stops; from here C is alone with its forwarded state.
+    cluster.stop_node(B).await;
+    wait_quiet(cluster, C, "B shutdown").await?;
+    assert_counters(cluster, C, &base, "after B shutdown").await?;
+    let relay_base = baseline(cluster, C).await?;
+
+    // Hostile relay, authenticated as B (fresh TLS leaf for B's id, B's
+    // origin seed for signatures the victim accepts). Forged identities
+    // must not collide with real ones.
+    let db = cluster.database_id();
+    let (id_a, id_b, id_c) = (cluster.node_id(A), cluster.node_id(B), cluster.node_id(C));
+    for forged in [FORGED_ID, PROOF_ID, CHUNK_ID, CROSS_DB] {
+        if [id_a, id_b, id_c, db].contains(&forged) {
+            return Err("forged test identity collides with a real id".into());
+        }
+    }
+    if PROOF_ID == CHUNK_ID {
+        return Err("chunk proof/envelope test identities must differ".into());
+    }
+    let seed_a = cluster.node_origin_seed(A);
+    let seed_b = cluster.node_origin_seed(B);
+    let relay = Attacker::impersonate(cluster, B, seed_b)
+        .map_err(|e| format!("relay identity: {e}"))?;
+
+    // Served-origin-proof capture: fetch A's batches from C, verified
+    // under A's origin key.
+    let (original, c_schema) = capture_original(cluster, &relay).await?;
+    eprintln!(
+        "capture: original origin-A seq {} id {} ({} payload bytes)",
+        original.sequence,
+        murmur_live_harness::hex(&original.id),
+        original.payload.len()
     );
-    frames
+    let forged_seq = original.sequence + 1;
+    let chunk_seq = original.sequence + 2;
+
+    // Modified batch: fresh identity, tampered payload bytes, original
+    // signature (Go: `modified`). Fails the payload digest.
+    let mut modified = original.clone();
+    modified.sequence = forged_seq;
+    modified.id = FORGED_ID;
+    modified.payload[0] ^= 0x01;
+    let prev = last_error(cluster, C).await?;
+    let prev = expect_rejection(
+        cluster,
+        &relay,
+        || Message::Batches(vec![modified.clone()]),
+        &prev,
+        "payload digest",
+        "modified batch",
+    )
+    .await?;
+    assert_protected(cluster, &relay_base, "after the modified batch").await?;
+
+    // Unsigned batch (Go: `unsigned`). Adjacent legs use distinct
+    // rejection texts (ed25519 messages are not asserted verbatim).
+    let mut unsigned = original.clone();
+    unsigned.sequence = forged_seq;
+    unsigned.id = FORGED_ID;
+    unsigned.signature.clear();
+    let prev = expect_rejection(
+        cluster,
+        &relay,
+        || Message::Batches(vec![unsigned.clone()]),
+        &prev,
+        "authentication",
+        "unsigned batch",
+    )
+    .await?;
+    assert_protected(cluster, &relay_base, "after the unsigned batch").await?;
+
+    // Cross-DBID batch: valid A signature (verified locally first, so the
+    // rejection isolates the database check), wrong database (Go: `crossDB`).
+    let mut cross = original.clone();
+    cross.database = CROSS_DB;
+    cross.sequence = forged_seq;
+    cross.id = FORGED_ID;
+    cross
+        .sign(&seed_a)
+        .map_err(|e| format!("cross-DBID sign: {e}"))?;
+    cross
+        .verify(
+            CROSS_DB,
+            &BTreeMap::from([(id_a, cluster.node_origin_pubkey(A))]),
+            MAX_TRANSACTION,
+        )
+        .map_err(|e| format!("cross-DBID fixture must verify under its own DBID: {e}"))?;
+    let prev = expect_rejection(
+        cluster,
+        &relay,
+        || Message::Batches(vec![cross.clone()]),
+        &prev,
+        "transaction identity",
+        "cross-DBID batch",
+    )
+    .await?;
+    assert_protected(cluster, &relay_base, "after the cross-DBID batch").await?;
+
+    // Fabricated batch: B's valid signature over an origin-A sequence
+    // (Go: `fabricated`, signed with B's key). The relay's own key must
+    // not authorize another origin's log.
+    let mut fabricated = original.clone();
+    fabricated.sequence = forged_seq;
+    fabricated.id = FORGED_ID;
+    fabricated
+        .sign(&seed_b)
+        .map_err(|e| format!("fabricated sign: {e}"))?;
+    fabricated
+        .verify(
+            db,
+            &BTreeMap::from([(id_a, cluster.node_origin_pubkey(B))]),
+            MAX_TRANSACTION,
+        )
+        .map_err(|e| format!("fabricated fixture must carry a valid B signature: {e}"))?;
+    let prev = expect_rejection(
+        cluster,
+        &relay,
+        || Message::Batches(vec![fabricated.clone()]),
+        &prev,
+        "authentication",
+        "fabricated batch",
+    )
+    .await?;
+    assert_protected(cluster, &relay_base, "after the fabricated batch").await?;
+
+    // Chunk-identity batch (Go: forged `TransactionChunk` with a tampered
+    // identity). The proof is a valid A-signed header for the forged
+    // sequence; the envelope claims a different id, so binding fails
+    // before anything stages.
+    let mut proof = Transaction {
+        database: db,
+        origin: id_a,
+        sequence: chunk_seq,
+        id: PROOF_ID,
+        millis: original.millis,
+        logical: original.logical,
+        schema: original.schema,
+        payload_digest: [0; 32],
+        payload: Vec::new(),
+        signature: Vec::new(),
+    };
+    proof
+        .sign(&seed_a)
+        .map_err(|e| format!("chunk proof sign: {e}"))?;
+    proof
+        .verify_header(db, &BTreeMap::from([(id_a, cluster.node_origin_pubkey(A))]))
+        .map_err(|e| format!("chunk proof fixture must verify: {e}"))?;
+    let chunk = Chunk {
+        proof,
+        origin: id_a,
+        sequence: chunk_seq,
+        id: CHUNK_ID,
+        index: 0,
+        count: 1,
+        total: 100,
+        digest: [7; 32],
+        data: vec![7; 100],
+    };
+    let _prev = expect_rejection(
+        cluster,
+        &relay,
+        || Message::TransactionChunk(chunk.clone()),
+        &prev,
+        "chunk proof identity",
+        "chunk-identity batch",
+    )
+    .await?;
+    assert_protected(cluster, &relay_base, "after the chunk-identity batch").await?;
+
+    // Neither the batch legs nor the chunk leg may have staged anything.
+    probe_availability(cluster, &relay, forged_seq, chunk_seq).await?;
+    assert_protected(cluster, &relay_base, "after the availability probe").await?;
+    eprintln!("hostile relay rejected: rows, counters, and cursor untouched");
+
+    // Restart C: the honest row is durable (A and B stay stopped).
+    cluster.stop_node(C).await;
+    cluster.start_node(C).await.map_err(|e| format!("restart node3: {e}"))?;
+    if names(cluster, C).await? != vec!["from-A".to_string()] {
+        return Err("honest row lost on restart".into());
+    }
+    // Fresh process: counters restart at zero (verified premise for the
+    // idempotency legs below, not an assumption).
+    let post = baseline(cluster, C).await?;
+    if (post.counters.received, post.counters.applied) != (0, 0) {
+        return Err("fresh-process counters must start at zero".into());
+    }
+
+    // Signed-duplicate replay over the relay: idempotent across restart
+    // (no error frame, nothing counted twice, rows and cursor unchanged).
+    replay_original(cluster, &relay, &original).await?;
+    assert_protected(cluster, &post, "after the signed-duplicate replay").await?;
+
+    // An authenticated relay is not automatically a trusted snapshot
+    // source: a manifest with a valid B signature from donor B is still
+    // refused (C trusts no snapshot donors). The schema matches C's own
+    // so the refusal isolates donor trust.
+    let (manifest, _) = snapshot::build(
+        (db, id_b),
+        id_c,
+        vec![0xAB; 100],
+        Vec::new(),
+        protocol::schema_digest(&c_schema),
+        relay.config(),
+        retention::now_millis(),
+    )
+    .map_err(|e| format!("untrusted manifest build: {e}"))?;
+    if manifest.donor != id_b || manifest.chunks.len() != 1 || manifest.signature.is_empty() {
+        return Err("untrusted manifest fixture malformed".into());
+    }
+    let prev = last_error(cluster, C).await?;
+    expect_rejection(
+        cluster,
+        &relay,
+        || Message::SnapshotManifest(manifest.clone()),
+        &prev,
+        "snapshot identity",
+        "untrusted snapshot manifest",
+    )
+    .await?;
+    assert_protected(cluster, &post, "after the untrusted snapshot manifest").await?;
+    eprintln!("forwarded origin survived offline origin, hostile relay, and restart");
+
+    // B rejoins and re-offers the transaction C already holds; C must
+    // absorb the duplicate idempotently: no error, nothing counted
+    // twice, rows unchanged (the engine dedups before counting, so
+    // `received` stays 0).
+    cluster.start_node(B).await.map_err(|e| format!("restart node2: {e}"))?;
+    cluster.add_peer(B, C).await.map_err(|e| format!("re-mesh B->C: {e}"))?;
+    cluster.add_peer(C, B).await.map_err(|e| format!("re-mesh C->B: {e}"))?;
+    cluster.sync_all().await.map_err(|e| format!("sync after B rejoin: {e}"))?;
+    tokio::time::sleep(SETTLE).await;
+    assert_protected(cluster, &post, "after the idempotent re-offer").await?;
+    eprintln!("honest re-offer absorbed idempotently after the relay legs");
+    Ok(())
 }
 
-/// Wait until `idx` has no connected sessions (between relay legs,
-/// every session claims B's identity, so the previous one must be
-/// fully torn down first).
-fn wait_quiet(cluster: &Cluster, idx: usize, what: &str) {
-    assert!(
-        wait_until(PEER_TIMEOUT, Duration::from_millis(50), || {
-            connected_peers(cluster, idx) == 0
-        }),
-        "{what}: node{} sessions did not tear down",
-        idx + 1
-    );
-}
-
-#[test]
-fn forwarded_origin_survives_offline_origin_and_hostile_relay() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forwarded_origin_survives_offline_origin_and_hostile_relay() {
     let mut cluster = Cluster::new(ClusterOptions {
         name: "origin-signatures".into(),
         num_nodes: 3,
-        node_ids: vec![NODE_A, NODE_B, NODE_C],
         manual_peers: true,
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
-
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        const TARGET: usize = C;
-        let dbid = cluster.database_id();
-
-        // Same table on every node (Go: TypedRecords fixture tables).
-        for i in 0..cluster.len() {
-            cluster
-                .node(i)
-                .migrate(Migration::new(
-                    "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-                ))
-                .expect("migrate records table");
-            cluster.node(i).flush().expect("flush schema");
-        }
-
-        // A commits; B receives; A stops.
-        cluster.add_peer(A, B).expect("mesh A->B");
-        cluster.add_peer(B, A).expect("mesh B->A");
-        insert(&cluster, A, 1, "from-A");
-        wait_names(&cluster, B, &["from-A"], CONVERGE_TIMEOUT);
-        cluster.stop_node(A);
-
-        // C learns A's transaction exclusively from B while A stays stopped.
-        cluster.add_peer(B, C).expect("mesh B->C");
-        cluster.add_peer(C, B).expect("mesh C->B");
-        wait_names(&cluster, C, &["from-A"], CONVERGE_TIMEOUT);
-        assert_eq!(
-            names(cluster.node(B)),
-            names(cluster.node(C)),
-            "forwarded state differs"
-        );
-
-        // Honest baseline on C (Go: `before := status` + honest receipt).
-        // The applied row is the receipt proof: receipts commit atomically
-        // with the apply, and there is no public receipt read API.
-        let base = counters(&cluster, TARGET);
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "honest transaction missing on C before the attacks"
-        );
-
-        // B stops; the relay authenticates as B from here on.
-        cluster.stop_node(B);
-        wait_quiet(&cluster, TARGET, "B shutdown");
-
-        // Relay fixture sharing the cluster CA trust (Go: B's TLS files).
-        let issued = cluster.issue_cert(&NODE_B).expect("issue relay cert");
-        let relay_config =
-            ReplConfig::new("127.0.0.1:0".parse().unwrap(), issued.credentials, FABRICATE_SEED);
-        let relay = Relay::new(&relay_config, dbid);
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("relay runtime");
-        let node_addr = cluster.node_info(TARGET).repl_addr;
-
-        // --- Capture leg: fetch A's genuine batches from C's stored log
-        // (Go: reopen A's dir + `ScanReplicationLog`). The served bytes
-        // must verify under A's origin key with the origin intact,
-        // proving C stores the forwarded origin proof (not a B-minted
-        // copy) even though A is offline.
-        let mut fetch =
-            rt.block_on(relay.dial(node_addr, DIVERGENT_SCHEMA.to_vec(), "fetch"));
-        let real_schema = fetch.welcome_schema.clone();
-        assert_ne!(
-            real_schema,
-            DIVERGENT_SCHEMA,
-            "node schema equals the divergent bytes (leg vacuous)"
-        );
-        rt.block_on(fetch.send(
-            &Message::Need {
-                origin: NODE_A,
-                from: 1,
-                through: 16,
-            },
-            "fetch-need",
-        ));
-        let fetch_frames = rt.block_on(fetch.collect(NEED_WINDOW));
-        let mut a_txs: Vec<Transaction> = Vec::new();
-        for f in &fetch_frames {
-            if let Message::Batches(txs) = f {
-                for tx in txs {
-                    if tx.origin == NODE_A {
-                        a_txs.push(tx.clone());
-                    }
-                }
-            }
-        }
-        assert!(
-            !a_txs.is_empty(),
-            "C served no A-origin batches for Need{{A,1..=16}}; saw {}",
-            frame_summary(&fetch_frames)
-        );
-        a_txs.sort_by_key(|tx| tx.sequence);
-        a_txs.dedup_by(|a, b| {
-            assert_eq!(
-                a.digest().expect("digest served tx"),
-                b.digest().expect("digest served tx"),
-                "C served conflicting bytes for A/{}",
-                a.sequence
-            );
-            a.sequence == b.sequence
-        });
-        let original = a_txs.last().expect("served A batch").clone();
-        let mut trust: BTreeMap<[u8; 16], [u8; 32]> = BTreeMap::new();
-        trust.insert(NODE_A, cluster.node_origin_pubkey(A));
-        original
-            .verify(dbid, &trust, MAX_TX)
-            .expect("served A batch must verify under A's origin key");
-        eprintln!(
-            "captured genuine A/{} ({} A-origin batch{}) for the attack legs",
-            original.sequence,
-            a_txs.len(),
-            if a_txs.len() == 1 { "" } else { "es" }
-        );
-        fetch.close("fetch");
-        wait_quiet(&cluster, TARGET, "fetch session");
-
-        // Fresh sequences per attack (Go: `Sequence++` on every attack).
-        let fresh = original.sequence + 100;
-        let recorder = Recorder::start(&cluster, TARGET);
-
-        // --- Modified: tampered payload under the original signature
-        // (Go: `Mutations[0].Value = "tampered"`).
-        let mut modified = original.clone();
-        modified.sequence = fresh;
-        modified.id = MODIFIED_ID;
-        assert!(
-            !modified.payload.is_empty(),
-            "original has an empty payload (leg vacuous)"
-        );
-        modified.payload[0] ^= 0x01;
-        assert_eq!(
-            modified.signature, original.signature,
-            "fixture updated the signature it must leave stale"
-        );
-        let mut s = rt.block_on(relay.dial(node_addr, real_schema.clone(), "modified"));
-        let since = Instant::now();
-        rt.block_on(s.send(&Message::Batches(vec![modified]), "modified"));
-        rt.block_on(assert_stream_dead(&mut s, &HONEST, 0xD1, "modified batch"));
-        assert!(
-            recorder.saw_since(since, "payload digest mismatch"),
-            "node never latched the digest-mismatch cause for the modified batch"
-        );
-        s.close("modified");
-        wait_quiet(&cluster, TARGET, "modified session");
-        assert_counters(&cluster, TARGET, &base, "after the modified batch");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the modified batch"
-        );
-
-        // --- Fabricated: re-signed with the wrong key (Go: B's origin
-        // key) while claiming origin A, with a bumped clock (Go: HLC++).
-        let mut fabricated = original.clone();
-        fabricated.sequence = fresh + 1;
-        fabricated.id = FABRICATED_ID;
-        fabricated.millis = original.millis.wrapping_add(1000);
-        fabricated
-            .sign(&FABRICATE_SEED)
-            .expect("fabricated sign");
-        // Non-vacuous: the fabrication is self-consistent under the
-        // attacker key, so only the origin/key binding is wrong.
-        let mut wrong_trust: BTreeMap<[u8; 16], [u8; 32]> = BTreeMap::new();
-        wrong_trust.insert(NODE_A, protocol::public_key(&FABRICATE_SEED));
-        fabricated
-            .verify(dbid, &wrong_trust, MAX_TX)
-            .expect("fabrication must verify under the attacker key locally");
-        assert!(
-            fabricated.verify(dbid, &trust, MAX_TX).is_err(),
-            "fabrication verifies under A's key locally (leg vacuous)"
-        );
-        let mut s = rt.block_on(relay.dial(node_addr, real_schema.clone(), "fabricated"));
-        let since = Instant::now();
-        rt.block_on(s.send(&Message::Batches(vec![fabricated]), "fabricated"));
-        rt.block_on(assert_stream_dead(&mut s, &HONEST, 0xD2, "fabricated batch"));
-        assert!(
-            recorder.saw_since(since, "signature error"),
-            "node never latched the signature cause for the fabricated batch"
-        );
-        s.close("fabricated");
-        wait_quiet(&cluster, TARGET, "fabricated session");
-        assert_counters(&cluster, TARGET, &base, "after the fabricated batch");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the fabricated batch"
-        );
-
-        // --- Unsigned: the signature stripped (Go: SignatureVersion = 0).
-        let mut unsigned = original.clone();
-        unsigned.sequence = fresh + 2;
-        unsigned.id = UNSIGNED_ID;
-        unsigned.signature.clear();
-        assert!(
-            unsigned.verify(dbid, &trust, MAX_TX).is_err(),
-            "unsigned batch verifies locally (leg vacuous)"
-        );
-        let mut s = rt.block_on(relay.dial(node_addr, real_schema.clone(), "unsigned"));
-        let since = Instant::now();
-        rt.block_on(s.send(&Message::Batches(vec![unsigned]), "unsigned"));
-        rt.block_on(assert_stream_dead(&mut s, &HONEST, 0xD3, "unsigned batch"));
-        assert!(
-            recorder.saw_since(since, "signature error"),
-            "node never latched the signature cause for the unsigned batch"
-        );
-        s.close("unsigned");
-        wait_quiet(&cluster, TARGET, "unsigned session");
-        assert_counters(&cluster, TARGET, &base, "after the unsigned batch");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the unsigned batch"
-        );
-
-        // --- Cross-DBID: A's signature over a foreign database id.
-        // Identity failures are `Error::Protocol`, so unlike the Auth
-        // legs above the session must survive (Go: same session).
-        let mut cross = original.clone();
-        cross.sequence = fresh + 3;
-        cross.id = CROSSDB_ID;
-        cross.database = CROSS_DB;
-        assert!(
-            cross.verify(dbid, &trust, MAX_TX).is_err(),
-            "cross-DBID batch verifies locally (leg vacuous)"
-        );
-        let mut s = rt.block_on(relay.dial(node_addr, real_schema.clone(), "cross-db"));
-        let since = Instant::now();
-        rt.block_on(s.send(&Message::Batches(vec![cross]), "cross-db"));
-        let seen = rt.block_on(expect_protocol_error(
-            &mut s,
-            "transaction identity",
-            "cross-DBID batch",
-        ));
-        assert_no_foreign_data(&seen, &HONEST, "on the cross-DBID session");
-        assert!(
-            recorder.saw_since(since, "transaction identity"),
-            "node never latched the identity cause for the cross-DBID batch"
-        );
-        // Session alive: the ping round-trips.
-        let pong_frames = rt.block_on(expect_pong(&mut s, 0xD4, "ping after cross-DBID"));
-        assert_no_foreign_data(&pong_frames, &HONEST, "after the cross-DBID batch");
-        s.close("cross-db");
-        wait_quiet(&cluster, TARGET, "cross-DBID session");
-        assert_counters(&cluster, TARGET, &base, "after the cross-DBID batch");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the cross-DBID batch"
-        );
-
-        // --- Chunk identity: a tampered proof clock (Go: chunk.HLC++)
-        // must fail before durable staging or cleanup.
-        let chunk_seq = fresh + 4;
-        let mut proof = original.clone();
-        proof.payload.clear();
-        proof.sequence = chunk_seq;
-        proof.id = CHUNK_ID;
-        proof.millis = original.millis.wrapping_add(1);
-        // Signature deliberately NOT updated. Non-vacuous: the
-        // untampered cleared-payload proof shape verifies, so the +1ms
-        // tamper is the sole rejection cause.
-        let mut clean = original.clone();
-        clean.payload.clear();
-        clean
-            .verify_header(dbid, &trust)
-            .expect("untampered cleared-payload proof must verify");
-        assert!(
-            proof.verify_header(dbid, &trust).is_err(),
-            "tampered proof verifies locally (leg vacuous)"
-        );
-        let chunk_data = b"origin-chunk-attack-probe".to_vec();
-        let chunk = Chunk {
-            proof,
-            origin: NODE_A,
-            sequence: chunk_seq,
-            id: CHUNK_ID,
-            index: 0,
-            count: 1,
-            total: chunk_data.len() as u64,
-            digest: Sha256::digest(&chunk_data).into(),
-            data: chunk_data,
-        };
-        // Well-formedness: every structural check passes; only the
-        // proof signature is wrong.
-        assert_eq!(
-            chunk.count as usize,
-            (chunk.total as usize).div_ceil(protocol::CHUNK_BYTES),
-            "fixture chunk count is structurally wrong"
-        );
-        let mut s = rt.block_on(relay.dial(node_addr, real_schema.clone(), "chunk"));
-        let since = Instant::now();
-        rt.block_on(s.send(&Message::TransactionChunk(chunk), "chunk"));
-        rt.block_on(assert_stream_dead(&mut s, &HONEST, 0xD5, "tampered chunk"));
-        assert!(
-            recorder.saw_since(since, "signature error"),
-            "node never latched the signature cause for the tampered chunk"
-        );
-        s.close("chunk");
-        wait_quiet(&cluster, TARGET, "chunk session");
-        assert_counters(&cluster, TARGET, &base, "after the tampered chunk");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the tampered chunk"
-        );
-        // Nothing durably staged: the availability index must not list
-        // the attacked transfer (it lists durable chunk manifests).
-        let mut probe = rt.block_on(relay.dial(node_addr, real_schema.clone(), "chunk-probe"));
-        rt.block_on(probe.send(
-            &Message::ChunkAvailabilityRequest { offset: 0 },
-            "chunk-probe",
-        ));
-        let probe_frames = rt.block_on(probe.collect_until(PROBE_TIMEOUT, |m| {
-            matches!(m, Message::ChunkAvailabilityPage { .. })
-        }));
-        match probe_frames.iter().find_map(|m| match m {
-            Message::ChunkAvailabilityPage { entries, more } => Some((entries, more)),
-            _ => None,
-        }) {
-            Some((entries, more)) => {
-                assert!(
-                    entries.is_empty(),
-                    "rejected chunk was durably staged: {entries:?}"
-                );
-                assert!(!more, "unexpected second availability page");
-            }
-            None => panic!(
-                "no chunk-availability page; saw {}",
-                frame_summary(&probe_frames)
-            ),
-        }
-        probe.close("chunk-probe");
-        wait_quiet(&cluster, TARGET, "chunk-probe session");
-
-        // --- Restart C: the honest row and signed history are durable
-        // (Go: `receipt` present after restart). A and B stay stopped.
-        recorder.stop();
-        cluster.stop_node(TARGET);
-        cluster.start_node(TARGET).expect("restart node3");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "honest row lost on restart"
-        );
-        // Fresh process: counters restart at zero (verified premise for
-        // the idempotency leg below, not an assumption).
-        let post = counters(&cluster, TARGET);
-        assert_eq!(
-            (post.received, post.applied),
-            (0, 0),
-            "fresh-process counters must start at zero"
-        );
-        let node_addr = cluster.node_info(TARGET).repl_addr;
-
-        // --- Signed duplicate replay stays idempotent across restart:
-        // no error, the session survives, and nothing is counted twice
-        // (Go: generation unchanged; Rust dedups before counting, so
-        // `received` stays 0 rather than reaching 1).
-        let mut replay = rt.block_on(relay.dial(node_addr, real_schema.clone(), "replay"));
-        rt.block_on(replay.send(
-            &Message::Batches(vec![original.clone()]),
-            "replay",
-        ));
-        // Ordered stream: the pong proves the duplicate was already
-        // processed (silently absorbed, not applied).
-        let replay_frames = rt.block_on(expect_pong(&mut replay, 0xD6, "replay ping"));
-        assert!(
-            !replay_frames
-                .iter()
-                .any(|m| matches!(m, Message::Error { .. })),
-            "signed duplicate drew an error frame; saw {}",
-            frame_summary(&replay_frames)
-        );
-        assert_no_foreign_data(&replay_frames, &HONEST, "on the replay session");
-        replay.close("replay");
-        wait_quiet(&cluster, TARGET, "replay session");
-        assert_counters(&cluster, TARGET, &post, "after the signed-duplicate replay");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the signed-duplicate replay"
-        );
-
-        // --- An authenticated relay is not automatically a trusted
-        // snapshot source (Go: empty `TrustedSnapshotSources` on C,
-        // which is also the harness default).
-        let recorder2 = Recorder::start(&cluster, TARGET);
-        let snap_data = vec![0x53u8; 4096];
-        let snap_schema = protocol::schema_digest(&real_schema);
-        let now = retention::now_millis();
-        let (manifest, _records) = snapshot::build(
-            (dbid, NODE_B),
-            NODE_C,
-            snap_data.clone(),
-            Vec::new(),
-            snap_schema,
-            &relay_config,
-            now,
-        )
-        .expect("build manifest");
-        // Non-vacuous: every manifest check except source trust passes,
-        // so the refusal is the trust check alone.
-        assert_eq!(manifest.donor, NODE_B, "fixture manifest donor wrong");
-        assert_eq!(manifest.recipient, NODE_C, "fixture manifest recipient wrong");
-        assert_eq!(manifest.database, dbid, "fixture manifest database wrong");
-        assert!(manifest.expires > now, "fixture manifest already expired");
-        assert_eq!(manifest.bytes, snap_data.len() as u64, "fixture manifest size wrong");
-        assert_eq!(
-            manifest.chunks.len(),
-            snap_data.len().div_ceil(protocol::CHUNK_BYTES),
-            "fixture manifest chunking wrong"
-        );
-        assert_eq!(
-            manifest.digest,
-            <[u8; 32]>::from(Sha256::digest(&snap_data)),
-            "fixture manifest digest wrong"
-        );
-        let mut s = rt.block_on(relay.dial(node_addr, real_schema.clone(), "snapshot"));
-        let since = Instant::now();
-        rt.block_on(s.send(&Message::SnapshotManifest(manifest), "snapshot"));
-        rt.block_on(assert_stream_dead(
-            &mut s,
-            &HONEST,
-            0xD7,
-            "untrusted snapshot manifest",
-        ));
-        assert!(
-            recorder2.saw_since(since, "snapshot identity, trust or expiry"),
-            "node never latched the trust cause for the untrusted manifest"
-        );
-        s.close("snapshot");
-        wait_quiet(&cluster, TARGET, "snapshot session");
-        assert_counters(&cluster, TARGET, &post, "after the untrusted snapshot manifest");
-        assert_eq!(
-            names(cluster.node(TARGET)),
-            vec!["from-A".to_string()],
-            "node3 rows changed after the untrusted snapshot manifest"
-        );
-        recorder2.stop();
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("origin-signatures");
+    assert_eq!(cluster.len(), 3, "this scenario is written for 3 nodes");
+    let result = run_body(&mut cluster).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
+    if failed {
+        cluster.dump_forensics("origin-signatures").await;
+    }
+    cluster.finish(failed).await;
     assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }

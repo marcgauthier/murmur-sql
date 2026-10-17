@@ -264,8 +264,20 @@ impl Store {
         result
     }
 
-    /// Select the oldest sealed segment whose live ratio is at or
-    /// below the threshold.
+    /// Select the oldest sealed segment whose live-value-byte ratio is
+    /// at or below the threshold.
+    ///
+    /// Tombstones are excluded from the ratio: a tombstone costs ~100
+    /// bytes to rewrite but counts as a full live record under a count
+    /// ratio, so a few hundred markers (tens of KiB) can veto
+    /// compacting a file that is 99%+ garbage by bytes. Those stranded
+    /// markers pin their file from deletion (which needs zero live
+    /// tombstones) while their file's survival pins younger tomb files
+    /// from draining (tomb drops need co-contained values), gridlocking
+    /// reclamation behind cross-file delete chains (retention prunes,
+    /// snapshot chunk deletes, blob-piece cleanup) with reclaim a
+    /// permanent no-op. Files with no live value records stay on the
+    /// deletion path and are never rewritten.
     fn pick_compaction(&self) -> Option<u64> {
         let active = self.inner.seg.active_id();
         let mut best: Option<u64> = None;
@@ -277,12 +289,14 @@ impl Store {
             if snap.state != SegmentState::Sealed {
                 continue;
             }
-            let total = snap.stats.total_records;
+            if snap.stats.live_records == 0 {
+                continue;
+            }
+            let total = snap.stats.total_bytes;
             if total == 0 {
                 continue;
             }
-            let live = snap.stats.live_records + snap.live_tombs;
-            if live == 0 || live as f64 / total as f64 > self.inner.opts.compaction_threshold {
+            if snap.stats.live_bytes as f64 / total as f64 > self.inner.opts.compaction_threshold {
                 continue;
             }
             if best.map(|b| id < b).unwrap_or(true) {

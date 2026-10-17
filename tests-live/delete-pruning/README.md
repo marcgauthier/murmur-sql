@@ -1,85 +1,64 @@
 # delete-pruning (Rust port)
 
 Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/delete-pruning/`
-(`README.md` + `delete_pruning_test.go`:
+(`delete_pruning_test.go`,
 `TestConcurrentDeletesResurrectionsAndUpdatesConverge`).
 
 ## What it proves
 
-Three encrypted, mutually authenticated nodes share 300 rows
-(`MURMUR_DELETE_PRUNING_KEYS`, multiple of 3), then concurrently delete,
-update, and resurrect disjoint thirds under aggressive log retention
-(retention 1 s, minimum retained 10, maximum offline 20 s). Retention
-collection is forced mid-flight and all nodes must converge on exact
-counts plus equal row contents.
+Concurrent deletes, resurrections, and updates on a shared row set
+converge under aggressive log retention (1 s retention, 10 minimum
+retained batches, 20 s offline memory). A retention pass is driven
+explicitly while tombstone batches are live, and afterwards all nodes
+agree on contents plus exact row counts.
 
-Scope (same as Go): delete/resurrect convergence plus log-GC collection
-of the delete batches; stored tombstone markers stay in state by design
-and are out of scope.
+Scope note (same as Go): there is no stored-tombstone pruning API in
+the product (tombstone markers stay in state; only origin-log batches
+are collected). This suite proves delete/resurrect convergence plus
+log collection of the delete batches, not stored-tombstone reclamation.
 
-## Pass criteria
+## Pass criteria (same as Go)
 
-- `Cluster::new` opens 3 meshed nodes under
-  `tests-live/runtime/delete-pruning/` with aggressive retention overlays.
-- Node 1 seeds `seed-{0..299}`; all nodes converge on 300 rows with equal
-  contents within 60 s.
-- Phase 1 (concurrent, one worker per node): node 1 deletes the first
-  third, node 2 renames the middle third to `upd-{i}`, node 3 deletes the
-  last third. All nodes converge on 100 rows; row `third` reads `upd-{third}`
-  (anti-vacuity: the update was not lost).
-- Phase 2: node 2 resurrects the first third as `res-{i}`; all nodes
-  converge on 200 rows.
-- Phase 3: node 1 deletes the middle third; all nodes converge on 100 rows.
-- Retention passes run on node 1 until its durable
-  `collected_transactions` counter advances (within 150 s); runs and
-  collected totals are logged.
-- Every node holds exactly 100 rows with identical ordered `(id, name)`
-  digests; row 0 reads `res-0` and row `third` is absent on every node.
-- A post-prune insert from node 3 (`post-prune`) replicates everywhere
-  within 30 s (101 rows).
+- 300 seeded rows (multiple of 3) converge on all nodes.
+- Phase 1 (concurrent disjoint thirds: delete / update / delete)
+  converges on the updated middle third only, with the update value
+  intact (anti-vacuity).
+- Phase 2 resurrects the first third; phase 3 deletes the middle third;
+  survivors are exactly the resurrected rows.
+- A retention pass runs (`last_collection_millis` advances) and collects
+  log batches (`collected_transactions` grows).
+- Identical digests and exact counts everywhere; resurrected content
+  present, deleted rows absent, on every node; a post-prune write
+  replicates everywhere.
 
 ## Env knobs
 
-- `MURMUR_DELETE_PRUNING_KEYS` (default 300): shared row count; must be a
-  multiple of 3.
-- Standard harness knobs: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
+- `MURMUR_DELETE_PRUNING_KEYS` (default 300): shared row count, must be
+  a multiple of 3.
+- Harness knobs apply: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT)`) via
-  `Database::transaction`/`Database::read` instead of the managed
-  typed-contention HTTP API (`TypedContentionInsert/Update/Delete/Read/Rows`);
-  row ids keep the Go `deleteRowID` UUID-shaped format; "not found" is a
-  missing SQL row instead of a `failed (404)` API error.
-- Concurrency via `std::thread::scope` + a start `Barrier` (one worker per
-  node, cloned `Database` handles) instead of goroutines + `WaitGroup` +
-  error channel; per-op `flush()` publishes each write to replication.
-- Aggressive retention maps onto the harness
-  `ReplicationOptions { retention: 1 s, minimum_retained: 10,
-  maximum_offline: 20 s }` overlays (Go: `MinLogRetentionMs`,
-  `MinRetainedBatches`, `MaxOfflineLogRetentionMs`); no harness change needed.
-- GC forcing uses the product's on-demand `Database::collect_retention()`
-  (each 2 s poll runs a pass) instead of waiting for the Go 30 s GC ticker;
-  `retention_status().collected_transactions` replaces
-  `spedsql_gc_log_collected_total` and
-  `status().metrics.retention_runs` replaces `spedsql_gc_runs_total`.
-- Resurrection is a plain SQL re-`INSERT` of the same primary key after the
-  delete has converged, so the insert wins by row generation under the
-  product's tombstone join (`merge.rs`: a row survives iff the newest
-  tombstone generation for its key is older than the row generation).
+- Multi-process `murmur-server` children over the PG wire (per design)
+  instead of `testnode` daemon processes over HTTPS+mTLS.
+- Plain SQL (`rows(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL)`, UUID-shaped
+  ids with explicit `NOT NULL` on primary key) instead of the typed-contention
+  HTTP API; a missing row reads back as an empty result instead of a 404.
+- Retention legs use `MURMUR RETENTION COLLECT` (on-demand bounded pass)
+  plus `MURMUR SHOW RETENTION` (`collected_transactions`,
+  `last_collection_millis`) instead of polling the 30 s GC ticker's
+  `spedsql_gc_runs_total` / `spedsql_gc_log_collected_total` counters.
+- One flush per phase op: the product mints one replication log entry per
+  flush batch, so unflushed phases would leave too few batches to prune.
+- Digests join `id\0name` pairs instead of JSON-marshalling rows (only
+  cross-node equality within one process is asserted).
 
-## Shared-harness addition
-
-None. The `ReplicationOptions::{retention, minimum_retained,
-maximum_offline}` overlays and the `Database::collect_retention` /
-`Database::retention_status` product APIs already exist.
-
-## Compile check (only gate; never run here)
+## Verification
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/delete-pruning/Cargo.toml
+MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server \
+  CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target \
+  cargo test --manifest-path tests-live/delete-pruning/Cargo.toml -- --nocapture
 ```

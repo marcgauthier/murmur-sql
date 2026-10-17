@@ -22,7 +22,6 @@ use std::{
 /// Scoped SQL access. Does not expose connection hooks or transaction controls.
 pub struct Sql<'a> {
     pub(crate) connection: &'a Connection,
-    #[cfg(feature="replication")]
     pub(crate) schema: &'a Schema,
     #[cfg(feature="replication")]
     pub(crate) intents: Option<&'a std::cell::RefCell<Vec<PolicyIntent>>>,
@@ -31,20 +30,24 @@ pub struct Sql<'a> {
 }
 impl Sql<'_> {
     pub fn execute<P: Params>(&self, sql: &str, params: P) -> rusqlite::Result<usize> {
-        self.connection.execute(sql, params)
+        self.prepare(sql)?.execute(params)
     }
     pub fn execute_batch(&self, sql: &str) -> rusqlite::Result<()> {
-        self.connection.execute_batch(sql)
+        for statement in crate::primary_key::statements(sql)? {
+            let rewritten = crate::primary_key::rewrite(statement, self.schema)?;
+            self.connection.execute_batch(&rewritten)?;
+        }
+        Ok(())
     }
     pub fn prepare(&self, sql: &str) -> rusqlite::Result<Statement<'_>> {
-        self.connection.prepare(sql)
+        self.connection.prepare(&crate::primary_key::rewrite(sql, self.schema)?)
     }
     pub fn query_row<T, P, F>(&self, sql: &str, params: P, f: F) -> rusqlite::Result<T>
     where
         P: Params,
         F: FnOnce(&Row<'_>) -> rusqlite::Result<T>,
     {
-        self.connection.query_row(sql, params, f)
+        self.prepare(sql)?.query_row(params, f)
     }
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
@@ -85,11 +88,18 @@ pub struct Database {
     pub(crate) inner: Arc<Inner>,
 }
 impl Database {
-    pub fn open(
+    pub fn open(path: impl AsRef<std::path::Path>, key: impl AsRef<[u8]>, options: Options) -> Result<Self> {
+        Self::open_inner(path, key, options, None)
+    }
+    pub(crate) fn open_with_flags(path: impl AsRef<std::path::Path>, key: impl AsRef<[u8]>, options: Options, flags: std::collections::BTreeMap<String,bool>) -> Result<Self> {
+        Self::open_inner(path, key, options, Some(flags))
+    }
+    fn open_inner(
         path: impl AsRef<std::path::Path>,
         key: impl AsRef<[u8]>,
         #[allow(unused_mut)]
         mut options: Options,
+        flags: Option<std::collections::BTreeMap<String,bool>>,
     ) -> Result<Self> {
         #[cfg(feature = "replication")]
         if let Some(config) = &options.replication {
@@ -121,7 +131,8 @@ impl Database {
                     let cursor = opened.cursor;
                     let collection_clock = opened.clock;
                     let mut search = crate::search::Manager::new(&options);
-                    crate::search::Manager::register(&connection, &options.search_indexes)?;
+                    let definitions = crate::search::schema_definitions(&options.search_indexes, &schema)?;
+                    crate::search::Manager::register(&connection, &definitions)?;
                     search.sync_schema(&connection, &schema, options.mode == OpenMode::CreateNew)?;
                     search.refresh(&connection, &schema)?;
                     search.take_publications();
@@ -155,6 +166,9 @@ impl Database {
                         captured_cursor: cursor,
                         last_capture: Instant::now(),
                         pending_intents: Vec::new(),
+                        table_config_path: None,
+                        table_config: None,
+                        transition_failed: false,
                         search,
                         last_search: Instant::now(),
                         sub_mgr: sub_mgr.clone(),
@@ -231,6 +245,11 @@ impl Database {
                 sub_mgr,
             }),
         };
+        if let Some(flags) = flags {
+            if !flags.is_empty() || database.table_config_owned()? {
+                if let Err(error) = database.set_table_replication_memory(flags) { let _ = database.close(); return Err(error); }
+            }
+        }
         #[cfg(feature = "replication")]
         if let Some(config) = network_config {
             match crate::network::attach(&database, config) {
@@ -307,7 +326,7 @@ impl Database {
             let result = catch_unwind(AssertUnwindSafe(|| {
                 f(&Sql {
                     connection: &c.connection,
-                    #[cfg(feature="replication")] schema: &c.schema,
+                    schema: &c.schema,
                     #[cfg(feature="replication")] intents: None,
                     #[cfg(feature="replication")] access: &c.access,
                 })
@@ -328,8 +347,9 @@ impl Database {
     pub fn refresh_indexes(&self) -> Result<()> {
         self.call(|c| { c.checkpoint()?; c.maintain_search(true) })
     }
-    /// Replace node-local index definitions atomically and rebuild them.
-    /// Supply these definitions again in Options when reopening the database.
+    /// Replace explicit node-local index definitions atomically and rebuild them.
+    /// Schema-derived column FTS indexes are retained. Supply explicit definitions
+    /// again in Options when reopening the database.
     pub fn set_search_indexes(&self, definitions: Vec<crate::SearchIndex>) -> Result<()> {
         self.call(move |c| {
             c.writable()?;
@@ -359,16 +379,75 @@ impl Database {
             Ok(())
         })
     }
+    /// Persist a column's FTS declaration as replicated schema metadata.
+    /// Requires TEXT and one INTEGER application primary key. Index contents
+    /// remain node-local and follow source changes asynchronously.
+    pub fn set_column_fts(&self, table: &str, column: &str, enabled: bool) -> Result<()> {
+        let table = table.to_owned();
+        let column = column.to_owned();
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance)?;
+        let result = self.call(move |c| c.set_column_fts(&table, &column, enabled));
+        drop(ticket);
+        result
+    }
+
+    /// Persist or remove a vector declaration. Requires BLOB, one INTEGER
+    /// application key, and the vector feature. None disables the declaration.
+    pub fn set_column_vector(&self, table: &str, column: &str, config: Option<crate::VectorColumnConfig>) -> Result<()> {
+        let table = table.to_owned(); let column = column.to_owned();
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance)?;
+        let result = self.call(move |c| c.set_column_search(&table, &column, move |c| c.vector = config));
+        drop(ticket);
+        result
+    }
+
     /// Persist a table's local replication setting with its schema in Spool.
-    /// Tables default to enabled. Local writes remain durable when disabled.
+    /// Tables default to local-only. Changing modes rebuilds the physical primary key.
     pub fn set_replication(&self, table_name: &str, enabled: bool) -> Result<()> {
         let table_name = table_name.to_owned();
-        self.call(move |c| c.set_table_replication(&table_name, enabled))
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance)?;
+        let result = self.call(move |c| c.set_table_replication(&table_name, enabled));
+        drop(ticket); result
+    }
+    pub(crate) fn set_replication_config(&self, name: &str, enabled: bool, path: &std::path::Path) -> Result<()> {
+        let name = name.to_owned(); let path = path.to_path_buf();
+        let ticket = self.inner.scheduler.admit(crate::scheduler::WriterClass::Maintenance)?;
+        let result = self.call(move |c| c.set_table_mode(&name, enabled, Some(&path)));
+        drop(ticket); result
     }
     /// Alias matching the requested API spelling.
     #[allow(non_snake_case)]
     pub fn SetReplication(&self, table_name: &str, value: bool) -> Result<()> {
         self.set_replication(table_name, value)
+    }
+    /// Reconcile table structures against the authoritative config map before
+    /// serving SQL or starting replication.
+    pub(crate) fn set_table_replication_memory(
+        &self,
+        map: std::collections::BTreeMap<String, bool>,
+    ) -> Result<()> {
+        self.call(move |c| {
+            let tables = c.schema.tables.iter().map(|t| (t.name.clone(), t.id.clone())).collect::<Vec<_>>();
+            for (name, id) in tables { c.set_table_replication(&name, map.get(&id).copied().unwrap_or(false))?; }
+            c.schema.table_replication = map;
+            Ok(())
+        })
+    }
+    pub(crate) fn bind_table_config(&self, path: &std::path::Path, config: Arc<std::sync::RwLock<crate::config::Config>>) -> Result<()> {
+        let path=path.to_path_buf(); self.call(move |c|{c.table_config_path=Some(path);c.table_config=Some(config);Ok(())})
+    }
+    pub(crate) fn table_config_owned(&self) -> Result<bool> {
+        Ok(self.inner.store.get(b"00/schema/config-owned")?.is_some())
+    }
+    pub(crate) fn mark_table_config_owned(&self) -> Result<()> {
+        self.call(|c| {
+            let (tx, rx) = mpsc::channel();
+            c.worker.send(Work::Network(Box::new(move |opened| {
+                let result = opened.store.commit(&[spool::Mutation::put(b"00/schema/config-owned".to_vec(), vec![1])], spool::Durability::Sync).map_err(Error::from);
+                let _ = tx.send(result);
+            }))).map_err(|_|Error::Closed)?;
+            rx.recv().map_err(|_|Error::Closed)?
+        })
     }
     /// Read the table's current local replication setting.
     pub fn replication_enabled(&self, table_name: &str) -> Result<bool> {
@@ -461,6 +540,7 @@ impl Database {
     /// Retry retained checkpoints after the storage problem is resolved.
     pub fn retry_storage(&self) -> Result<()> {
         self.call(|c| {
+            if c.transition_failed { return Err(Error::Storage("table transition interrupted; close and reopen the database".into())); }
             let (tx, rx) = mpsc::channel();
             c.worker.send(Work::Retry(tx)).map_err(|_| Error::Closed)?;
             rx.recv().map_err(|_| Error::Closed)??;
@@ -601,6 +681,9 @@ pub(crate) struct Core {
     pub(crate) captured_cursor: u64,
     last_capture: Instant,
     pending_intents: Vec<PolicyIntent>,
+    pub(crate) table_config_path: Option<std::path::PathBuf>,
+    pub(crate) table_config: Option<Arc<std::sync::RwLock<crate::config::Config>>>,
+    transition_failed: bool,
     pub(crate) search: crate::search::Manager,
     last_search: Instant,
     pub(crate) sub_mgr: Arc<crate::subscription::SubscriptionManager>,
@@ -655,6 +738,7 @@ impl Core {
         }
     }
     fn writable(&self) -> Result<()> {
+        if self.transition_failed { return Err(Error::Storage("table transition interrupted; close and reopen the database".into())); }
         let s = self.status.lock().unwrap();
         if s.closed {
             return Err(Error::Closed);
@@ -811,7 +895,7 @@ impl Core {
             let value = catch_unwind(AssertUnwindSafe(|| {
                 f(&Sql {
                     connection: &self.connection,
-                    #[cfg(feature="replication")] schema: &self.schema,
+                    schema: &self.schema,
                     #[cfg(feature="replication")] intents: Some(&intents),
                     #[cfg(feature="replication")] access: &self.access,
                 })
@@ -844,24 +928,172 @@ impl Core {
         }
         result
     }
-    fn set_table_replication(&mut self, name: &str, enabled: bool) -> Result<()> {
+    fn set_column_fts(&mut self, table: &str, column: &str, enabled: bool) -> Result<()> {
+        self.set_column_search(table, column, |c| c.fts = enabled)
+    }
+    fn set_column_search(&mut self, table: &str, column: &str, change: impl FnOnce(&mut Column)) -> Result<()> {
         self.writable()?;
-        let table = self.schema.tables.iter().find(|t| t.name.eq_ignore_ascii_case(name))
-            .ok_or_else(|| Error::Invalid(format!("unknown table: {name}")))?.id.clone();
-        if crate::table_replication::enabled(&self.schema, &table) == enabled {
-            return self.barrier();
+        if column.eq_ignore_ascii_case(crate::primary_key::COLUMN) {
+            return Err(Error::Invalid("column search declarations require an application column".into()));
         }
-        // Settle the previous collection under its original table settings.
-        self.flush()?;
-        let mut schema = self.schema.clone();
-        schema.table_replication.insert(table.clone(), enabled);
-        let bytes = encode(&schema)?.len() + encode(&schema.table_replication)?.len();
+        let mut target = self.schema.clone();
+        let table = target.tables.iter_mut().find(|t| t.name.eq_ignore_ascii_case(table))
+            .ok_or_else(|| Error::Invalid(format!("unknown table: {table}")))?;
+        let column = table.columns.iter_mut().find(|c| c.name.eq_ignore_ascii_case(column))
+            .ok_or_else(|| Error::Invalid(format!("unknown column: {}.{column}", table.name)))?;
+        change(column);
+        if target == self.schema { return Ok(()); }
+        // Validate before collecting writes or touching the current indexes.
+        let mut validation = self.options.clone();
+        validation.search_indexes = crate::search::schema_definitions(&validation.search_indexes, &target)?;
+        validation.validate()?;
+        crate::search::Manager::new(&validation).validate_schema(&target, false)?;
+        self.checkpoint()?;
+        // Set memory-only TEMP storage before starting the maintenance transaction.
+        crate::search::Manager::register(&self.connection, &validation.search_indexes)?;
+        target.history = *blake3::hash(&[self.schema.history.as_slice(), &encode(&target)?].concat()).as_bytes();
+        let version = self.collection_clock.next(self.identity.node)?;
+        let bytes = encode(&target)?.len();
         self.admit(bytes)?;
+        let previous = self.search.clone();
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.search.sync_schema(&self.connection, &target, false)?;
+            self.search.refresh(&self.connection, &target)?;
+            self.connection.execute_batch("COMMIT")?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            self.search = previous;
+            self.search.publish_guard();
+            return Err(error);
+        }
+        self.schema = target.clone();
+        self.collection_clock = version;
+        configure_authorizer(&self.connection, &self.schema, self.access.clone(), self.search.guard.clone())?;
+        self.status.lock().unwrap().search_indexes = self.search.status();
         let cursor = self.bump()?;
-        self.send(Event::TableReplication { table, enabled, schema: schema.clone() }, cursor, bytes)?;
-        self.schema = schema;
+        self.send(Event::SchemaCaptured { migration: String::new(), schema: target, before: Vec::new(), after: Vec::new(), version }, cursor, bytes)?;
         self.captured_cursor = cursor;
-        self.barrier()
+        self.sub_mgr.notify_reset("column search setting changed");
+        Ok(())
+    }
+
+    fn set_table_replication(&mut self, name: &str, enabled: bool) -> Result<()> {
+        self.set_table_mode(name, enabled, None)
+    }
+    fn set_table_mode(&mut self, name: &str, enabled: bool, config: Option<&std::path::Path>) -> Result<()> {
+        self.writable()?;
+        let old = self.schema.tables.iter().find(|t| t.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| Error::Invalid(format!("unknown table: {name}")))?.clone();
+        if old.application_key.is_some() == enabled {
+            if self.schema.table_replication.get(&old.id) != Some(&enabled) {
+                self.flush()?;
+                let mut schema=self.schema.clone();schema.table_replication.insert(old.id.clone(),enabled);
+                let version=self.collection_clock.next(self.identity.node)?;
+                let bytes=encode(&schema)?.len();self.admit(bytes)?;let cursor=self.bump()?;
+                self.send(Event::SchemaCaptured{migration:String::new(),schema:schema.clone(),before:Vec::new(),after:Vec::new(),version},cursor,bytes)?;
+                self.captured_cursor=cursor;self.schema=schema;self.collection_clock=version;
+            }
+            self.barrier()?;
+            if let Some(path) = config { crate::config::save_table_flag(path, &old.id, enabled)?; }
+            return Ok(());
+        }
+        self.flush()?;
+        let key = match &old.application_key {
+            Some(key) => key.clone(),
+            None => crate::primary_key::inspect_key(&self.connection, &old)?,
+        };
+        if key.collations.iter().any(|c| !["BINARY", "NOCASE", "RTRIM"].iter().any(|s| c.eq_ignore_ascii_case(s))) {
+            return Err(Error::Invalid("unsupported application primary-key collation".into()));
+        }
+        let before = schema::read_table_rows(&self.connection, &old)?;
+        let mut replacement = old.clone();
+        replacement.sql = crate::primary_key::definition(&old, &key, enabled)?;
+        replacement.application_key = if enabled { Some(key.clone()) } else { None };
+        for column in &mut replacement.columns {
+            column.primary_key = if enabled { 0 } else {key.columns.iter().position(|n| n == &column.name).map(|i| i+1).unwrap_or(0)};
+            if enabled && key.columns.contains(&column.name) { column.not_null = true; }
+        }
+        if enabled {
+            replacement.columns.push(Column { vector: None, fts: false, id: id(&[old.id.as_bytes(), crate::primary_key::COLUMN.as_bytes()].concat()),
+                name: crate::primary_key::COLUMN.into(), primary_key: 1, declared_type: "TEXT".into(), not_null: true, policy: MergePolicy::Lww });
+        } else { replacement.columns.retain(|c| c.name != crate::primary_key::COLUMN); }
+        let mut intended = self.schema.clone();
+        *intended.tables.iter_mut().find(|t| t.id == old.id).unwrap() = replacement.clone();
+        intended.table_replication.insert(old.id.clone(), enabled);
+        let mut after = Vec::with_capacity(before.len());
+        for row in &before {
+            let mut row = row.clone();
+            let app_values = key.columns.iter().map(|n| {
+                let column = old.columns.iter().find(|c| c.name == *n).ok_or(Error::SchemaMismatch)?;
+                row.cells.iter().find(|c| c.column == column.id).map(|c|c.value.clone()).ok_or(Error::SchemaMismatch)
+            }).collect::<Result<Vec<_>>>()?;
+            if enabled {
+                let value = Value::Text(crate::primary_key::uuid(&old.name, &key.collations, &app_values)?);
+                row.key = vec![value.clone()];
+                row.cells.push(Cell {column: replacement.columns.last().unwrap().id.clone(), value, version: Version::default()});
+            } else {
+                row.key = app_values;
+                let managed = old.columns.iter().find(|c| c.name == crate::primary_key::COLUMN).ok_or(Error::SchemaMismatch)?;
+                row.cells.retain(|c| c.column != managed.id);
+            }
+            after.push(row);
+        }
+        let previous_search = self.search.clone();
+        self.capture.take();
+        self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let mut published = false;
+        let result = (|| -> Result<()> {
+            // Schema maintenance uses the same database and never installs triggers.
+            self.connection.execute_batch(&format!("DROP TABLE {}", quote(&old.name)))?;
+            self.connection.execute_batch(&replacement.sql)?;
+            for row in &after { schema::put_user_row(&self.connection, &replacement, row)?; }
+            for sql in &self.schema.indexes {
+                if schema::index_table(sql).is_some_and(|name| name.eq_ignore_ascii_case(&old.name)) {
+                    if !enabled && crate::primary_key::references_managed_column(sql)? {continue;}
+                    self.connection.execute_batch(sql)?;
+                }
+            }
+            intended = schema::inspect(&self.connection, &intended, &Migration::new(""))?;
+            // A node-local replication mode change is not an application DDL migration.
+            intended.history = self.schema.history;
+            self.search.sync_schema(&self.connection, &intended, true)?;
+            self.search.refresh(&self.connection, &intended)?;
+            // Collection time precedes storage queueing and survives retries.
+            let version = self.collection_clock.next(self.identity.node)?;
+            let bytes = encode(&before)?.len() + encode(&after)?.len() + encode(&intended)?.len();
+            self.admit(bytes)?;
+            let cursor = self.bump()?;
+            self.send(Event::TableReplication { table: old.id.clone(), enabled, schema: intended.clone(), before, after, version }, cursor, bytes)?;
+            self.captured_cursor = cursor;
+            published = true;
+            // The durable schema event is also the transition journal. Config
+            // remains authoritative if a crash occurs before its atomic rename.
+            self.barrier()?;
+            if let Some(path) = config { crate::config::save_table_flag(path, &old.id, enabled)?; }
+            self.connection.execute_batch("COMMIT")?;
+            self.schema = intended.clone();
+            self.collection_clock = version;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = self.connection.execute_batch("ROLLBACK");
+            self.search = previous_search;
+            self.search.publish_guard();
+            // A committed Spool transition cannot be undone in memory. Fail
+            // closed until reopen, where configuration chooses the final mode.
+            if published {
+                self.transition_failed = true;
+                self.status.lock().unwrap().storage_error = Some("table transition interrupted; close and reopen the database".into());
+            }
+        }
+        self.capture = Some(schema::capture(&self.connection, &self.schema)?);
+        configure_authorizer(&self.connection, &self.schema, self.access.clone(), self.search.guard.clone())?;
+        self.status.lock().unwrap().search_indexes = self.search.status();
+        if result.is_ok() { self.sub_mgr.notify_reset("table replication mode changed"); }
+        result
     }
     fn migrate(&mut self, m: Migration) -> Result<()> {
         self.writable()?;
@@ -906,7 +1138,12 @@ impl Core {
         let result = (|| -> Result<(Schema, Vec<(Vec<RowState>, Vec<RowState>)>, Version)> {
             self.access
                 .store(Access::Migration as u8, Ordering::Relaxed);
-            let sql_result = self.connection.execute_batch(&m.sql);
+            let sql_result = (|| -> rusqlite::Result<()> {
+                for statement in crate::primary_key::statements(&m.sql)? {
+                    self.connection.execute_batch(&crate::primary_key::rewrite(statement, &self.schema)?)?;
+                }
+                Ok(())
+            })();
             self.access.store(0, Ordering::Relaxed);
             sql_result?;
             #[allow(unused_mut)]
@@ -1128,7 +1365,7 @@ pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU
         .flat_map(|t| {
             t.columns
                 .iter()
-                .filter(|c| c.primary_key > 0)
+                .filter(|c| t.application_key.is_some() && (c.primary_key > 0 || crate::primary_key::application_columns(t).iter().any(|key| key.id == c.id)))
                 .map(|c| (t.name.clone(), c.name.clone()))
         })
         .collect::<Vec<_>>();
@@ -1173,8 +1410,9 @@ pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU
             } => {
                 access != Access::Read
                     && (!internal(table_name))
-                    && (access == Access::Migration
-                        || (!pk.contains(&(table_name.into(), column_name.into())) && !policies.contains(&(table_name.into(),column_name.into()))))
+                    && !column_name.eq_ignore_ascii_case(crate::primary_key::COLUMN)
+                    && !pk.iter().any(|(t,c)|t.eq_ignore_ascii_case(table_name)&&c.eq_ignore_ascii_case(column_name))
+                    && (access == Access::Migration || !policies.contains(&(table_name.into(),column_name.into())))
             }
             AuthAction::Pragma {
                 pragma_name,
@@ -1196,6 +1434,8 @@ pub(crate) fn configure_authorizer(c: &Connection, s: &Schema, mode: Arc<AtomicU
                     !["load_extension", "writefile", "readfile"].contains(&function_name)
                         && (access != Access::Migration
                             || [
+                                "_murmur_uuid",
+                                "_murmur_affinity",
                                 "abs",
                                 "coalesce",
                                 "ifnull",

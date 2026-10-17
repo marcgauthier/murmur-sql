@@ -322,3 +322,51 @@ fn obsolete_fetched_object_cannot_replace_overwritten_or_deleted_metadata() {
     assert!(!backend.keys(b"08/files/meta/").unwrap().is_empty());
     backend.store.close().unwrap();
 }
+
+#[test]
+fn incremental_upload_download_pins_and_shared_limits() {
+    let tmp = tempfile::tempdir().unwrap();
+    let backend = Arc::new(FileBackend::open(&tmp.path().join("spool"), 1, 2));
+    let mut cfg = config(&tmp.path().join("objects"));
+    cfg.max_staging_bytes = 1 << 20;
+    let objects = Arc::new(Objects::open(cfg, backend.clone()).unwrap());
+    let old = objects.upload("same", b"old".as_slice()).unwrap();
+    let mut upload = objects.begin_upload("same").unwrap();
+    let bytes = content(200001);
+    for chunk in bytes.chunks(7919) {
+        upload.append(chunk).unwrap();
+    }
+    assert_eq!(objects.metadata("same").unwrap().unwrap(), old);
+    objects.collect(Duration::ZERO).unwrap();
+    let m = objects.finish_upload(upload).unwrap();
+    assert_eq!(m.bytes, bytes.len() as u64);
+    let mut download = objects.download("same").unwrap();
+    objects.upload("same", b"replacement".as_slice()).unwrap();
+    objects.collect(Duration::ZERO).unwrap();
+    let mut out = Vec::new();
+    loop {
+        let (offset, chunk, eof) = download.next(789).unwrap();
+        assert_eq!(offset, out.len() as u64);
+        out.extend(chunk);
+        if eof {
+            break;
+        }
+    }
+    assert_eq!(out, bytes);
+    drop(download);
+    let mut abandoned = objects.begin_upload("aborted").unwrap();
+    abandoned.append(b"secret").unwrap();
+    drop(abandoned);
+    assert!(objects.metadata("aborted").unwrap().is_none());
+    let mut large = objects.begin_upload("large").unwrap();
+    assert!(large.append(&vec![0; 1 << 20]).is_err());
+    drop(large);
+    let empty = objects.begin_upload("empty").unwrap();
+    objects.finish_upload(empty).unwrap();
+    assert!(objects.download("empty").unwrap().next(1).unwrap().2);
+    assert!(objects.list_bounded(1).is_err());
+    let m = objects.metadata("same").unwrap().unwrap();
+    std::fs::remove_file(objects.path(m.digest, m.generation)).unwrap();
+    assert!(objects.download("same").is_err());
+    backend.store.close().unwrap();
+}

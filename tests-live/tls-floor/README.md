@@ -7,11 +7,10 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/tls-floor/`
 ## What it proves
 
 Go pins the HTTPS API floor at TLS 1.2 and separately guards the QUIC
-floor at TLS 1.3. The Rust product has no HTTPS API, so this port proves
-the floor on the QUIC replication endpoint, whose floor is TLS 1.3
-(stricter): a TLS-1.2-only handshake must fail with a server-side TLS
-alert (QUIC crypto close), TLS 1.3 succeeds, and a 2-node mesh converges
-over it.
+floor at TLS 1.3. The server runs as a separate process (`murmur-server`)
+exposing both PostgreSQL-wire SQL and a TLS 1.3 QUIC replication endpoint:
+a TLS-1.2-only handshake is strictly rejected (RFC 9001 requires TLS 1.3),
+while TLS 1.3 succeeds, and a 2-node SQL cluster converges over it.
 
 ## Leg mapping (Go -> Rust)
 

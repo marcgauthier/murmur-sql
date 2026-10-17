@@ -31,13 +31,22 @@ impl Fts5Index {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum DistanceMetric {
     #[default]
     L2,
     Cosine,
     L1,
 }
+/// Persistent configuration for one application's BLOB vector column.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VectorColumnConfig {
+    pub dimensions: usize,
+    #[serde(default)]
+    pub distance: DistanceMetric,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VectorIndex {
     pub name: String,
@@ -134,6 +143,39 @@ pub struct SearchIndexStatus {
     pub pending_keys: usize,
     pub queued_bytes: usize,
     pub error: Option<String>,
+}
+
+pub(crate) fn schema_index_name(table: &crate::Table) -> String {
+    format!("murmur_fts_{}", table.id)
+}
+
+pub(crate) fn vector_index_name(table: &crate::Table, column: &crate::Column) -> String {
+    format!("murmur_vec_{}_{}", table.id, column.id)
+}
+
+/// Shared by startup, schema maintenance, and explicit-index replacement.
+pub(crate) fn schema_definitions(explicit: &[SearchIndex], schema: &Schema) -> Result<Vec<SearchIndex>> {
+    let mut definitions = explicit.to_vec();
+    for table in &schema.tables {
+        let columns: Vec<_> = table.columns.iter().filter(|c| c.fts).map(|c| c.name.clone()).collect();
+        if !columns.is_empty() {
+            definitions.push(Fts5Index::new(schema_index_name(table), &table.name, columns).into());
+        }
+        for column in &table.columns {
+            if let Some(config) = &column.vector {
+                if column.name.eq_ignore_ascii_case(crate::primary_key::COLUMN) {
+                    return Err(Error::Invalid("vector declarations require an application column".into()));
+                }
+                definitions.push(VectorIndex {
+                    name: vector_index_name(table, column), source_table: table.name.clone(),
+                    column: column.name.clone(), dimensions: config.dimensions, distance: config.distance,
+                }.into());
+            }
+        }
+    }
+    let options = Options { search_indexes: definitions, ..Options::default() };
+    validate_options(&options)?;
+    Ok(options.search_indexes)
 }
 
 pub(crate) type Guard = Arc<RwLock<BTreeMap<String, bool>>>;
@@ -238,6 +280,7 @@ impl Index {
 
 #[derive(Clone)]
 pub(crate) struct Manager {
+    explicit: Vec<SearchIndex>,
     indexes: Vec<Index>,
     queued: VecDeque<Vec<u8>>,
     queued_bytes: usize,
@@ -251,6 +294,7 @@ pub(crate) struct Manager {
 impl Manager {
     pub(crate) fn new(o: &Options) -> Self {
         Self {
+            explicit: o.search_indexes.clone(),
             indexes: o
                 .search_indexes
                 .iter()
@@ -354,7 +398,7 @@ impl Manager {
                     d.source_table()
                 )));
             };
-            let pk = crate::schema::pk_columns(t);
+            let pk = crate::primary_key::application_columns(t);
             if pk.len() != 1 || !pk[0].declared_type.eq_ignore_ascii_case("INTEGER") {
                 return Err(Error::Invalid(format!(
                     "{} requires one INTEGER PRIMARY KEY for search indexing",
@@ -386,6 +430,23 @@ impl Manager {
         s: &Schema,
         allow_missing: bool,
     ) -> Result<()> {
+        // Schema-derived definitions are disposable; only the column flags in
+        // Spool are authoritative. Reconcile before validating so local drops
+        // and renames cannot leave stale derived definitions behind.
+        let definitions = schema_definitions(&self.explicit, s)?;
+        if definitions != self.indexes.iter().map(|i| i.definition.clone()).collect::<Vec<_>>() {
+            let options = Options { search_indexes: definitions, ..Options::default() };
+            validate_options(&options)?;
+            let candidate = Manager::new(&options);
+            candidate.validate_schema(s, allow_missing)?;
+            Self::register(c, &options.search_indexes)?;
+            self.drop_indexes(c)?;
+            self.indexes = candidate.indexes;
+            self.queued.clear();
+            self.queued_sources.clear();
+            self.queued_bytes = 0;
+            self.next = 0;
+        }
         self.validate_schema(s, allow_missing)?;
         for index in &mut self.indexes {
             if !s
@@ -495,10 +556,10 @@ impl Manager {
     }
     pub(crate) fn rows(&mut self, s: &Schema, rows: &[RowState]) {
         for row in rows {
-            if let (Some(t), Some(Value::Integer(key))) =
-                (s.tables.iter().find(|t| t.id == row.table), row.key.first())
-            {
-                self.key(&t.name, *key);
+            if let Some(t) = s.tables.iter().find(|t| t.id == row.table) {
+                if t.application_key.is_some() {
+                    for index in &mut self.indexes { if index.definition.source_table() == t.name { index.invalidate(); } }
+                } else if let Some(Value::Integer(key)) = row.key.first() { self.key(&t.name, *key); }
             }
         }
     }
@@ -538,7 +599,8 @@ impl Manager {
                     item.old_value(pk)?
                 })?;
                 let Value::Integer(key) = value else {
-                    return Err(Error::SchemaMismatch);
+                    for index in &mut self.indexes { if index.definition.source_table() == op.table_name() { index.invalidate(); } }
+                    continue;
                 };
                 self.key(op.table_name(), key);
             }
@@ -576,7 +638,7 @@ impl Manager {
                     .iter()
                     .find(|t| t.name == index.definition.source_table())
                     .ok_or(Error::SchemaMismatch)?;
-                let pk = crate::schema::pk_columns(t)[0].name.as_str();
+                let pk = crate::primary_key::application_columns(t)[0].name.as_str();
                 let mut count = 0;
                 if index.rebuild {
                     if !index.started {

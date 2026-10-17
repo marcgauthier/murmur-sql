@@ -1,51 +1,62 @@
 # crash-recovery (Rust port)
 
 Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/crash-recovery/`
-(`crash_recovery_test.go`, `TestAbruptProcessDeathRecoversCommittedRows`).
+(`crash_recovery_test.go`,
+`TestAbruptProcessDeathRecoversCommittedRows`).
 
 ## What it proves
 
-Two nodes are abruptly restarted at different times while background
-writers (2 workers x 3 nodes, 50 ms tick) hammer all nodes. Every
-acknowledged write must survive on every node with equal contents, plus a
-post-recovery write that replicates everywhere.
+Three meshed nodes take continuous application writes (two workers per
+node) while node2 and then node3 are SIGKILLed mid-write and restarted
+under load. Every acknowledged write survives both restarts with
+identical digests on all nodes, and a post-recovery write replicates
+everywhere.
 
 ## Pass criteria (same as Go)
 
-- One baseline write per node; full mesh (`[2, 2, 2]` peers) and baseline
-  convergence within 20 s.
-- Each restart lands only with a write provably in flight on the victim
-  (5 s gate; a vacuous restart fails loudly).
-- After each restart + re-mesh, full peering returns within 90 s under
-  continuing load.
-- After writers stop: convergence within `MURMUR_CRASH_SETTLE_SECONDS`
-  (default 60), every acknowledged value present on every node, equal
-  contents on all nodes.
-- A `post-recovery-write` then converges (settle default 20) with the same
-  ack + equality assertions.
-- Write windows honor `MURMUR_CRASH_WRITE_SECONDS` (default 12).
+- Baseline: one row per node converges with a full `[2, 2, 2]` mesh.
+- Each SIGKILL lands with a write provably in flight on the victim
+  (5 s gate); each victim rejoins under continuing load (`[2, 2, 2]`
+  peers within 90 s).
+- After both restarts: full convergence, every acknowledged write
+  present everywhere, equal digests.
+- A post-recovery write on node1 replicates everywhere with equal
+  digests.
+
+## Env knobs
+
+- `MURMUR_CRASH_WRITE_SECONDS` (default 8): burst length between
+  kill/restart legs.
+- `MURMUR_CRASH_SETTLE_SECONDS` (default 90): convergence deadline.
+- Harness knobs apply: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
+  `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster instead of daemon processes; restart is
-  `close()` + reopen of the same directory with the same key (**clean close,
-  not SIGKILL**: killing one in-process node would kill the test driver).
-  Abrupt mid-write death is therefore not exercised; durability of
-  acknowledged writes across restart is.
-- Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT NOT NULL PRIMARY KEY)`.
-- Peer counts come from the replication status (`peers`), not `/v1/status`.
-- Ordered-vec equality replaces the SHA-256 name digest (identical strength
-  for an equality check; no new dependency).
-- Writers resolve the current-generation handle per write from a shared
-  slot the driver refreshes after every restart (mirrors Go writers
-  re-resolving the node endpoint; a pre-restart clone only sees the old
-  generation). Refused requests during restart windows are skipped like Go.
-- Explicit re-mesh after each restart (fresh ephemeral port).
+- Multi-process `murmur-server` children over the PG wire (per design)
+  instead of `testnode` daemon processes over HTTPS+mTLS.
+- Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`,
+  per-writer id strides) instead of the managed typed-records HTTP API.
+  Row identity in assertions is `name@id`.
+- Session counts come from `MURMUR SHOW REPLICATION` (`peers` column)
+  instead of `/v1/status` (`connected_peers`).
+- Digests are FNV-1a/64 over sorted names instead of SHA-256 (only
+  cross-node equality within one process is asserted).
+- Writers are `tokio::spawn` tasks sharing the cluster behind one async
+  mutex (the harness `kill_node`/`start_node` legs need `&mut`, so the
+  pilot's borrowed `tokio::join!` shape cannot run writers across kills).
+  A `running` flag per node, cleared before each kill and re-checked
+  under the lock, keeps writers off a stopped node (whose
+  `Cluster::node` would panic); every insert carries a 10 s wire timeout
+  so a kill can never wedge a writer on the lock. Refused writes during
+  kill/restart windows are dropped like the Go original.
+- `Cluster::kill_node`/`start_node` + `mesh()` replace
+  `KillNode`/`StartNode`/`UnlockNode`/`WaitNodeReady` (unlock runs under
+  the harness watchdog inside `start_node`).
 
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/crash-recovery/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/crash-recovery/Cargo.toml
 ```

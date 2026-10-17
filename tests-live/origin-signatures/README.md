@@ -6,28 +6,38 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/origin-signatures/`
 
 ## What it proves
 
-Three encrypted nodes share one database id. A commits a transaction,
-B receives it, A stops, and C receives A's transaction exclusively
-through B. The fixture checks the actual stored origin proof, then a
-malicious relay authenticated as B sends modified, fabricated,
-unsigned, cross-DBID and chunk-identity attacks at C. Every attack must
-be rejected while rows, generation and receipts stay unchanged.
-Restart plus signed-duplicate replay check durability and idempotency,
-and an untrusted snapshot manifest must be refused.
+Three `murmur-server` processes share one database id. A commits a
+transaction, B receives it, A stops, and C receives A's transaction
+exclusively through B. A hostile relay impersonating B (a raw QUIC
+client speaking the replication wire protocol via the shared harness
+attacker fixture, which reuses the product implementation) then fetches
+A's batches from C, and sends modified, unsigned, cross-DBID,
+fabricated, and chunk-identity attacks. Every attack must be rejected
+with rows, staged/applied counters, and commit cursor untouched, and a
+chunk-availability probe must show nothing staged. Restart checks
+durability, a signed-duplicate replay checks idempotency, and an
+untrusted snapshot manifest checks donor trust.
 
 ## Pass criteria
 
 - C converges on A's row while A is stopped (forwarded through B only);
   B's and C's row sets are equal.
-- A's served bytes verify under A's origin key with the origin intact.
-- Modified / fabricated / unsigned / cross-DBID batches are rejected;
-  the tampered chunk fails before durable staging (availability index
-  empty); row set and staged/applied counters never move.
-- After a C restart the honest row is still present; replaying the
-  signed original is idempotent (no error, session survives, counters
-  and rows unchanged).
-- A well-formed snapshot manifest from the (untrusted) relay is
-  refused; rows and counters unchanged.
+- Counters (`staged_transactions`, `applied_transactions` from
+  `MURMUR SHOW REPLICATION`) do not move on C after B shuts down.
+- The relay captures A's batches from C over a `Need` session; every
+  served batch verifies under A's origin key.
+- Each attack (modified, unsigned, cross-DBID, fabricated,
+  chunk-identity) is rejected: C records the rejection in `last_error`
+  while rows, counters, and commit cursor stay flat; the availability
+  probe shows no forged chunks staged.
+- After a C restart with A and B stopped, the honest row is still
+  present and the fresh-process counters start at zero.
+- The signed-duplicate replay draws no error frame and moves nothing
+  (rows, counters, cursor).
+- The untrusted snapshot manifest (valid B signature, B donor, C's own
+  schema) is refused with `last_error` set and nothing moved.
+- After B rejoins and re-offers, C's rows, counters, and cursor are
+  unchanged (the engine dedups before counting, so `received` stays 0).
 
 ## Env knobs
 
@@ -36,32 +46,37 @@ None beyond the shared `MURMUR_LIVE_RUNTIME` / `MURMUR_LIVE_FAILURES` /
 
 ## Deviations from the Go original
 
-- Plain SQL replaces the typed-records HTTP API; there is no daemon,
-  no HTTPS API, and no Prometheus endpoint (in-process cluster).
-- Go replays all four batch attacks over one relay session. The Rust
-  engine kills a session on `Error::Auth`, so each signature-failure
-  leg uses its own session and asserts stream death; only the
-  cross-DBID leg (`Error::Protocol`) shares Go's surviving session.
-- Go asserts rejection counters move. The Rust engine keeps no
-  invalid-batch counters, so each leg asserts the wire/session outcome
-  plus the matching `last_error` latch cause instead
-  (`payload digest mismatch`, `signature error`,
-  `transaction identity`, `snapshot identity, trust or expiry`).
-- Go reads A's log by reopening A's directory. The port fetches A's
-  genuine batches from C's stored log over a `Need` relay session and
-  verifies them locally against A's origin public key.
-- Go reuses B's TLS key file and origin key for the relay. The port
-  uses a fresh harness-CA leaf issued for B's NodeID (same transport
-  identity, still fully authenticated) and a dedicated attacker
-  signing key for the fabricated leg (node seeds are harness-private);
-  the verification exercised is identical.
-- Go asserts HLC, generation and per-TxID receipts. Rust exposes no
-  HLC clock or receipt read API; the port asserts the staged/applied
-  counters plus the row set instead (receipts commit atomically with
-  the apply, and clock observation happens only inside staging, after
-  verification).
-- Go's duplicate replay reaches `batches_received_total == 1`. The
-  Rust engine dedups before counting, so the port asserts `received`
-  stays 0 across the replay (session alive, no error frame).
-- C's `trusted_snapshot_sources` is empty by default in the harness,
-  matching Go's explicit `{2: {}}` overlay (no overlay needed).
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS (per
+  design).
+- Plain SQL replaces the typed-records HTTP API; the table is
+  explicitly flagged replicated on each node. There is no daemon, no
+  HTTPS API, and no Prometheus endpoint.
+- Go's HLC, generation, and per-TxID receipt assertions map to the
+  staged/applied counters plus the row set (receipts commit atomically
+  with the apply; the Rust engine exposes no HLC clock or receipt read
+  API). The commit cursor (`committed`) stands in for state generation.
+- Go reads the original batch from the stopped origin's store; the port
+  fetches it from C over a `Need` session (served-origin-proof capture)
+  and verifies it under A's origin key, which additionally proves the
+  offline origin's log stays servable through the forwarder.
+- Go's `batches_invalid_total` / `origin_signature_invalid_total`
+  counters have no Rust equivalent, so rejection is observed via
+  `last_error` (changed text containing the check that failed) plus
+  flat rows/counters/cursor; per-leg resends tolerate `last_error`
+  overwrites from C's redial of stopped B. The unsigned/fabricated legs
+  assert an `authentication` rejection rather than the ed25519 message
+  text.
+- The relay authenticates as B with a fresh cluster-CA leaf for B's id
+  (identity is the TLS SAN URI) and B's origin seed; one session per
+  leg with a quiet gate between dials (the engine closes duplicate
+  inbound sessions for an id with a lingering entry).
+- The honest-transport idempotent re-offer (rejoining B re-offers over
+  the real mesh) is kept after the relay replay as an extra leg.
+
+## Compile check (only gate; never run here)
+
+```sh
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/origin-signatures/Cargo.toml
+```

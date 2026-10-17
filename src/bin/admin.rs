@@ -7,10 +7,12 @@
 //!   backup  <data-dir> <dest-dir>           Consistent online hot backup
 //!   restore <backup-dir> <dest-dir>         Restore backup into clean destination directory
 //!   keys    <data-dir>                      Inspect key registry and active data keys
+//!   hash-password                           Argon2 hash for auth.users (reads stdin without --password)
 //!
 //! Options:
 //!   --json                                  Output structured JSON format
 //!   --passphrase=<str>                      Passphrase for database encryption
+//!   --password=<str>                        Password for hash-password (stdin when absent)
 //!   --key-hex=<hex>                         32-byte (64 hex char) raw encryption key
 //!   --backup                                Verify backup directory mode for `verify`
 //!   --fresh-node-id[=<hex>]                 Assign a new node identity on restore
@@ -33,6 +35,7 @@ const DEFAULT_KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 struct GlobalOpts {
     json: bool,
     passphrase: Option<String>,
+    password: Option<String>,
     key_hex: Option<String>,
     is_backup: bool,
     fresh_node_id: Option<[u8; 16]>,
@@ -104,10 +107,12 @@ Commands:
   backup   <data-dir> <dest-dir>           Consistent online hot backup
   restore  <backup-dir> <dest-dir>         Restore backup into clean destination directory
   keys     <data-dir>                      Inspect key registry and active data keys
+  hash-password                           Argon2 hash for auth.users (reads stdin without --password)
 
 Options:
   --json                                  Output structured JSON format
   --passphrase=<str>                      Passphrase for database encryption
+  --password=<str>                        Password for hash-password (stdin when absent)
   --key-hex=<hex>                         32-byte (64 hex char) raw encryption key
   --backup                                Treat target directory as backup archive in `verify`
   --fresh-node-id[=<hex>]                 Assign new node identity on restore
@@ -685,6 +690,32 @@ fn cmd_keys(data_dir: &str, opts: &GlobalOpts) -> Result<(), String> {
     Ok(())
 }
 
+fn cmd_hash_password(opts: &GlobalOpts) -> Result<(), String> {
+    let password = match &opts.password {
+        Some(password) => password.clone(),
+        None => {
+            use std::io::BufRead;
+            let mut line = String::new();
+            std::io::stdin()
+                .lock()
+                .read_line(&mut line)
+                .map_err(|e| format!("cannot read password from stdin: {e}"))?;
+            line.trim_end_matches(['\r', '\n']).to_owned()
+        }
+    };
+    if password.is_empty() {
+        return Err("password must not be empty".into());
+    }
+    let hash = sqlite_session::server::auth::hash_password(&password)
+        .map_err(|e| format!("cannot hash password: {e}"))?;
+    if opts.json {
+        println!("{}", serde_json::json!({ "password_hash": hash }));
+    } else {
+        println!("{hash}");
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // main dispatch
 // ---------------------------------------------------------------------------
@@ -722,6 +753,11 @@ fn main() -> ExitCode {
         } else if arg == "--key-hex" && i + 1 < args.len() {
             i += 1;
             global_opts.key_hex = Some(args[i].clone());
+        } else if arg.starts_with("--password=") {
+            global_opts.password = Some(arg.trim_start_matches("--password=").to_string());
+        } else if arg == "--password" && i + 1 < args.len() {
+            i += 1;
+            global_opts.password = Some(args[i].clone());
         } else if arg == "--fresh-node-id" {
             global_opts.fresh_node_id = Some(rand::random());
         } else if arg.starts_with("--fresh-node-id=") {
@@ -801,6 +837,7 @@ fn main() -> ExitCode {
                 cmd_keys(&cmd_args[0], &global_opts)
             }
         }
+        "hash-password" => cmd_hash_password(&global_opts),
         unknown => Err(format!(
             "unknown command: \"{unknown}\". Run 'murmur-admin --help' for usage."
         )),

@@ -6,17 +6,20 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/flap-partition/`
 
 ## What it proves
 
-Three fully meshed nodes take continuous writes from all nodes while
-node3's links flap through split/heal cycles. A partition must never
-fail a write to a live node (all commits are local), and after the
-final heal every node must converge on the identical row set with
+Three fully meshed `murmur-server` processes take continuous writes from
+all nodes while node3's links flap through split/heal cycles. A partition
+must never fail a write to a live node (all commits are local), and after
+the final heal every node must converge on the identical row set with
 equal digests. The first split carries an isolation proof: a marker
 written on node1 must reach node2 but never node3.
 
 ## Pass criteria
 
-- `Cluster::new` opens 3 meshed nodes under
+- `Cluster::new` starts 3 meshed servers under
   `tests-live/runtime/flap-partition/`.
+- The `records` table is created on every node and flagged
+  `MURMUR SET TABLE records REPLICATED true` on each one (row
+  convergence needs the per-node flag).
 - 6 baseline inserts on node 0 converge on all 3 nodes within 150 s
   (honest-path control).
 - Continuous writers on every node (50 ms cadence each) run across
@@ -38,32 +41,45 @@ written on node1 must reach node2 but never node3.
 - `MURMUR_FLAP_HEAL_SECONDS` (default 2): heal settle per cycle.
 - Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
   `MURMUR_LIVE_FAILURES`, `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol (SQL + `MURMUR PEER ...`) instead of `testnode` daemon
+  processes over HTTPS+mTLS (per design).
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`) instead of the
   managed typed-records HTTP API (`TypedInsert` / `TypedNames`); writer
   ids are `node * 10_000_000 + seq`, baseline ids start at 90_000_001,
   and the isolation marker uses id 90_001_001, instead of
-  server-generated typed IDs. The Go `AwaitUnlock` / `TypedRecords`
-  cluster options have no Rust equivalents (no unlock endpoint; SQL
-  schema instead of typed fixtures).
+  server-generated typed IDs.
+- The table is explicitly flagged replicated on each node; the Go
+  fixture tables replicate by default.
 - `waitConverged` sorts each node's names before the ordered comparison
   (Go's `TypedNames` arrives ordered; SQL `SELECT` without `ORDER BY`
   does not guarantee order).
-- Goroutine writers become `std::thread::scope` writer threads sharing
-  `&Cluster`; the stop channel becomes an `AtomicBool`, and a
-  drop-guard sets it on unwind so a failed phase cannot deadlock the
-  scope join. Written/failed counters stay `AtomicI64`.
+- Goroutine writers become borrowed writer futures inside one
+  `tokio::join!` with the flap driver (no `'static` spawn); the stop
+  flag is set on every driver exit path so a failed phase cannot hang
+  the join. Written/failed counters stay `AtomicI64`.
 - Cycle count uses a local `env_int` helper (the harness only provides
   `env_seconds` for duration knobs).
-- Directory logging shows label/dir/repl-addr (no PIDs exist in-process).
+- Directory logging shows label/dir/SQL/replication addresses (plus PIDs
+  via `Cluster::node_pid`).
 
-## Compile check (only gate; never run here)
+## Compile check
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/flap-partition/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/flap-partition/Cargo.toml
 ```
+
+## Run (pilot scenario: run until green)
+
+```sh
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --manifest-path /home/marc/MURMUR-SQL/tests-live/flap-partition/Cargo.toml
+```
+
+`MURMUR_SERVER_BIN` reuses a prebuilt `--features replication` server
+instead of the one cargo build the harness triggers.

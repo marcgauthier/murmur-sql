@@ -21,6 +21,7 @@ fn create(path: &std::path::Path, mut o: Options) -> Result<Database> {
     db.migrate(Migration::new(
         "CREATE TABLE docs(id INTEGER PRIMARY KEY,title TEXT NOT NULL,body TEXT,embedding BLOB)",
     ))?;
+    db.set_replication("docs", true)?;
     Ok(db)
 }
 fn matches(db: &Database, term: &str) -> Result<Vec<i64>> {
@@ -141,9 +142,12 @@ fn indexes_rebuild_on_recovery_restore_and_reconfiguration() -> Result<()> {
     );
     assert_eq!(matches(&db, "durable")?, vec![-5]);
     db.set_search_indexes(vec![])?;
+    // Renames require a local-only table.
+    db.set_replication("docs", false)?;
     db.migrate(Migration::new(
         "ALTER TABLE docs RENAME COLUMN title TO heading",
     ))?;
+    db.set_replication("docs", true)?;
     db.set_search_indexes(vec![
         Fts5Index::new("docs_fts", "docs", vec!["heading".into()]).into(),
     ])?;
@@ -286,7 +290,7 @@ fn offline_conflicts_and_local_replication_settings_use_resolved_rows() -> Resul
     b.set_replication("docs", true)?;
     b.merge_state(a.export_state()?)?;
     b.refresh_indexes()?;
-    assert!(matches(&b, "froma")?.is_empty());
+    assert_eq!(matches(&b, "froma")?, vec![1]);
     a.close()?;
     b.close()
 }

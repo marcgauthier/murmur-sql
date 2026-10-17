@@ -306,6 +306,6 @@ without concurrent builds and report medians. These component ratios do not pred
 full-cluster speedups. The process-isolated mesh gate remains the end-to-end test.
 
 For the measured results and full-cluster limits, see
-[SCALABILITY.md](../SCALABILITY.md#batched-spool-reads-and-outgoing-reuse-results).
+[SCALABILITY.md](../docs/SCALABILITY.md#batched-spool-reads-and-outgoing-reuse-results).
 The three-node smoke comparison showed mixed latency changes despite the component
 CPU improvements; no overall cluster speedup or 500-node acceptance is claimed.

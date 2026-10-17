@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Live Murmur Rust multi-Database scenario checks with isolated node directories.
+# Live Murmur multi-process scenario checks: one murmur-server child per node.
 # Port agents NEVER run this (single-package `cargo test --no-run` only); it is
 # the CI/operator runner. Each scenario is a standalone package and runs alone.
 set -euo pipefail
@@ -19,30 +19,30 @@ echo "======================================================================"
 echo "  MURMUR RUST LIVE SCENARIO RUNNER"
 echo "======================================================================"
 
-# Reap fixture processes rooted at OUR runtime dir on the way out (Ctrl-C,
-# inter-scenario kills, CI cancel). Scoped by the --dir path so parallel runs
-# with their own MURMUR_LIVE_RUNTIME roots are never touched. No-op on clean
-# runs (in-test cleanup already reaped everything).
-sweep_runtime_fixtures() {
+# Reap server processes rooted at OUR runtime dir on the way out (Ctrl-C,
+# inter-scenario kills, CI cancel). Scoped by the --config path so parallel
+# runs with their own MURMUR_LIVE_RUNTIME roots are never touched. No-op on
+# clean runs (in-test cleanup already reaped everything).
+sweep_runtime_servers() {
   local pids
-  pids=$(pgrep -f "testnode.*$runtime_root" 2>/dev/null || true)
+  pids=$(pgrep -f "murmur-server.*$runtime_root" 2>/dev/null || true)
   if [[ -z "$pids" ]]; then
     return 0
   fi
   # shellcheck disable=SC2086
   kill -TERM $pids 2>/dev/null || true
   sleep 2
-  pids=$(pgrep -f "testnode.*$runtime_root" 2>/dev/null || true)
+  pids=$(pgrep -f "murmur-server.*$runtime_root" 2>/dev/null || true)
   if [[ -n "$pids" ]]; then
     # shellcheck disable=SC2086
     kill -KILL $pids 2>/dev/null || true
   fi
 }
-trap sweep_runtime_fixtures EXIT INT TERM
+trap sweep_runtime_servers EXIT INT TERM
 
-echo "Building testnode fixture binary..."
-cargo build --manifest-path "$live/harness/Cargo.toml" --bin testnode
-export MURMUR_TESTNODE_BIN="$CARGO_TARGET_DIR/debug/testnode"
+echo "Building murmur-server binaries..."
+cargo build --manifest-path "$root/Cargo.toml" --features replication --bin murmur-server --bin murmur-admin
+export MURMUR_SERVER_BIN="$CARGO_TARGET_DIR/debug/murmur-server"
 
 scenario_timeout_secs() {
   # Per-scenario caps for the `timeout(1)` wrapper (mirrors Go run.sh).

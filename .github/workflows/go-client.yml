@@ -8,21 +8,16 @@ on:
 permissions:
   contents: read
 jobs:
-  native:
+  test:
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
           - runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
           - runner: macos-15-intel
-            target: x86_64-apple-darwin
           - runner: macos-15
-            target: aarch64-apple-darwin
           - runner: windows-2022
-            target: x86_64-pc-windows-gnu
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -30,43 +25,28 @@ jobs:
         with:
           go-version: '1.24.x'
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
       - name: Linux compiler dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
-      - name: Windows GNU tools
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Build server binary
+        shell: bash
         run: |
-          "C:\msys64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          "CC=gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "LIBCLANG_PATH=C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-      - name: Build and test Go (Unix)
-        if: runner.os != 'Windows'
-        run: bash clients/go/build.sh test -p 2 -count=1 -timeout 180s ./...
-      - name: Build and test Go (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: ./clients/go/build.ps1 test -p 2 -count=1 -timeout 180s ./...
-      - name: Native ABI tests
-        run: cargo test --locked --manifest-path clients/go/native/Cargo.toml --target ${{ matrix.target }}
+          cargo build --locked --features replication --bin murmur-server --bin murmur-admin
+          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/target/debug/murmur-server${{ runner.os == 'Windows' && '.exe' || '' }}" >> $GITHUB_ENV
       - name: Go static analysis
         working-directory: clients/go
         run: go vet ./...
-      - name: Race detector
+      - name: Go tests
+        working-directory: clients/go
+        run: go test -p 2 -count=1 -timeout 300s ./...
+      - name: Go race detector
         if: runner.os != 'Windows'
         working-directory: clients/go
-        run: go test -p 2 -race -count=1 -timeout 180s ./...
-      - name: cgo pointer checks
+        run: go test -p 2 -race -count=1 -timeout 300s ./...
+      - name: Go examples
         working-directory: clients/go
-        env:
-          GOEXPERIMENT: cgocheck2
-        run: go test -p 2 -count=1 -timeout 180s ./...
-      - name: Public API coverage audit
         shell: bash
-        working-directory: clients/go
         run: |
-          mkdir -p build
-          cargo run --locked --quiet --manifest-path native/Cargo.toml --example api_inventory > build/current-api.json
-          go run ./internal/apiaudit -inventory build/current-api.json
+          for ex in basic migrations tables tls concurrency backup keys metrics files search vectors json replication bridge; do
+            go run ./examples/$ex
+          done

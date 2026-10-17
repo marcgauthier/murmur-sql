@@ -31,21 +31,27 @@ None scenario-specific. Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol (SQL + `MURMUR PEER ...`) instead of `testnode` daemon
+  processes over HTTPS+mTLS (per design).
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`) instead of the
   managed typed-records HTTP API (`TypedInsert`/`TypedNames`); canonical
   order comes from `ORDER BY name` rather than the API response.
+- The table is explicitly flagged replicated on each node; the Go
+  fixture tables replicate by default.
 - Per-node dissemination uses the harness `ClusterOptions::dissemination_by_node`
-  overlay (added for this scenario; mirrors Go `DisseminationByNode`).
-- Refusal evidence is `replication().status().last_error` containing
-  `incompatible` (the Rust engine fails closed with `incompatible hello` on
-  accept and `incompatible welcome` on dial) plus session counts, instead of
-  the Go `spedsql_repl_handshake_capability_refusals_total` Prometheus metric,
+  overlay (mirrors Go `DisseminationByNode`).
+- Refusal evidence is the `last_error` column of
+  `MURMUR SHOW REPLICATION` containing `incompatible` (the Rust engine
+  fails closed with `incompatible hello` on accept and
+  `incompatible welcome` on dial) plus the `peers` session counts from
+  the same command, instead of the Go
+  `spedsql_repl_handshake_capability_refusals_total` Prometheus metric,
   which has no Rust equivalent.
 
 ## Compile check (only gate; never run here)
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/plumtree-live/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/plumtree-live/Cargo.toml
 ```

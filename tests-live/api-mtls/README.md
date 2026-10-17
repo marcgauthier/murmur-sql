@@ -1,46 +1,21 @@
-# api-mtls (Rust port, test-side equivalent)
+# SQL mutual TLS
 
-Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/api-mtls/`
-(`api_mtls_test.go`, `TestDaemonAPIRequiresMTLSExceptHealth`).
+Starts a real SQL server, writes a control row, then restarts it in production mode with TLS and a trusted client CA. The Rust client must reject plaintext, missing client certificates and an untrusted certificate. A trusted certificate still requires the correct password and encryption key. Valid writes must remain available after all rejection probes and after another restart.
 
-## What it proves
+Application operations use the [Rust client](../../clients/rust/README.md)
+over PostgreSQL wire connections to separate `murmur-server` processes.
+No embedded database is opened by these tests.
 
-Go requires mutual TLS on the HTTPS daemon API. The Rust product has no
-HTTPS API server, so this port proves the same TLS policy on the
-product's only TLS server — the QUIC replication endpoint, which
-verifies client certificates against the cluster CA at handshake:
-trusted client certs complete handshakes and open streams, missing or
-foreign-CA certs are rejected at handshake, plaintext is refused, and
-rejected handshakes attach no sessions.
-
-## Leg mapping (Go -> Rust)
-
-- Trusted cert reads API -> 200 becomes: trusted node cert completes a
-  QUIC handshake and opens a stream.
-- Missing cert -> 401 on `/v1/status` + `/metrics` becomes: handshake
-  without a client certificate fails. QUIC has no HTTP layer for a
-  401, so the same policy enforces one step earlier — and the
-  `/healthz` exemption has no target: every connection to this endpoint
-  is authenticated (uniformly stricter, documented here).
-- Foreign-CA cert rejected becomes: handshake with a rogue-CA
-  certificate fails (rogue CA minted in-test via `harness::certs`).
-- Plaintext HTTP refused becomes: TCP connect refused (nothing
-  listens) plus UDP garbage attaching no session.
-- Expired client cert: NOT portable (minting one needs the cluster CA
-  key, which the harness never exposes); port with the HTTPS suite.
-- CLI status legs: NOT portable (`murmur-admin` is an offline CLI with
-  no API client); port with the HTTPS suite.
-
-## Pass criteria
-
-- Trusted handshake + stream open within 10 s / 5 s.
-- Certless and foreign-CA handshakes fail within 10 s each.
-- Zero sessions attach from any rejected handshake or garbage burst.
-- Plaintext TCP refused.
-
-## Compile check (only gate; never run here)
+Run from the repository root:
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/api-mtls/Cargo.toml
+CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path tests-live/api-mtls/Cargo.toml -- --nocapture
 ```
+
+Production SQL mTLS is tested here. Replication-peer certificate admission is covered separately. The client verifies the server chain and loopback IP name.
+
+The process harness builds `murmur-server` and `murmur-admin` with replication,
+or reuses `MURMUR_SERVER_BIN` and its sibling admin executable
+(`MURMUR_ADMIN_BIN` overrides the latter). `MURMUR_LIVE_RUNTIME` selects
+the artifact parent. Each test receives a unique runtime directory; passing
+tests clean up, while panics retain configuration and server logs.

@@ -1,59 +1,21 @@
-# dos-client (Rust port, QUIC surface only)
+# SQL and QUIC connection pressure
 
-Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/dos-client/`
-(`dos_client_test.go`, `TestDoSClientFlood`).
+Holds authenticated QUIC connections without sending the replication Hello, plus idle/partial PostgreSQL startup connections, while spraying invalid UDP datagrams. Honest Rust clients must continue writing within ten seconds, remote application must progress during the attack, incomplete connections must not become replication peers, and all exact rows must converge after teardown and a post-attack write.
 
-## What it proves
+Application operations use the [Rust client](../../clients/rust/README.md)
+over PostgreSQL wire connections to separate `murmur-server` processes.
+No embedded database is opened by these tests.
 
-While an attacker sprays garbage UDP and holds valid-credential QUIC
-half-opens (stream opened, Hello never sent) against the victim's
-replication port, the node keeps serving its legit peer (writes converge
-both ways within latency bounds) and attacker state stays bounded
-(garbage creates no sessions, half-opens never attach as replication
-peers, peer counts recover after teardown).
-
-## Pass criteria (same as Go, for the ported surface)
-
-- Pre-attack: both directions converge within 30 s; peer counts settle.
-- Garbage phase: 5 heartbeat writes converge (7 rows, 30 s); peer count
-  unmoved (junk created no server state).
-- Flood (`MURMUR_DOS_CLIENT_ATTACK_SECONDS`, default 60;
-  `MURMUR_DOS_CLIENT_QUIC_HALFOPEN`, default 24): attacker must hold
-  half the attempted half-opens within 30 s or the flood is too weak to
-  prove anything; a victim write lands in under 10 s; peers stay within
-  baseline + 2; a peer write converges (9 rows) before the deadline; the
-  flood holds for the full duration.
-- Teardown: peers recover to 1 within 30 s and within baseline + 2.
-- Post-attack: one write converges (10 rows) within 15 s with equal
-  digests.
-
-## Not ported (no HTTPS target in Rust)
-
-- All HTTPS flood vectors (TCP half-opens, partial ClientHellos,
-  TLS-idle, slow-loris, certified trickle bodies) and their knobs.
-- Phase 2 protocol-floor checks (401 on unauthenticated exec, TLS 1.0
-  refusal): QUIC pins TLS 1.3 structurally, and a sub-1.3 QUIC dial is
-  inexpressible in quinn.
-- Healthz/legit-query latency legs and goroutine counting (no HTTP
-  endpoints, no stacks endpoint); pressure is proven attacker-side via
-  held half-opens instead.
-
-## Deviations from the Go original
-
-- In-process two-`Database` cluster; plain SQL replaces the
-  typed-contention HTTP API (`contention(id, name)`).
-- Live peer counts (`status().peers`) replace the sessions-opened
-  counter and `/v1/status` connected-peers reads.
-- The QUIC attacker is a real quinn endpoint in-test (new scenario-only
-  deps `quinn`/`rustls`/`tokio`, same versions as the product),
-  presenting the victim's own node certificate from its `tls/` dir with
-  the replication ALPN — the stolen-credential model, exactly like Go.
-- Deterministic xorshift64* replaces `math/rand` (no new dependencies
-  for the garbage spray).
-
-## Compile check (only gate; never run here)
+Run from the repository root:
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/dos-client/Cargo.toml
+CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path tests-live/dos-client/Cargo.toml -- --nocapture
 ```
+
+Defaults: MURMUR_DOS_CLIENT_ATTACK_SECONDS=60 and MURMUR_DOS_CLIENT_QUIC_HALFOPEN=24. Both accept positive integers. Expired QUIC half-opens are replaced throughout the window. This bounded loopback pressure test checks protocol admission and continued service; it does not claim internet-scale denial-of-service resistance.
+
+The process harness builds `murmur-server` and `murmur-admin` with replication,
+or reuses `MURMUR_SERVER_BIN` and its sibling admin executable
+(`MURMUR_ADMIN_BIN` overrides the latter). `MURMUR_LIVE_RUNTIME` selects
+the artifact parent. Each test receives a unique runtime directory; passing
+tests clean up, while panics retain configuration and server logs.

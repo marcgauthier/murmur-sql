@@ -1,49 +1,93 @@
-//! Rust port of the Go `compression` live scenario.
+//! Rust port of the Go `compression` live benchmark.
 //!
 //! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/compression/`
-//! (`compression_test.go`, `TestSpoolCompressionSizes`). Each (compression
-//! mode, traffic profile) cell opens a fresh encrypted store, writes a
-//! seeded deterministic dataset in batches of 500, applies an update pass
-//! over every 10th row where applicable, closes cleanly, and measures the
-//! on-disk store directory.
-//!
-//! Deviation: the Go cells write through managed RIME records on a full
-//! database because the Go engine exposes a per-database `Spool.Compression`
-//! knob (`none`/`deflate`). The Rust `Database` hardcodes its Spool block
-//! codec to a custom zstd codec (`storage.rs::spool_options`, codec id 128)
-//! with only a level knob, so a `none`-vs-`deflate` comparison is impossible
-//! through `Database::open`. The cells therefore write equivalent seeded KV
-//! traffic directly to `spool::Store` with `Compression::NONE` vs
-//! `Compression::DEFLATE` (same 64 KiB target blocks, same AES-256-GCM
-//! encryption). Row counts, ID checksums, and the size gates mirror Go.
+//! (`compression_test.go`, `TestSpoolCompressionSizes`). For several
+//! realistic traffic shapes, compare the on-disk store size across Spool
+//! compression levels. Each cell runs a real single-node `murmur-server`
+//! on real disk, writes a seeded deterministic dataset through plain SQL,
+//! shuts down cleanly, and measures the data directory. The Rust engine
+//! has no compression on/off knob (Spool always uses zstd with a level),
+//! so cells compare the lowest and a high `compression_level` instead of
+//! Go's `none` vs `deflate` (see the scenario README.md).
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use murmur_live_harness::artifacts::{finish, prepare_runtime_dir};
-use murmur_live_harness::spool::{
-    self, Compression, Durability, Mutation,
-};
-use rand::{Rng, RngCore, SeedableRng};
+use murmur_live_harness::tokio_postgres::types::ToSql;
+use murmur_live_harness::{Cluster, ClusterOptions};
 
-/// Seeded RNG stream (Go: `rand.New(rand.NewSource(42))`). The same seed is
-/// reused for every mode so all modes get byte-identical keys and datasets.
-const SEED: u64 = 42;
-/// Insert batch size (Go: `const batch = 500`).
+/// Compression levels under test: lowest vs high zstd (Go compares
+/// `none` vs `deflate`, which has no Rust equivalent).
+const LEVELS: [i32; 2] = [1, 12];
+/// Insert batch size (Go: 500 rows per write batch).
 const BATCH: usize = 500;
-/// Fresh-application key per store (Go: `bytes.Repeat([]byte{0x3a}, 32)`).
-const KEY: [u8; 32] = [0x3a; 32];
-/// Key-envelope id (Go: `KeyID: "compression-bench"`).
-const KEY_ID: &str = "compression-bench";
-/// Target plaintext bytes per Spool block (Go: `TargetBlockBytes = 64 << 10`).
-const TARGET_BLOCK_BYTES: usize = 64 << 10;
+/// Flush/update stride inside the churn pass.
+const CHURN_FLUSH_STRIDE: usize = 500;
+/// Fixed dataset seed: every level of one profile gets byte-identical keys
+/// and datasets (Go: `seed = 42`).
+const SEED: u64 = 42;
 
-/// One traffic record. All profiles share this single stable shape (Go:
-/// `compressionRecord`); unused fields stay empty.
-#[derive(Clone)]
+const LOREM: &str = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation ullamco laboris nisi aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate velit esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt culpa qui officia deserunt mollit anim id est laborum perspiciatis unde omnis natus error voluptatem";
+
+/// Minimal deterministic PRNG (xorshift64*): only same-seed equality across
+/// levels within one process is needed, not cross-language equality.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545f4914f6cdd1d)
+    }
+
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+
+    fn bytes(&mut self, out: &mut [u8]) {
+        let mut i = 0;
+        while i < out.len() {
+            let word = self.next().to_le_bytes();
+            let take = (out.len() - i).min(8);
+            out[i..i + take].copy_from_slice(&word[..take]);
+            i += take;
+        }
+    }
+
+    fn float(&mut self) -> f64 {
+        (self.next() >> 11) as f64 / (1u64 << 53) as f64
+    }
+}
+
+fn lorem(rng: &mut Rng, words: usize) -> String {
+    let vocab: Vec<&str> = LOREM.split(' ').collect();
+    (0..words)
+        .map(|_| vocab[rng.below(vocab.len() as u64) as usize])
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// One traffic profile (Go: `trafficProfile`).
+struct Profile {
+    name: &'static str,
+    rows: usize,
+    /// 0 = oltp-small, 1 = text-heavy, 2 = json-docs, 3 = blobs-random.
+    kind: u8,
+}
+
+const PROFILES: [Profile; 4] = [
+    Profile { name: "oltp-small", rows: 20_000, kind: 0 },
+    Profile { name: "text-heavy", rows: 8_000, kind: 1 },
+    Profile { name: "json-docs", rows: 8_000, kind: 2 },
+    Profile { name: "blobs-random", rows: 2_000, kind: 3 },
+];
+
+/// One generated row: all columns (Go: full `compressionRecord` with zero
+/// values for untouched fields).
 struct Record {
-    id: [u8; 16],
+    id: String,
     code: String,
     qty: i64,
     price: f64,
@@ -55,184 +99,90 @@ struct Record {
     data: Vec<u8>,
 }
 
-impl Record {
-    fn blank(id: [u8; 16]) -> Self {
-        Self {
-            id,
-            code: String::new(),
-            qty: 0,
-            price: 0.0,
-            title: String::new(),
-            body: String::new(),
-            tags: String::new(),
-            kind: String::new(),
-            payload: String::new(),
-            data: Vec::new(),
+fn create(rng: &mut Rng, profile: &Profile, i: usize) -> Record {
+    let mut id_bytes = [0u8; 16];
+    rng.bytes(&mut id_bytes);
+    let id = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let mut record = Record {
+        id,
+        code: String::new(),
+        qty: 0,
+        price: 0.0,
+        title: String::new(),
+        body: String::new(),
+        tags: String::new(),
+        kind: String::new(),
+        payload: String::new(),
+        data: Vec::new(),
+    };
+    match profile.kind {
+        0 => {
+            record.code = format!("SKU-{:05}", rng.below(2000));
+            record.qty = rng.below(100) as i64;
+            record.price = rng.float() * 999.99;
         }
-    }
-
-    /// Deterministic field encoding: fixed field order, each length-prefixed.
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        push_str(&mut out, &self.code);
-        out.extend_from_slice(&self.qty.to_le_bytes());
-        out.extend_from_slice(&self.price.to_le_bytes());
-        push_str(&mut out, &self.title);
-        push_str(&mut out, &self.body);
-        push_str(&mut out, &self.tags);
-        push_str(&mut out, &self.kind);
-        push_str(&mut out, &self.payload);
-        push_bytes(&mut out, &self.data);
-        out
-    }
-
-    fn key(&self) -> Vec<u8> {
-        let mut key = b"rec/".to_vec();
-        key.extend_from_slice(&hex_id(&self.id));
-        key
-    }
-}
-
-fn push_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
-    out.extend_from_slice(b);
-}
-
-fn push_str(out: &mut Vec<u8>, s: &str) {
-    push_bytes(out, s.as_bytes());
-}
-
-fn hex_id(id: &[u8; 16]) -> Vec<u8> {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = Vec::with_capacity(32);
-    for b in id {
-        out.push(HEX[(b >> 4) as usize]);
-        out.push(HEX[(b & 0xf) as usize]);
-    }
-    out
-}
-
-struct Mode {
-    name: &'static str,
-    algo: Compression,
-}
-
-const MODES: [Mode; 2] = [
-    Mode {
-        name: "none",
-        algo: Compression::NONE,
-    },
-    Mode {
-        name: "deflate",
-        algo: Compression::DEFLATE,
-    },
-];
-
-/// Which fields a profile fills, and its update pass.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ProfileKind {
-    OltpSmall,
-    TextHeavy,
-    JsonDocs,
-    BlobsRandom,
-}
-
-struct Profile {
-    name: &'static str,
-    rows: usize,
-    kind: ProfileKind,
-}
-
-const PROFILES: [Profile; 4] = [
-    Profile {
-        name: "oltp-small",
-        rows: 20_000,
-        kind: ProfileKind::OltpSmall,
-    },
-    Profile {
-        name: "text-heavy",
-        rows: 8_000,
-        kind: ProfileKind::TextHeavy,
-    },
-    Profile {
-        name: "json-docs",
-        rows: 8_000,
-        kind: ProfileKind::JsonDocs,
-    },
-    Profile {
-        name: "blobs-random",
-        rows: 2_000,
-        kind: ProfileKind::BlobsRandom,
-    },
-];
-
-const LOREM_TEXT: &str = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod\ntempor incididunt ut labore et dolore magna aliqua enim ad minim veniam quis nostrud exercitation\nullamco laboris nisi aliquip ex ea commodo consequat duis aute irure in reprehenderit voluptate\nvelit esse cillum fugiat nulla pariatur excepteur sint occaecat cupidatat non proident sunt culpa\nqui officia deserunt mollit anim id est laborum perspiciatis unde omnis natus error voluptatem";
-
-fn lorem(rng: &mut impl Rng, words: &[&str], n: usize) -> String {
-    let mut out = String::new();
-    for i in 0..n {
-        if i > 0 {
-            out.push(' ');
+        1 => {
+            let title_words = 4 + rng.below(6) as usize;
+            let body_words = 100 + rng.below(200) as usize;
+            record.title = lorem(rng, title_words);
+            record.body = lorem(rng, body_words);
+            record.tags = "news,tech,local".to_string();
         }
-        out.push_str(words[rng.gen_range(0..words.len())]);
-    }
-    out
-}
-
-fn create_row(rng: &mut impl Rng, words: &[&str], kind: ProfileKind, i: usize, id: [u8; 16]) -> Record {
-    let mut row = Record::blank(id);
-    match kind {
-        ProfileKind::OltpSmall => {
-            row.code = format!("SKU-{:05}", rng.gen_range(0..2000));
-            row.qty = rng.gen_range(0..100);
-            row.price = rng.gen::<f64>() * 999.99;
-        }
-        ProfileKind::TextHeavy => {
-            let title_words = 4 + rng.gen_range(0..6);
-            row.title = lorem(rng, words, title_words);
-            let body_words = 100 + rng.gen_range(0..200);
-            row.body = lorem(rng, words, body_words);
-            row.tags = "news,tech,local".to_string();
-        }
-        ProfileKind::JsonDocs => {
-            row.kind = "pageview".to_string();
-            row.payload = format!(
-                "{{\"event_id\":{i},\"user\":{{\"id\":{},\"name\":\"user-{}\",\"roles\":[\"reader\",\"editor\"]}},\
-                 \"context\":{{\"app\":\"storefront\",\"region\":\"eu-west\",\"build\":{}}},\
-                 \"metrics\":{{\"latency_ms\":{:.3},\"retries\":{},\"flags\":[true,false,true]}},\
-                 \"trace\":[\"recv\",\"auth\",\"load\",\"render\",\"send\"]}}",
-                rng.gen_range(0..50_000),
-                rng.gen_range(0..50_000),
-                1000 + rng.gen_range(0..50),
-                rng.gen::<f64>() * 250.0,
-                rng.gen_range(0..4),
+        2 => {
+            record.kind = "pageview".to_string();
+            record.payload = format!(
+                "{{\"event_id\":{i},\"user\":{{\"id\":{},\"name\":\"user-{}\",\"roles\":[\"reader\",\"editor\"]}},\"context\":{{\"app\":\"storefront\",\"region\":\"eu-west\",\"build\":{}}},\"metrics\":{{\"latency_ms\":{:.3},\"retries\":{},\"flags\":[true,false,true]}},\"trace\":[\"recv\",\"auth\",\"load\",\"render\",\"send\"]}}",
+                rng.below(50_000),
+                rng.below(50_000),
+                1000 + rng.below(50),
+                rng.float() * 250.0,
+                rng.below(4),
             );
         }
-        ProfileKind::BlobsRandom => {
-            row.data = vec![0u8; 4096];
-            rng.fill_bytes(&mut row.data);
+        _ => {
+            let mut buf = vec![0u8; 4096];
+            rng.bytes(&mut buf);
+            record.data = buf;
         }
     }
-    row
+    record
 }
 
-/// Update pass over one row. Returns false for profiles without updates
-/// (Go: `update: nil` for immutable blobs).
-fn update_row(rng: &mut impl Rng, kind: ProfileKind, row: &mut Record) -> bool {
-    match kind {
-        ProfileKind::OltpSmall => {
-            row.qty = rng.gen_range(0..100);
-            true
+/// Churn pass for one row id: update every 10th row like live traffic
+/// would (Go: per-profile `update`; blobs are immutable).
+async fn churn(cluster: &Cluster, profile: &Profile, id: &str) -> Result<bool, String> {
+    match profile.kind {
+        0 => {
+            let qty = (id.len() % 100) as i64;
+            let params = [&qty as &(dyn ToSql + Sync), &id as _];
+            cluster
+                .node(0)
+                .execute("UPDATE cells SET qty = $1 WHERE id = $2", &params)
+                .await
+                .map_err(|e| format!("churn update {id:?}: {e}"))?;
+            Ok(true)
         }
-        ProfileKind::TextHeavy => {
-            row.tags = "news,tech,local,updated".to_string();
-            true
+        1 => {
+            let tags = "news,tech,local,updated";
+            let params = [&tags as &(dyn ToSql + Sync), &id as _];
+            cluster
+                .node(0)
+                .execute("UPDATE cells SET tags = $1 WHERE id = $2", &params)
+                .await
+                .map_err(|e| format!("churn update {id:?}: {e}"))?;
+            Ok(true)
         }
-        ProfileKind::JsonDocs => {
-            row.kind = "pageview-v2".to_string();
-            true
+        2 => {
+            let kind = "pageview-v2";
+            let params = [&kind as &(dyn ToSql + Sync), &id as _];
+            cluster
+                .node(0)
+                .execute("UPDATE cells SET kind = $1 WHERE id = $2", &params)
+                .await
+                .map_err(|e| format!("churn update {id:?}: {e}"))?;
+            Ok(true)
         }
-        ProfileKind::BlobsRandom => false,
+        _ => Ok(false),
     }
 }
 
@@ -241,128 +191,37 @@ struct CellResult {
     total: u64,
     files: usize,
     write_dur: Duration,
-    checksum: String,
+    checksum: u64,
 }
 
-/// `MURMUR_LIVE_COMPRESSION_SCALE` multiplies every profile's row count.
-fn env_scale() -> usize {
-    match std::env::var("MURMUR_LIVE_COMPRESSION_SCALE") {
-        Ok(raw) if !raw.is_empty() => raw
-            .parse::<usize>()
-            .ok()
-            .filter(|n| *n >= 1)
-            .unwrap_or_else(|| {
-                panic!("MURMUR_LIVE_COMPRESSION_SCALE must be a positive integer")
-            }),
-        _ => 1,
-    }
-}
-
-/// FNV-1a/64 over row IDs in write order (Go hashes hex IDs with SHA-256;
-/// only cross-mode equality within this process is asserted).
-fn checksum_ids(rows: &[Record]) -> String {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for row in rows {
-        for b in row.id {
-            h ^= b as u64;
-            h = h.wrapping_mul(0x100000001b3);
+fn fnv1a(ids: &[String]) -> u64 {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for id in ids {
+        for b in id.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
         }
     }
-    format!("{h:016x}")
+    hash
 }
 
-fn dir_usage(path: &Path) -> (u64, usize) {
-    let mut total = 0u64;
-    let mut files = 0usize;
-    let mut stack = vec![path.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let entries =
-            std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
-        for entry in entries {
-            let entry = entry.expect("dir entry");
-            let ty = entry.file_type().expect("file type");
-            if ty.is_dir() {
-                stack.push(entry.path());
-            } else {
+fn dir_size(dir: &std::path::Path) -> (u64, usize) {
+    let mut total = 0;
+    let mut files = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if let Ok(meta) = entry.metadata() {
+                total += meta.len();
                 files += 1;
-                total += entry.metadata().expect("file metadata").len();
             }
         }
     }
     (total, files)
-}
-
-fn run_cell(runtime: &Path, mode: &Mode, prof: &Profile, scale: usize) -> CellResult {
-    let dir: PathBuf = runtime.join(format!("{}-{}", mode.name, prof.name));
-    let mut opts = spool::default_options(dir.to_string_lossy().to_string());
-    opts.master_key = KEY.to_vec();
-    opts.wrapping_key_id = KEY_ID.to_string();
-    opts.target_block_bytes = TARGET_BLOCK_BYTES;
-    opts.compression = Some(mode.algo);
-    // No codec override: the store's built-in none/deflate codecs apply.
-    opts.reclaim_interval = None; // deterministic sizes
-
-    let store = spool::open(&opts).expect("spool open");
-    let rows_total = prof.rows * scale;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
-    let words: Vec<&str> = LOREM_TEXT.split_whitespace().collect();
-    let mut rows: Vec<Record> = Vec::with_capacity(rows_total);
-
-    let start = Instant::now();
-    for base in (0..rows_total).step_by(BATCH) {
-        let end = (base + BATCH).min(rows_total);
-        let mut mutations = Vec::with_capacity(end - base);
-        for i in base..end {
-            let mut id = [0u8; 16];
-            rng.fill_bytes(&mut id);
-            let row = create_row(&mut rng, &words, prof.kind, i, id);
-            mutations.push(Mutation::put(row.key(), row.encode()));
-            rows.push(row);
-        }
-        store
-            .commit(&mutations, Durability::Async)
-            .expect("insert batch");
-    }
-    // Churn pass: update every 10th row like live traffic would.
-    if prof.kind != ProfileKind::BlobsRandom {
-        for base in (0..rows_total).step_by(BATCH * 10) {
-            let end = (base + BATCH * 10).min(rows_total);
-            let mut mutations = Vec::new();
-            for i in (base..end).step_by(10) {
-                let row = &mut rows[i];
-                assert!(update_row(&mut rng, prof.kind, row));
-                mutations.push(Mutation::put(row.key(), row.encode()));
-            }
-            store
-                .commit(&mutations, Durability::Async)
-                .expect("update batch");
-        }
-    }
-    let write_dur = start.elapsed();
-
-    // Async commits are admitted without blocking; the location index only
-    // reflects them once the background writer processes the batch, so a
-    // barrier is required before counting (and before measuring sizes).
-    store.flush().expect("flush before count");
-    let count = store.keys_with_prefix(b"rec/").len();
-    assert_eq!(
-        count, rows_total,
-        "mode {} profile {}: count = {count}, want {rows_total}",
-        mode.name, prof.name,
-    );
-    let checksum = checksum_ids(&rows);
-
-    store.flush().expect("flush before close");
-    store.close().expect("close store");
-
-    let (total, files) = dir_usage(&dir);
-    CellResult {
-        rows: count,
-        total,
-        files,
-        write_dur: write_dur,
-        checksum,
-    }
 }
 
 fn format_bytes(n: u64) -> String {
@@ -376,106 +235,229 @@ fn format_bytes(n: u64) -> String {
         div *= UNIT;
         exp += 1;
     }
-    format!("{:.1}{}B", n as f64 / div as f64, b"KMGT"[exp] as char)
+    format!("{:.1}{}B", n as f64 / div as f64, ["K", "M", "G", "T"][exp])
 }
 
-fn body(runtime: &Path) {
-    let scale = env_scale();
+/// Run one (profile, level) cell: fresh single-node server, seeded
+/// dataset, churn pass, clean shutdown, data-dir measurement.
+async fn run_cell(profile: &Profile, level: i32, scale: usize) -> Result<CellResult, String> {
+    let name = format!("compression-{}-l{level}", profile.name);
+    let mut cluster = Cluster::new(ClusterOptions {
+        name: name.clone(),
+        num_nodes: 1,
+        extra_toml: format!("[engine]\ncompression_level = {level}\n"),
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| format!("cell {} setup: {e}", profile.name))?;
 
-    // profile -> mode -> result
-    let mut results: HashMap<&str, HashMap<&str, CellResult>> = HashMap::new();
-    for prof in &PROFILES {
-        let mut per_mode = HashMap::new();
-        for mode in &MODES {
-            let res = run_cell(runtime, mode, prof, scale);
-            eprintln!(
-                "{:<12} {:<8} rows={} total={} files={} write={:?}",
-                prof.name,
-                mode.name,
-                res.rows,
-                format_bytes(res.total),
-                res.files,
-                res.write_dur,
-            );
-            per_mode.insert(mode.name, res);
+    let body = async {
+        match cluster.node(0).simple("CREATE TABLE cells(id TEXT NOT NULL PRIMARY KEY, code TEXT NOT NULL, qty INTEGER NOT NULL, price REAL NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, tags TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, data BLOB NOT NULL)").await {
+            Ok(_) => {
+                if let Err(e) = cluster.node(0).flush().await {
+                    return Err(format!("flush error: {e:#?}"));
+                }
+            }
+            Err(e) => return Err(format!("create table error: {e:#?}")),
         }
-        results.insert(prof.name, per_mode);
+
+        let rows = profile.rows * scale;
+        let mut rng = Rng(SEED);
+        let mut ids = Vec::with_capacity(rows);
+        let start = Instant::now();
+        for base in (0..rows).step_by(BATCH) {
+            let end = (base + BATCH).min(rows);
+            let mut batch = Vec::with_capacity(end - base);
+            for i in base..end {
+                let record = create(&mut rng, profile, i);
+                ids.push(record.id.clone());
+                batch.push(record);
+            }
+            // One multi-row INSERT per batch.
+            let mut sql = String::from("INSERT INTO cells(id, code, qty, price, title, body, tags, kind, payload, data) VALUES");
+            let mut refs: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(batch.len() * 10);
+            for (n, record) in batch.iter().enumerate() {
+                let base_param = n * 10 + 1;
+                sql.push_str(&format!(
+                    "{}( ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                    if n == 0 { "" } else { "," },
+                    base_param,
+                    base_param + 1,
+                    base_param + 2,
+                    base_param + 3,
+                    base_param + 4,
+                    base_param + 5,
+                    base_param + 6,
+                    base_param + 7,
+                    base_param + 8,
+                    base_param + 9,
+                ));
+                refs.push(&record.id);
+                refs.push(&record.code);
+                refs.push(&record.qty);
+                refs.push(&record.price);
+                refs.push(&record.title);
+                refs.push(&record.body);
+                refs.push(&record.tags);
+                refs.push(&record.kind);
+                refs.push(&record.payload);
+                refs.push(&record.data);
+            }
+            cluster
+                .node(0)
+                .execute(&sql, &refs)
+                .await
+                .map_err(|e| format!("batch insert at {base}: {e}"))?;
+            cluster.node(0).flush().await.map_err(|e| format!("flush batch at {base}: {e}"))?;
+        }
+        // Churn pass: update every 10th row like live traffic would.
+        let mut churned = 0;
+        for (i, id) in ids.iter().enumerate() {
+            if i % 10 != 0 {
+                continue;
+            }
+            if churn(&cluster, profile, id).await? {
+                churned += 1;
+                if churned % CHURN_FLUSH_STRIDE == 0 {
+                    cluster.node(0).flush().await.map_err(|e| format!("flush churn: {e}"))?;
+                }
+            }
+        }
+        cluster.node(0).flush().await.map_err(|e| format!("final flush: {e}"))?;
+        let write_dur = start.elapsed();
+
+        let count_rows = cluster
+            .node(0)
+            .query("SELECT COUNT(*) FROM cells", &[])
+            .await
+            .map_err(|e| format!("count: {e}"))?;
+        let count: i64 = count_rows
+            .first()
+            .ok_or_else(|| "count returned no rows".to_string())?
+            .try_get(0)
+            .map_err(|e| format!("decode count: {e}"))?;
+        if count as usize != rows {
+            return Err(format!("level {level} profile {}: count = {count}, want {rows}", profile.name));
+        }
+        let checksum = fnv1a(&ids);
+        let data_dir = cluster.node_info(0).data_dir.clone();
+        cluster.stop_node(0).await;
+        let (total, files) = dir_size(&data_dir);
+        Ok::<CellResult, String>(CellResult { rows: count as usize, total, files, write_dur, checksum })
+    }
+    .await;
+
+    let failed = body.is_err();
+    if let Err(e) = &body {
+        eprintln!("cell {} l{level} failed: {e}", profile.name);
+    }
+    if failed {
+        cluster.dump_forensics("compression-cell").await;
+    }
+    // The node is already stopped on success; finish reaps children and
+    // retains-or-cleans the runtime dir + RESULT line.
+    cluster.finish(failed).await;
+    let result = body?;
+    eprintln!(
+        "{:<12} l{:<2} rows={} total={} ({} files) write={:?}",
+        profile.name,
+        level,
+        result.rows,
+        format_bytes(result.total),
+        result.files,
+        result.write_dur
+    );
+    Ok(result)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn spool_compression_sizes() {
+    let scale = std::env::var("MURMUR_LIVE_COMPRESSION_SCALE")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v >= 1)
+        .unwrap_or(1);
+
+    let mut failed = false;
+    // profile -> level -> result.
+    let mut results: Vec<(&str, Vec<(i32, CellResult)>)> = Vec::new();
+    for profile in &PROFILES {
+        let mut cells = Vec::new();
+        for level in LEVELS {
+            match run_cell(profile, level, scale).await {
+                Ok(result) => cells.push((level, result)),
+                Err(e) => {
+                    eprintln!("scenario failed: {e}");
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        if failed {
+            break;
+        }
+        results.push((profile.name, cells));
+    }
+    if failed {
+        panic!("scenario failed; artifacts retained under tests-live/failures/");
     }
 
-    eprintln!("mode \\ profile | oltp-small | text-heavy | json-docs | blobs-random");
-    for mode in &MODES {
+    eprintln!("level \\ profile | {}", PROFILES.iter().map(|p| p.name).collect::<Vec<_>>().join(" | "));
+    for level in LEVELS {
         let mut cells = Vec::new();
-        for prof in &PROFILES {
-            let res = &results[prof.name][mode.name];
-            let base = results[prof.name]["none"].total;
-            let ratio = if base > 0 {
-                res.total as f64 / base as f64
-            } else {
-                0.0
-            };
-            cells.push(format!("{} ({:.0}%)", format_bytes(res.total), ratio * 100.0));
+        for (name, level_results) in &results {
+            let base = level_results.iter().find(|(l, _)| *l == LEVELS[0]).unwrap().1.total;
+            let total = level_results.iter().find(|(l, _)| *l == level).unwrap().1.total;
+            let ratio = if base > 0 { total as f64 / base as f64 * 100.0 } else { 0.0 };
+            cells.push(format!("{} ({ratio:.0}%)", format_bytes(total)));
+            let _ = name;
         }
-        eprintln!("{:<8} | {}", mode.name, cells.join(" | "));
+        eprintln!("l{level:<7} | {}", cells.join(" | "));
     }
 
     // Sanity gates: identical datasets must hold identical rows with
-    // identical checksums; compressible traffic must shrink under deflate;
-    // incompressible traffic must not explode; and segment bytes must exist.
-    for prof in &PROFILES {
-        let mut want_sum: Option<&str> = None;
-        for mode in &MODES {
-            let res = &results[prof.name][mode.name];
+    // identical checksums; compressible traffic must shrink at the high
+    // level; incompressible traffic must not explode; and segments must
+    // exist.
+    for (name, level_results) in &results {
+        let profile = PROFILES.iter().find(|p| p.name == *name).unwrap();
+        let mut want_sum = None;
+        for (level, result) in level_results {
             match want_sum {
-                None => want_sum = Some(&res.checksum),
-                Some(want) => assert_eq!(
-                    res.checksum, want,
-                    "profile {}: mode {} dataset diverged",
-                    prof.name, mode.name,
-                ),
+                None => want_sum = Some(result.checksum),
+                Some(want) if want == result.checksum => {}
+                _ => panic!("profile {name}: level {level} dataset diverged"),
             }
-            assert_eq!(
-                res.rows,
-                prof.rows * scale,
-                "profile {} mode {}: rows = {}",
-                prof.name,
-                mode.name,
-                res.rows,
-            );
-            assert!(
-                res.files > 0 && res.total > 0,
-                "profile {} mode {}: no segment bytes measured",
-                prof.name,
-                mode.name,
-            );
+            assert_eq!(result.rows, profile.rows * scale, "profile {name} level {level}: row count");
+            assert!(result.files > 0 && result.total > 0, "profile {name} level {level}: no store bytes measured");
         }
     }
-    let text_none = results["text-heavy"]["none"].total;
-    let text_deflate = results["text-heavy"]["deflate"].total;
+    let get = |profile: &str, level: i32| -> u64 {
+        results
+            .iter()
+            .find(|(n, _)| *n == profile)
+            .unwrap()
+            .1
+            .iter()
+            .find(|(l, _)| *l == level)
+            .unwrap()
+            .1
+            .total
+    };
+    let text_low = get("text-heavy", LEVELS[0]);
+    let text_high = get("text-heavy", LEVELS[1]);
     assert!(
-        text_deflate < text_none,
-        "text-heavy deflate ({text_deflate}) not smaller than none ({text_none}): compression disengaged?",
+        text_high < text_low,
+        "text-heavy l{} ({text_high}) not smaller than l{} ({text_low}): compression disengaged?",
+        LEVELS[1],
+        LEVELS[0]
     );
-    let blob_none = results["blobs-random"]["none"].total;
-    let blob_deflate = results["blobs-random"]["deflate"].total;
+    let blob_low = get("blobs-random", LEVELS[0]);
+    let blob_high = get("blobs-random", LEVELS[1]);
     assert!(
-        blob_deflate <= blob_none * 11 / 10,
-        "blobs-random deflate grew >10% over none ({blob_deflate} vs {blob_none})",
-    );
-}
-
-#[test]
-fn spool_compression_sizes() {
-    let runtime =
-        prepare_runtime_dir("compression").expect("prepare runtime dir");
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        body(&runtime);
-    }))
-    .is_err();
-    // No cluster/forensics handle in this in-process single-store scenario;
-    // on failure the runtime dir (all cell stores) is retained as-is.
-    finish("compression", &runtime, failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
+        blob_high <= blob_low * 11 / 10,
+        "blobs-random l{} grew >10% over l{} ({blob_high} vs {blob_low})",
+        LEVELS[1],
+        LEVELS[0]
     );
 }

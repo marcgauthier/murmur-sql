@@ -4,4 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-murmur-live-harness = { path = "../harness" }
+murmur-live-harness = { package = "murmur-live-sql-harness", path = "../sql-harness" }
+murmur-client = { path = "../../clients/rust" }
+tokio = { version = "1", features = ["full"] }
+toml_edit = "0.22"
+libc = "0.2"

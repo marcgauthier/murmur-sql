@@ -7,14 +7,15 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/snapshot-resync/`
 
 ## What it proves
 
-Three nodes mesh with aggressive log retention (1 s retention, 20 s offline
-pin, 10 retained batches). One node stops while the survivors write past
-retention and GC expiry, then restarts with the same durable directory: its
-needed log ranges are unrecoverable, so it must rejoin by merging a snapshot
-without discarding its acknowledged pre-stop state. A second test stops two
-nodes and restarts both back-to-back so their snapshot requests overlap on
-the survivor. A multi-source case gives the stale node three snapshot
-sources concurrently over a 6,000-row snapshot.
+Three `murmur-server` processes mesh with aggressive log retention (1 s
+retention, 20 s offline pin, 10 retained batches). One node stops while the
+survivors write past retention and GC expiry, then restarts with the same
+durable directory: its needed log ranges are unrecoverable, so it must
+rejoin by merging a snapshot without discarding its acknowledged pre-stop
+state. A second test stops two nodes and restarts both back-to-back so
+their snapshot requests overlap on the survivor. A multi-source case gives
+the stale node three snapshot sources concurrently over a 6,000-row
+snapshot.
 
 ## Pass criteria
 
@@ -25,9 +26,9 @@ sources concurrently over a 6,000-row snapshot.
   and no longer pins node3 (proves the rejoin must use the snapshot path,
   since only the newest 10 per origin survive).
 - Node3 restarts with the same durable directory; all converge on 65 rows
-  with equal digests (90 s) while node3's log-path growth stays within
+  with equal digests (90 s) while node3's applied-log growth stays within
   the retained tail and far below the gap (proves the bulk arrived via
-  snapshot, which bypasses those counters);
+  snapshot, which bypasses that counter);
   the 5 pre-stop `stale-*` rows survive the merge.
 - Dual leg: same shape with two stale nodes and one survivor; both rejoin
   via snapshots (120 s), both keep their 5 pre-stop rows, and each
@@ -41,37 +42,53 @@ sources concurrently over a 6,000-row snapshot.
 
 - `MURMUR_SNAPSHOT_RESYNC_GC_WAIT_SECONDS` (default 30): member-deadline
   wait before the collection passes. Lower than the Go default (55) because
-  this port drives retention with explicit `collect_retention` passes
+  this port drives retention with explicit `MURMUR RETENTION COLLECT` passes
   instead of waiting out the engine's 60 s collection interval.
 - Harness knobs apply: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`,
+  `CARGO_TARGET_DIR`.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
+- Multi-process cluster: one `murmur-server` child per node, driven over
+  the PostgreSQL wire (SQL + `MURMUR ...` commands), instead of `testnode`
+  daemon processes over HTTPS+mTLS (per design). Process stop/start
+  replaces close/reopen; `mesh()` re-dials after each restart because the
+  node rebinds fresh ports.
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`) instead of the
   managed typed-records HTTP API; digests are newline-joined names.
-- Close/reopen replaces process stop/start (no SIGKILL leg in this
-  scenario); `mesh()` re-dials after each restart because the node
-  rebinds a fresh ephemeral port.
-- Snapshot trust is configured up front (every node trusts every node)
-  instead of via the Go fixture policy; the empty-trust default is
-  unchanged, so without this overlay no leg could request a snapshot.
-- No snapshot metrics exist (`ReplicationMetrics` carries no snapshot
-  counters), so the Go counter legs map to behavior: `snapshots_received
-  >= 1` becomes "rows converged while the receiver's log growth stayed
+  Every node runs `MURMUR SET TABLE records REPLICATED true` (per-node
+  config) before any writes.
+- Retention legs map to wire commands: `collect_retention` becomes
+  `MURMUR RETENTION COLLECT` (returns pruned count), and retention pins
+  plus prune totals come from `MURMUR SHOW RETENTION`
+  (`node_id`/`last_seen_millis`/`collected_transactions` columns).
+- No snapshot metrics exist, so the Go counter legs map to behavior:
+  `snapshots_received >= 1` becomes "rows converged while the receiver's
+  `applied_transactions` growth (via `MURMUR SHOW REPLICATION`) stayed
   within the retained tail and far below the gap" (the retained tail
-  legitimately arrives via logs, so a flat pair would be over-strict);
+  legitimately arrives via logs, so a flat counter would be over-strict);
   the dual test's progress/deferral-series presence legs become a
   connected-peer diagnostics assertion; the multi-source suppressed-frames
   leg becomes behavioral contention coverage (three live sources, one
   completed transfer, convergence to 6,005 rows).
+- `received_transactions` has no wire equivalent (`MURMUR SHOW METRICS`
+  only covers SQLite/Spool, and `staged_transactions` is a gauge, not a
+  cumulative counter), so the snapshot-path proof uses the cumulative
+  `applied_transactions` column alone; snapshot application bypasses it,
+  so the proof is unchanged.
 - Survivor writes flush per write/batch: one replication log entry is
   minted per flush batch, and retention needs dozens of entries to prune
   past (a single trailing flush would leave fewer than
   `minimum_retained`).
-- The collection proof is explicit (`collect_retention` passes plus a
-  retention-pin age assertion per survivor/victim pair) rather than a
+- The collection proof is explicit (`MURMUR RETENTION COLLECT` passes plus
+  a retention-pin age assertion per survivor/victim pair) rather than a
   fixed 55 s sleep, but the member-deadline wait is kept.
+
+## Compile check (only gate; never run here)
+
+```sh
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/snapshot-resync/Cargo.toml
+```

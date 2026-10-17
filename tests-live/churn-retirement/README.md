@@ -10,7 +10,7 @@ Go pass criterion:
 
 1. Baseline: five rows written on node1 converge identically on all nodes.
 2. Sessions to node3 drop on both survivors; each survivor sees exactly one
-   peer (the other survivor).
+   open session (the other survivor).
 3. Node3's writes stop arriving (survivors keep only the five baseline rows
    across a 5 s hold).
 4. Exclusion survives a survivor restart with no rediscovery re-mesh
@@ -23,36 +23,42 @@ Go pass criterion:
 
 | Go | Rust |
 |---|---|
-| `Cluster.TypedInsert` / `TypedNames` (HTTP API) | Plain SQL `records(name TEXT NOT NULL PRIMARY KEY)` via `Database::transaction` / `Database::read` + `flush()` |
-| `RemovePeer` (exclusion legs) | `Cluster::remove_peer` (durable `07/replication/excluded/*` record, reversible via `add_peer`) |
-| Retention-pin release inside `RemovePeer` | `Database::retire_peer` (durable `retired=true` retention record) |
-| `spedsql_peer_connected{peer=...}` | `Handle::status().peers_diagnostics` (`node_id` + `connected`) |
-| `spedsql_peer_count` | `Handle::status().peers` |
-| `spedsql_gating_members` | `Database::retention_status().peers` entries with `retired == false` |
-| `StopNode` / `StartNode` / `UnlockNode` / `WaitNodeReady` | `Cluster::stop_node` (`close()`) / `Cluster::start_node` (reopen same dir+key under the unlock watchdog); explicit `add_peer` re-mesh to the fellow survivor only (fresh ephemeral port) |
-| `AddPeer` re-add | `Cluster::add_peer` (deletes the exclusion record + dials) |
+| `Cluster.TypedInsert` / `TypedNames` (HTTP API) | Plain SQL `records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)` via `execute`/`query` + `flush()` |
+| `RemovePeer` (exclusion legs) | `Cluster::remove_peer` (durable exclusion, reversible via `add_peer`) |
+| Retention-pin release inside `RemovePeer` | `Cluster::retire_peer` (durable `retired=true` retention record) |
+| `spedsql_peer_connected{peer=...}` | `MURMUR SHOW PEERS` (`node_id` + `connected`) |
+| `spedsql_peer_count` | Open-session rows of `MURMUR SHOW PEERS` |
+| `spedsql_gating_members` | Distinct non-retired peers in `MURMUR SHOW RETENTION` |
+| `StopNode` / `StartNode` / `UnlockNode` / `WaitNodeReady` | `Cluster::stop_node` / `Cluster::start_node` (unlock runs under the harness watchdog inside `start_node`); explicit `add_peer` re-mesh to the fellow survivor only (fresh ephemeral port) |
+| `AddPeer` re-add | `Cluster::add_peer` (clears the exclusion + dials) |
 
 ## Deviations
 
 - **Retention-release leg runs after the re-add heal**, not immediately after
   exclusion. Rust splits Go's single `RemovePeer` into reversible exclusion
-  (`remove_peer`) and permanent retirement (`retire_peer`): session setup
-  rejects retired peers (`engine.rs`) and no unretire API exists, so retiring
-  before the re-add leg would make the heal leg impossible. Every assertion
-  is preserved; only the order changes.
+  (`remove_peer`, which keeps retention) and permanent retirement
+  (`retire_peer`, which releases it): session setup rejects retired peers
+  and no unretire API exists, so retiring before the re-add leg would make
+  the heal leg impossible. Every assertion is preserved; only the order
+  changes.
 - SWIM suspect/dead/refutation is not covered, same as the Go original
   (memberlist suspicion is not wired into the runtime).
-- Timeouts: 60 s convergence / peer waits (Go parity for saturated parallel
-  boxes), 30 s retention-pin appearance, 5 s isolation hold.
+- Timeouts: 60 s convergence / session waits (Go parity for saturated
+  parallel boxes), 5 s isolation hold, 5 s post-restart watch.
+- Node ids are pinned with the restarted node sorting last, so both
+  survivors' pre-restart sessions sit in their tie-break-preferred
+  direction and the restart/re-mesh legs deterministically exercise
+  zombie replacement instead of flaking on random id order.
 
 ## Env knobs
 
 None beyond the standard harness knobs (`MURMUR_LIVE_RUNTIME`,
 `MURMUR_LIVE_FAILURES`, `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-`MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`).
+`MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`).
 
 ## Compile check (only gate; never run here)
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/churn-retirement/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/churn-retirement/Cargo.toml
 ```

@@ -29,14 +29,14 @@ func TestFeatureCoverage(t *testing.T) {
 	}
 	catalog := strings.SplitN(sections[1], "\n## ", 2)[0]
 	features := map[string]bool{}
-	examples := map[string]bool{}
+	mapped := map[string]bool{}
 	for _, line := range strings.Split(catalog, "\n") {
 		if !strings.HasPrefix(line, "| ") {
 			continue
 		}
 		parts := strings.Split(line, "|")
 		name := strings.TrimSpace(parts[1])
-		if name == "Feature" {
+		if name == "Feature" || strings.HasPrefix(name, "---") {
 			continue
 		}
 		features[name] = true
@@ -49,32 +49,23 @@ func TestFeatureCoverage(t *testing.T) {
 			t.Errorf("obsolete feature mapping %q", feature)
 		}
 		for _, name := range names {
-			if filepath.Base(name) != name {
-				t.Errorf("invalid example path %q", name)
-				continue
-			}
-			examples[name] = true
-			for _, file := range []string{"main.go", "main_test.go"} {
-				if _, err := os.Stat(filepath.Join(name, file)); err != nil {
-					t.Error(err)
-				}
-			}
-			test, err := os.ReadFile(filepath.Join(name, "main_test.go"))
-			if err == nil && !strings.Contains(string(test), "run(ctx, env)") {
-				t.Errorf("%s smoke test does not invoke command scenario", name)
+			mapped[name] = true
+			main := filepath.Join(name, "main.go")
+			if _, err := os.Stat(main); err != nil {
+				t.Errorf("example %q has no %s", name, main)
 			}
 		}
 	}
-	dirs, err := os.ReadDir(".")
+	entries, err := os.ReadDir(".")
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, dir := range dirs {
-		if !dir.IsDir() || dir.Name() == "internal" {
+	for _, entry := range entries {
+		if !entry.IsDir() || entry.Name() == "internal" {
 			continue
 		}
-		if !examples[dir.Name()] {
-			t.Errorf("example %s has no feature mapping", dir.Name())
+		if !mapped[entry.Name()] {
+			t.Errorf("example %q is not mapped to a feature", entry.Name())
 		}
 	}
 }

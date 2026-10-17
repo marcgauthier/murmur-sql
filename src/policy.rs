@@ -7,16 +7,16 @@ use std::collections::BTreeMap;
 pub(crate) struct State {pub version:Version,pub domain:[u8;16],pub branch:Version,pub scope:Version,pub baseline:Value,pub basis:Version,pub table:String,pub column:String,pub key:Vec<Value>,pub generation:Version,pub causal:Causal}
 pub(crate) fn state_key(state:&State)->Result<Vec<u8>> {Ok(format!("10/policy/state/{}/{}/{}/{}",state.table,state.column,id(&encode(&state.key)?),id(&encode(&(state.generation,state.domain,state.branch,state.scope))?)).into_bytes())}
 pub(crate) fn configure(schema:&mut Schema,config:Option<&net::Config>)->Result<()> {
-    if let Some(config)=config {for((table,column),policy)in &config.merge_policies {let t=schema.tables.iter_mut().find(|t|&t.name==table).ok_or_else(||Error::Invalid(format!("unknown policy table {table}")))?;let c=t.columns.iter_mut().find(|c|&c.name==column).ok_or_else(||Error::Invalid(format!("unknown policy column {column}")))?;if c.primary_key>0 {return Err(Error::Invalid("primary key merge policy".into()));}c.policy=match policy{Policy::Lww=>MergePolicy::Lww,Policy::Counter=>MergePolicy::Counter,Policy::Set=>MergePolicy::Set,Policy::Min=>MergePolicy::Min,Policy::Max=>MergePolicy::Max};}}
+    if let Some(config)=config {for((table,column),policy)in &config.merge_policies {let t=schema.tables.iter_mut().find(|t|&t.name==table).ok_or_else(||Error::Invalid(format!("unknown policy table {table}")))?;let application_key_column=t.application_key.as_ref().is_some_and(|key|key.columns.contains(column));let c=t.columns.iter_mut().find(|c|&c.name==column).ok_or_else(||Error::Invalid(format!("unknown policy column {column}")))?;if c.primary_key>0 || application_key_column {return Err(Error::Invalid("primary key merge policy".into()));}c.policy=match policy{Policy::Lww=>MergePolicy::Lww,Policy::Counter=>MergePolicy::Counter,Policy::Set=>MergePolicy::Set,Policy::Min=>MergePolicy::Min,Policy::Max=>MergePolicy::Max};}}
     Ok(())
 }
 impl Sql<'_> {
     fn operation(&self,table:&str,key:Vec<Value>,column:&str,operation:PolicyOperation)->Result<()> {
         let intents=self.intents.ok_or_else(||Error::Invalid("policy operations require a transaction".into()))?;
         let t=self.schema.tables.iter().find(|t|t.name==table).ok_or(Error::SchemaMismatch)?;let c=t.columns.iter().find(|c|c.name==column).ok_or(Error::SchemaMismatch)?;
-        let required=match &operation{PolicyOperation::Counter(_)=>MergePolicy::Counter,PolicyOperation::Add(_)|PolicyOperation::Remove(_)=>MergePolicy::Set,PolicyOperation::Min(_)=>MergePolicy::Min,PolicyOperation::Max(_)=>MergePolicy::Max};if c.policy!=required || key.len()!=schema::pk_columns(t).len() || key.iter().any(|k|matches!(k,Value::Null)) {return Err(Error::Invalid("operation does not match column policy or primary key".into()));}
+        let required=match &operation{PolicyOperation::Counter(_)=>MergePolicy::Counter,PolicyOperation::Add(_)|PolicyOperation::Remove(_)=>MergePolicy::Set,PolicyOperation::Min(_)=>MergePolicy::Min,PolicyOperation::Max(_)=>MergePolicy::Max};if c.policy!=required || key.len()!=crate::primary_key::application_columns(t).len() || key.iter().any(|k|matches!(k,Value::Null)) {return Err(Error::Invalid("operation does not match column policy or primary key".into()));}
         if intents.borrow().len()>=10000 {return Err(Error::Limit("policy operation count".into()));}
-        let predicate=schema::pk_columns(t).iter().map(|c|format!("{} IS ?",quote(&c.name))).collect::<Vec<_>>().join(" AND ");
+        let predicate=crate::primary_key::application_predicate(t);
         let before=self.connection.query_row(&format!("SELECT {} FROM {} WHERE {predicate}",quote(column),quote(table)),rusqlite::params_from_iter(&key),|r|Value::read(r.get_ref(0)?))?;
         let after=match &operation {
             PolicyOperation::Counter(delta)=>match &before {Value::Integer(n)=>Value::Integer(n.checked_add(*delta).ok_or_else(||Error::Limit("counter overflow".into()))?),_=>return Err(Error::Invalid("counter projection must be INTEGER".into()))},
@@ -33,6 +33,10 @@ impl Sql<'_> {
         let mut parameters=vec![after];parameters.extend(key.clone());
         let changed=self.connection.execute(&format!("UPDATE {} SET {}=? WHERE {predicate}",quote(table),quote(column)),rusqlite::params_from_iter(&parameters));
         self.access.store(2,std::sync::atomic::Ordering::Relaxed);if changed?!=1 {return Err(Error::Invalid("policy row missing".into()));}
+        let key = if t.application_key.is_some() {
+            let predicate=crate::primary_key::application_predicate(t);
+            vec![self.connection.query_row(&format!("SELECT {} FROM {} WHERE {predicate}",quote(crate::primary_key::COLUMN),quote(table)),rusqlite::params_from_iter(&key),|r|Value::read(r.get_ref(0)?))?]
+        } else {key};
         intents.borrow_mut().push(PolicyIntent{table:table.into(),column:column.into(),key,before,operation,id:rand::random()});Ok(())
     }
     pub fn counter_add(&self,table:&str,key:Vec<Value>,column:&str,delta:i64)->Result<()> {self.operation(table,key,column,PolicyOperation::Counter(delta))}

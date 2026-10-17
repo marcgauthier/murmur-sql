@@ -1,290 +1,111 @@
-//! Rust port of the Go `api-mtls` live scenario (test-side equivalent).
-//!
-//! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/api-mtls/`
-//! (`api_mtls_test.go`). Go requires mutual TLS on the HTTPS daemon API
-//! (client cert mandatory except `/healthz`, foreign/expired certs
-//! rejected, plaintext refused). The Rust product has no HTTPS API
-//! server, so this port proves the same TLS policy on the product's only
-//! TLS server — the QUIC replication endpoint, which verifies client
-//! certificates against the cluster CA at handshake (see the scenario
-//! README.md for the leg mapping).
+//! Production PostgreSQL-wire endpoints require a trusted client certificate.
+use murmur_client::{Client, TlsConfig, TlsMode};
+use murmur_live_harness::{toml_edit, Cluster, ClusterOptions};
 
-use std::net::{SocketAddr, TcpStream, UdpSocket};
-use std::path::Path;
-use std::sync::Arc;
-use std::time::Duration;
-
-use murmur_live_harness::certs::Ca;
-use murmur_live_harness::murmur_replication::{protocol, transport};
-use murmur_live_harness::{Cluster, ClusterOptions};
-use rustls::client::danger::{
-    HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
-};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
-
-/// Per-dial timeout (Go: 5 s HTTP client timeout; QUIC needs headroom).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Attacker-side TLS verifier: any CA-valid server identity is accepted
-/// (mirrors the product `NodeVerifier` minus its peer allowlist; the
-/// server name is ignored exactly like the product does).
-#[derive(Debug)]
-struct TestServerVerifier {
-    roots: rustls::RootCertStore,
-    provider: Arc<rustls::crypto::CryptoProvider>,
-}
-
-impl ServerCertVerifier for TestServerVerifier {
-    fn verify_server_cert(
-        &self,
-        cert: &CertificateDer<'_>,
-        intermediates: &[CertificateDer<'_>],
-        _name: &ServerName<'_>,
-        _ocsp: &[u8],
-        now: UnixTime,
-    ) -> Result<ServerCertVerified, rustls::Error> {
-        let parsed = rustls::server::ParsedCertificate::try_from(cert)?;
-        rustls::client::verify_server_cert_signed_by_trust_anchor(
-            &parsed,
-            &self.roots,
-            intermediates,
-            now,
-            self.provider.signature_verification_algorithms.all,
-        )?;
-        let _ = transport::node_id(cert.as_ref())
-            .map_err(|e| rustls::Error::General(e.to_string()))?;
-        Ok(ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &self.provider.signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.provider
-            .signature_verification_algorithms
-            .supported_schemes()
-    }
-}
-
-/// Client credentials for one attacker endpoint: the CA roots used to
-/// verify the server plus an optional client chain/key.
-struct AttackerCreds {
-    roots_der: Vec<u8>,
-    chain_der: Option<Vec<u8>>,
-    key_der: Option<Vec<u8>>,
-}
-
-/// Attacker QUIC endpoint with exactly the given credentials (TLS 1.3 +
-/// the replication ALPN match the product server).
-fn attacker_endpoint(creds: &AttackerCreds) -> quinn::Endpoint {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
-    let mut roots = rustls::RootCertStore::empty();
-    roots
-        .add(CertificateDer::from(creds.roots_der.clone()))
-        .expect("add CA root");
-    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .expect("TLS 1.3")
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(TestServerVerifier {
-            roots,
-            provider,
-        }));
-    let mut client = match (&creds.chain_der, &creds.key_der) {
-        (Some(chain), Some(key)) => builder
-            .with_client_auth_cert(
-                vec![CertificateDer::from(chain.clone())],
-                PrivateKeyDer::try_from(key.clone()).expect("parse client key"),
-            )
-            .expect("client auth cert"),
-        _ => builder.with_no_client_auth(),
-    };
-    client.alpn_protocols = vec![protocol::ALPN.to_vec()];
-    client.enable_early_data = false;
-    let mut endpoint =
-        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("attacker endpoint");
-    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(client).expect("quic client config"),
-    )));
-    endpoint
-}
-
-/// Attempt one QUIC handshake; true when it completes.
-async fn try_handshake(endpoint: &quinn::Endpoint, addr: SocketAddr) -> bool {
-    let connecting = match endpoint.connect(addr, "localhost") {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    match tokio::time::timeout(DIAL_TIMEOUT, connecting).await {
-        Ok(Ok(conn)) => {
-            // TLS 1.3 completes client-side when the server Finished
-            // arrives, before the server validates our certificate
-            // flight; a rejection therefore always lands as an async
-            // close, never as a synchronous handshake error. Await it:
-            // staying open means the handshake genuinely succeeded.
-            let rejected = tokio::time::timeout(Duration::from_secs(5), conn.closed())
-                .await
-                .is_ok();
-            conn.close(0u32.into(), b"probe done");
-            !rejected
-        }
-        _ => false,
-    }
-}
-
-/// Live session count (failed handshakes must never attach as sessions).
-fn peer_count(cluster: &Cluster, node: usize) -> usize {
-    cluster
-        .node(node)
-        .replication()
-        .expect("replication enabled")
-        .status()
-        .peers
-}
-
-#[test]
-fn tls_endpoint_requires_mutual_auth() {
-    let cluster = Cluster::new(ClusterOptions {
+#[tokio::test(flavor = "multi_thread")]
+async fn sql_mtls_rejects_missing_and_untrusted_certificates_and_keeps_valid_clients_working() {
+    let mut cluster = Cluster::new(ClusterOptions {
         name: "api-mtls".into(),
         num_nodes: 1,
         ..Default::default()
     })
-    .expect("cluster setup");
-    let info = cluster.node_info(0);
-    eprintln!("{} dir={} repl={}", info.label, info.dir.display(), info.repl_addr);
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let repl = cluster.node_info(0).repl_addr;
-        let tls_dir = cluster.node_info(0).dir.join("tls");
-        let read = |name: &str| {
-            std::fs::read(Path::new(&tls_dir).join(name))
-                .unwrap_or_else(|e| panic!("read tls/{name}: {e}"))
-        };
-        let (ca_der, node_der, key_der) =
-            (read("ca.der"), read("node.der"), read("node.key"));
-
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("attacker runtime");
-        rt.block_on(async {
-            // Trusted client certificate: the handshake completes and a
-            // stream opens (Go: trusted cert reads `/v1/status` -> 200).
-            let trusted = attacker_endpoint(&AttackerCreds {
-                roots_der: ca_der.clone(),
-                chain_der: Some(node_der.clone()),
-                key_der: Some(key_der.clone()),
-            });
-            let connecting = trusted
-                .connect(repl, "localhost")
-                .expect("trusted dial builds");
-            let conn = tokio::time::timeout(DIAL_TIMEOUT, connecting)
-                .await
-                .expect("trusted handshake completes")
-                .expect("trusted handshake ok");
-            tokio::time::timeout(Duration::from_secs(5), conn.open_bi())
-                .await
-                .expect("trusted stream opens")
-                .expect("trusted stream ok");
-            conn.close(0u32.into(), b"probe done");
-            eprintln!("trusted client certificate: handshake + stream ok");
-
-            // No client certificate: the server must close the connection
-            // (Go: 401 on `/v1/status` and `/metrics`). QUIC has no HTTP
-            // layer for a 401, and TLS 1.3 finishes client-side before
-            // the server validates the certificate flight, so the
-            // rejection is always observed as an async close — and
-            // there is no `/healthz`-style exemption to probe: every
-            // connection to this endpoint is authenticated.
-            let no_cert = attacker_endpoint(&AttackerCreds {
-                roots_der: ca_der.clone(),
-                chain_der: None,
-                key_der: None,
-            });
-            assert!(
-                !try_handshake(&no_cert, repl).await,
-                "handshake without a client certificate succeeded, want rejection"
-            );
-            eprintln!("no client certificate: handshake rejected");
-
-            // Foreign-CA client certificate: the handshake must fail
-            // (Go: untrusted cert rejected on `/v1/status`).
-            let rogue_ca = Ca::generate().expect("rogue CA");
-            let rogue = rogue_ca
-                .issue(&[0xau8; 16], None)
-                .expect("rogue node cert");
-            let foreign = attacker_endpoint(&AttackerCreds {
-                roots_der: ca_der.clone(),
-                chain_der: Some(rogue.cert_der.clone()),
-                key_der: Some(rogue.key_der.clone()),
-            });
-            assert!(
-                !try_handshake(&foreign, repl).await,
-                "handshake with a foreign-CA certificate succeeded, want rejection"
-            );
-            eprintln!("foreign-CA client certificate: handshake rejected");
-        });
-
-        // Failed handshakes attached no sessions.
-        assert_eq!(
-            peer_count(&cluster, 0),
-            0,
-            "rejected handshakes attached {} sessions",
-            peer_count(&cluster, 0)
-        );
-
-        // Plaintext: nothing listens on TCP at the replication port, and
-        // UDP garbage creates no session (Go: plaintext HTTP refused).
-        match TcpStream::connect_timeout(&repl, Duration::from_secs(5)) {
-            Ok(_) => panic!("plaintext TCP unexpectedly reached the TLS endpoint"),
-            Err(_) => eprintln!("plaintext TCP refused"),
-        }
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("garbage socket");
-        sock.connect(repl).expect("garbage connect");
-        for _ in 0..10 {
-            let _ = sock.send(&[0x55u8; 300]);
-            std::thread::sleep(Duration::from_millis(50));
-        }
-        std::thread::sleep(Duration::from_secs(1));
-        assert_eq!(
-            peer_count(&cluster, 0),
-            0,
-            "garbage UDP attached {} sessions",
-            peer_count(&cluster, 0)
-        );
-        eprintln!("PASS: mutual TLS enforced, plaintext refused, no phantom sessions");
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("api-mtls-no-convergence");
-    }
-    cluster.finish(failed);
+    .await
+    .unwrap();
+    cluster.node(0).simple("CREATE TABLE records(id INTEGER PRIMARY KEY,body TEXT); INSERT INTO records VALUES(1,'before-tls')").await.unwrap();
+    cluster.node(0).flush().await.unwrap();
+    cluster.stop_node(0);
+    let dir = cluster.node_info(0).dir.clone();
+    let cert = dir.join("cert.pem").to_string_lossy().to_string();
+    let key = dir.join("key.pem").to_string_lossy().to_string();
+    let ca = dir.join("ca.pem").to_string_lossy().to_string();
+    cluster
+        .edit_config(0, |doc| {
+            doc["server"]["production"] = toml_edit::value(true);
+            doc["server"]["tls"]["enabled"] = toml_edit::value(true);
+            doc["server"]["tls"]["cert_file"] = toml_edit::value(cert.clone());
+            doc["server"]["tls"]["key_file"] = toml_edit::value(key.clone());
+            doc["server"]["tls"]["ca_file"] = toml_edit::value(ca.clone());
+        })
+        .unwrap();
+    cluster.set_client_tls(
+        0,
+        TlsConfig {
+            mode: TlsMode::VerifyFull,
+            ca_file: ca,
+            cert_file: cert,
+            key_file: key,
+        },
+    );
+    cluster.start_node(0).await.unwrap();
+    let valid = cluster.config(0);
+    assert_eq!(
+        cluster
+            .node(0)
+            .simple("SELECT body FROM records")
+            .await
+            .unwrap(),
+        vec![vec!["before-tls".to_string()]]
+    );
+    let mut plaintext = valid.clone();
+    plaintext.tls = TlsConfig::default();
     assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
+        Client::connect(&plaintext).await.is_err(),
+        "production accepted plaintext SQL"
+    );
+    let mut missing = valid.clone();
+    missing.tls.cert_file.clear();
+    missing.tls.key_file.clear();
+    assert!(
+        Client::connect(&missing).await.is_err(),
+        "production accepted no client certificate"
+    );
+    let mut params = rcgen::CertificateParams::new(vec!["rogue-client".into()]).unwrap();
+    params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ClientAuth];
+    let rogue_key = rcgen::KeyPair::generate().unwrap();
+    let rogue = params.self_signed(&rogue_key).unwrap();
+    let rogue_cert = dir.join("untrusted-cert.pem");
+    let rogue_key_path = dir.join("untrusted-key.pem");
+    std::fs::write(&rogue_cert, rogue.pem()).unwrap();
+    std::fs::write(&rogue_key_path, rogue_key.serialize_pem()).unwrap();
+    let mut untrusted = valid.clone();
+    untrusted.tls.cert_file = rogue_cert.to_string_lossy().into();
+    untrusted.tls.key_file = rogue_key_path.to_string_lossy().into();
+    assert!(
+        Client::connect(&untrusted).await.is_err(),
+        "untrusted client certificate accepted"
+    );
+    let mut bad_password = valid.clone();
+    bad_password.password = "wrong-mtls-password".into();
+    let error = match Client::connect(&bad_password).await {
+        Err(e) => e,
+        Ok(_) => panic!("certificate bypassed password auth"),
+    };
+    assert_eq!(error.code(), Some("28P01"));
+    let mut bad_key = valid.clone();
+    bad_key.key = "wrong-mtls-unlock-key".into();
+    let error = match Client::connect(&bad_key).await {
+        Err(e) => e,
+        Ok(_) => panic!("certificate bypassed unlock"),
+    };
+    assert_eq!(error.code(), Some("28000"));
+    let fresh = Client::connect(&valid).await.unwrap();
+    fresh
+        .simple("INSERT INTO records VALUES(2,'after-rejections')")
+        .await
+        .unwrap();
+    fresh.flush().await.unwrap();
+    drop(fresh);
+    cluster.stop_node(0);
+    cluster.start_node(0).await.unwrap();
+    assert_eq!(
+        cluster
+            .node(0)
+            .simple("SELECT body FROM records ORDER BY id")
+            .await
+            .unwrap(),
+        vec![
+            vec!["before-tls".to_string()],
+            vec!["after-rejections".to_string()]
+        ]
     );
 }

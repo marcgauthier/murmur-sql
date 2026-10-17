@@ -1,0 +1,50 @@
+{
+  "Connect and unlock": [
+    "basic"
+  ],
+  "CRUD with parameters": [
+    "basic"
+  ],
+  "Replication flags": [
+    "tables"
+  ],
+  "Automatic replication keys": [
+    "tables"
+  ],
+  "Durability flush": [
+    "tables"
+  ],
+  "Verified TLS": [
+    "tls"
+  ],
+  "Remote backup and restore": [
+    "backup"
+  ],
+  "Engine metrics": [
+    "metrics"
+  ],
+  "Encrypted file transfer and cursors": [
+    "files"
+  ],
+  "Key rotation": [
+    "keys"
+  ],
+  "Managed FTS and vector indexes": [
+    "search"
+  ],
+  "JSON and JSONB": [
+    "json"
+  ],
+  "Replication peers": [
+    "replication"
+  ],
+  "Retention": [
+    "replication"
+  ],
+  "CRDT policy operations": [
+    "replication"
+  ],
+  "Bridge ownership release": [
+    "bridge"
+  ]
+}

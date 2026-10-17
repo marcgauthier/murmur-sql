@@ -1,216 +1,331 @@
 # Murmur Go client
 
-An embedded cgo binding to Murmur's Rust implementation. Each managed database
-uses one in-memory SQLite database, with persistence, search maintenance, and
-replication in Rust background workers. No separate server or Go SQLite driver
-is required. The native library enables both `replication` and `vector`.
-
-Go 1.24+, a Rust toolchain supporting edition 2024, a C compiler, and libclang
-are required. Linux needs a GNU toolchain and libclang development packages;
-macOS needs Xcode command-line tools and libclang; Windows uses Rust's GNU target,
-MinGW-w64 GCC, and LLVM/libclang (`LIBCLANG_PATH` if needed). Build on the target
-OS/architecture; these scripts do not provision cross-compilers.
-
-From the repository root:
-
-```sh
-./clients/go/build.sh test -count=1 -timeout 180s ./...
-./clients/go/build.sh --release build ./...
-```
-
-Windows PowerShell:
-
-```powershell
-$env:CC = 'gcc'
-$env:LIBCLANG_PATH = 'C:\Program Files\LLVM\bin'
-./clients/go/build.ps1 test -count=1 -timeout 180s ./...
-./clients/go/build.ps1 -Release build ./...
-```
-
-Native targets: Linux amd64/arm64, macOS amd64/arm64, Windows amd64 (GNU).
-CI builds and tests each target. Native binaries are built locally into ignored
-`native/lib/<goos>-<goarch>` directories. Build scripts also generate an ignored
-library fingerprint so Go's build cache notices native changes. Rebuild after
-changing Rust code. `CGO_ENABLED=0` is unsupported. There are no external Go modules.
-
-Use `./clients/go/build.sh --release` (PowerShell: `./clients/go/build.ps1 -Release`)
-before linking an application for realistic startup and throughput measurements.
-The default build is debug. Running `go build` in a consuming application only
-links the installed native archive; it does not rebuild Rust sources, even with
-a local Go module replacement.
-
-For another application, use a local module replacement until distributing a
-native build with your application:
+A `database/sql` client for Murmur servers, speaking the PostgreSQL wire
+protocol through the pgx driver. SQL is the SQLite dialect; parameters use
+`$N`. No cgo, no native builds — pure Go plus the `pgx` module.
 
 ```go
-require github.com/marcgauthier/murmur/clients/go v0.0.0
-replace github.com/marcgauthier/murmur/clients/go => ../MURMUR/clients/go
+import (
+    "context"
+
+    murmur "github.com/marcgauthier/murmur/clients/go"
+)
+
+db, err := murmur.Open(ctx, murmur.Config{
+    Host:     "127.0.0.1",
+    Port:     5432,
+    User:     "app",
+    Password: "secret",
+    Key:      "encryption-key-or-passphrase",
+})
+if err != nil {
+    log.Fatal(err)
+}
+defer db.Close()
+
+var greeting string
+err = db.QueryRowContext(ctx,
+    "SELECT text FROM greetings WHERE lang = $1", "en").Scan(&greeting)
 ```
 
-Browse the [19 runnable feature examples](examples/README.md). Each creates local
-resources automatically and verifies its result. Start with:
+## Connection
 
-```sh
-./clients/go/build.sh run ./examples/basic
-./clients/go/build.sh run ./examples/replication
-./clients/go/build.sh run ./examples/bridge
-```
+`Config` takes the server address, an `auth.users` login from the server's
+`config.toml`, and the database encryption key (64 hex chars or a
+passphrase, hashed like `murmur-admin`). Every pooled connection unlocks
+itself with the key before first use; a wrong key fails `Open` with code
+`28000`. The `Database` name is accepted and ignored by the server.
 
-Start with `DefaultOptions()`, set `Mode = CreateNew` for a new directory, and
-call `Open(path, secret32ByteKey, options)`. A zero `Options{}` is not a defaults
-constructor. `Existing` reopens persisted state; `Flush` is the explicit durability
-barrier. A successful application transaction alone does not guarantee persistence.
-
-Spool's index includes fixed namespace hints for prefix searches: 32 KiB with
-the default 256 shards. These contain no record values, are rebuilt on open,
-and can cause extra searches when hashes collide or namespaces have been deleted.
-Setting `SpoolCacheBytes` to zero disables the decoded-block cache; these fixed
-index hints remain. See the [root usage guide](../../USAGE.md) for memory options.
-
-## SQL and transactions
+TLS mirrors Postgres `sslmode`:
 
 ```go
-err := db.Transaction(func(sql *murmur.Sql) error {
-    _, err := sql.Exec("INSERT INTO docs(id,title) VALUES(?,?)", 2, "Second document")
-    return err // an error or recovered panic rolls back
-})
-err = db.Read(func(sql *murmur.Sql) error {
-    rows, err := sql.Query("SELECT id,title FROM docs ORDER BY id")
-    if err != nil { return err }
-    defer rows.Close()
-    for rows.Next() {
-        var id int64
-        var title string
-        if err := rows.Scan(&id, &title); err != nil { return err }
-    }
-    return rows.Err()
-})
+murmur.Config{
+    // ...
+    TLS: murmur.TLSConfig{
+        Mode:     murmur.TLSVerifyFull,
+        CAFile:   "/etc/murmur/ca.crt",
+        CertFile: "/etc/murmur/client.crt", // mutual TLS
+        KeyFile:  "/etc/murmur/client.key",
+    },
+}
 ```
 
-`Exec`, `ExecuteBatch`, `Prepare`, `Query`, `QueryRow`, `LastInsertRowID`, statement
-execution, and streamed rows run in their native scope. `db.Exec` wraps a transaction;
-`db.Query` returns owned materialized rows. Use `Read` for streaming large results.
-SQL supports positional bindings: nil, booleans, signed integers, uint values that
-fit int64, float32/64, strings, bytes, and tagged `Value`. SQL's binary boundary
-preserves int64, floating-point bits, embedded NULs, empty blobs, and NULL.
-Use `Value` or `any` to scan nullable columns. Errors support `errors.Is` and
-`errors.As(*murmur.Error)`; SQLite extended codes are available on `Error`.
+`TLSDisable` sends passwords in cleartext. Production servers require TLS
+with a client certificate and reject anything else.
 
-SQL scopes, statements, and row iterators belong to the callback's locked OS thread.
-Do not retain them after return, share them with another goroutine, or call database
-methods from inside that callback. Such native SQL access is rejected. Call methods
-on the provided `Sql` instead. Owned row values can be retained. SQL statements and
-iterators are not safe for concurrent use. `DB` operations serialize in Rust.
+## SQL
 
-Migrate schemas with `Migrate(NewMigration(sql))`; `TableMapping` preserves stable
-table/column identities through renames. Managed SQL has the same restrictions as
-Rust, including primary keys, transaction control, and reserved objects. See the
-[root usage guide](../../USAGE.md#sql-and-schema-restrictions).
+Use the embedded `*sql.DB` for everything: `ExecContext`, `QueryContext`,
+`QueryRowContext`, prepared statements. DDL runs through server-side
+migrations; DML autocommits per statement. Explicit `BEGIN`/`COMMIT` is
+accepted and each statement stays individually atomic.
+
+`$N` parameters are inferred from context (`INSERT` columns, `WHERE`
+comparisons, `IN`, `BETWEEN`) so drivers encode values correctly.
+
+`murmur.CodeOf(err)` extracts the SQLSTATE code (`28000`, `42P01`,
+`23505`, `42601`, ...); `murmur.IsLocked(err)` spots statements sent
+before unlock on a raw connection.
+
+## Administration
+
+```go
+if err := db.Flush(ctx); err != nil { /* ... */ } // durability barrier
+if err := db.SetTableReplicated(ctx, "scratch", false); err != nil { /* ... */ }
+flags, err := db.TableReplication(ctx) // []TableFlag
+metrics, err := db.Metrics(ctx)        // []Metric{Subsystem, Metric, Value}
+sqliteMetrics, err := db.Metrics(ctx, "sqlite")
+```
+
+Remote backup moves single-file archives through the server's backup folder:
+
+```go
+saved, err := db.BackupSave(ctx) // BackupFile{Name, Size}
+files, err := db.BackupList(ctx) // []BackupFile
+err = db.BackupDownload(ctx, saved.Name, &buf)
+err = db.BackupUpload(ctx, "copy.murmur-backup", &buf)
+err = db.Restore(ctx, saved.Name, key) // live restore, key re-authenticates
+```
+
+Key rotation rewraps the registry under a new master key; open a fresh
+handle with the new key afterwards (run `go run ./examples/keys` for a
+checked rotation, old-key rejection, and data-preservation example):
+
+```go
+if err := db.RotateKey(ctx, oldKey, newKey); err != nil { /* ... */ }
+db.Close()
+db, err = murmur.Open(ctx, murmur.Config{ /* ... Key: newKey */ })
+```
+
+Tables are local-only by default and must declare an application primary key.
+Enabling replication rebuilds even a populated table: the application key becomes
+a unique index, and `id_murmur_primary_key TEXT NOT NULL PRIMARY KEY` contains an
+automatically generated UUIDv5 derived from the table name and application key.
+Read it with `SELECT` or `RETURNING`; applications cannot assign or update it.
+Supply every application-key component on replicated inserts; application keys
+remain immutable while replicated. Text keys, including UUID strings, and
+composite keys are supported. Disabling replication removes the managed column
+and restores the application primary key. Other server SQL restrictions still apply.
+Mode changes pause table access while rebuilding; existing queries should name
+columns explicitly because `SELECT *` changes shape.
+
+```go
+_, err = db.ExecContext(ctx,
+    "CREATE TABLE orders(id TEXT NOT NULL PRIMARY KEY, value TEXT)")
+err = db.SetTableReplicated(ctx, "orders", true)
+var replicationID string
+err = db.QueryRowContext(ctx,
+    "INSERT INTO orders(id, value) VALUES($1, $2) RETURNING id_murmur_primary_key",
+    "order-123", "ready").Scan(&replicationID)
+```
+
+Flags persist into the server's `config.toml`. Run `go run ./examples/tables`
+for a complete example with result checks, including populated conversions.
+
+## JSON
+
+Use SQLite JSON functions in ordinary SQL, with no column setting or extension.
+Store JSON as `TEXT`, bind JSON strings, and validate them in your application
+with `json.Valid` from `encoding/json` before writing. `json_extract`, `->>`, `json_set`,
+`json_each` and SQLite JSONB (`BLOB`) are available. `CHECK` constraints,
+generated columns and JSON expression indexes are currently rejected by managed
+migrations. Replication resolves conflicts on the whole JSON column value.
+
+Run `go run ./examples/json` for checked queries, updates, arrays, bound JSON,
+validation and JSONB conversion. See [JSON usage](../../docs/USAGE.md#json).
+
+## Full-text search
+
+```go
+err := db.SetColumnFTS(ctx, "documents", "body", true)
+err = db.RefreshIndexes(ctx)
+columns, err := db.ColumnFTS(ctx) // discover the quoted index identifier for MATCH
+_ = columns
+```
+
+Source columns must be declared `TEXT` and the table must have one `INTEGER`
+application primary key, including when replication uses a managed UUID physical
+key. All enabled columns in a table share a `unicode61` FTS5 index. Use ordinary
+SQL `MATCH $1` with a bound string; quote the discovered index name as an
+identifier, rather than a value parameter. `ColumnFTS` returns nullable pointers
+for disabled index/status fields.
+
+Declarations persist as schema metadata and follow existing schema replication
+rules. Index data is rebuilt locally, with eventual updates after source writes.
+`RefreshIndexes` waits for local collected writes, not peers or durable storage;
+use `Flush` for persistence. Default builds include FTS5. See the
+[complete restrictions](../../docs/USAGE.md#full-text-search) and run
+`go run ./examples/search` for a scratch-server example with result checks.
+
+## Vector search
+
+Vector search is included in ordinary server builds. Declare an index on a
+`BLOB` column of a table with one `INTEGER` application primary key:
+
+```go
+err := db.SetColumnVector(ctx, "documents", "embedding", &murmur.VectorOptions{
+    Dimensions: 384, Distance: murmur.VectorCosine,
+})
+err = db.RefreshIndexes(ctx)
+columns, err := db.ColumnVectors(ctx) // discover the index identifier and status
+_ = columns
+err = db.SetColumnVector(ctx, "documents", "embedding", nil) // disable
+```
+
+An empty distance selects L2; L1 and cosine are also supported. Store embeddings
+as little-endian finite float32 bytes using `encoding/binary` and `math.Float32bits`.
+Applications supply embeddings; the server does not generate them. Dimensions
+must be 1–8192, and source column names must be ASCII SQL identifiers starting
+with a letter. Nullable embeddings are excluded from search.
+
+Query the returned, quoted index name with `embedding MATCH $1 AND k=$2`;
+bind a JSON vector string and an integer neighbor count. KNN queries accept only
+`ORDER BY distance`; equal-distance ordering is unspecified. Explicitly typed
+BYTEA query parameters are also accepted by the server. Declarations persist and
+replicate like FTS, while indexes rebuild locally. Invalid populated settings
+roll back; malformed vectors written later leave source data intact but make the
+index unavailable until repaired and refreshed. Use `Flush` for durable storage.
+
+Run `go run ./examples/vectors` for checked neighbors, distances, and disabling.
+See [all restrictions](../../docs/USAGE.md#vector-search).
+
+## Encrypted files
+
+File contents live in encrypted disk objects; durable metadata lives in Spool.
+The server requires the `replication` Cargo feature, enabled replication with
+node credentials, and `[replication.files]`. No peers are required for local use.
+
+```go
+info, err := db.UploadFile(ctx, "reports/a.bin", reader)
+err = db.DownloadFile(ctx, info.Name, writer)
+cursor, err := db.SearchFiles(ctx, "reports/%.bin") // or db.ListFiles(ctx)
+if err != nil { /* handle error */ }
+defer cursor.Close()
+for cursor.Next(ctx) {
+    file := cursor.File() // Name, Size, ModifiedMillis, SHA256, Local
+    _ = file
+}
+err = cursor.Err()
+```
+
+Uploads replace existing names atomically at completion. Downloads pin the
+selected version and authenticate it before streaming. Search uses case-sensitive
+LIKE (`%`, `_`, backslash escaping). Metadata cursors are snapshots and pin a
+pooled connection until exhausted or closed; serialize calls on each cursor.
+Transfers use 64 KiB BYTEA chunks. SQL ROLLBACK does not undo file operations.
+Remote-only content returns `CodeOf(err) == "55000"`; retry after peer fetching.
+Handles expire after five idle minutes and do not survive reconnect or restore.
+The default staging limit is 1 GiB including encrypted overhead, shared with
+peer fetches; increase it to upload larger files. Back up the object directory
+and file keys separately from the database. See [USAGE](../../docs/USAGE.md#files-over-postgresql-sql)
+for SQL commands, limits, and error codes, or run `go run ./examples/files` for
+a complete scratch-node example with result checks.
+
+## Replication
+
+Peer management, retention inspection, and CRDT policy operations need a
+server built with the `replication` Cargo feature and enabled `[replication]`
+credentials; without them the server fails with code `55000`.
+
+```go
+status, err := db.ShowReplication(ctx) // ReplicationStatus{Running, Address, ...}
+peers, err := db.ShowPeers(ctx)        // []PeerInfo ordered by node id
+err = db.PeerAdd(ctx, "203.0.113.11:9001")
+err = db.PeerSync(ctx)
+err = db.PeerRemove(ctx, nodeID) // reversible with PeerAdd
+err = db.PeerRetire(ctx, nodeID) // permanent, releases retention
+entries, err := db.ShowRetention(ctx)  // []RetentionEntry
+collected, err := db.RetentionCollect(ctx)
+```
+
+`PeerAdd` succeeds once the dial is queued; dial failures surface in
+`ShowReplication` (`LastError`). Node ids are 32 hex characters and are
+validated locally, as are peer addresses. `ShowPeers` is empty when
+peerless; nullable columns (`Address`, `LastSeenMillisAgo`, `LastError`,
+`Origin`, `Acknowledged`) are nil pointers when the server reports NULL.
+
+Policy operations apply one CRDT op to a single-TEXT-key row whose column
+carries the matching `replication.merge_policies` entry:
+
+```go
+err = db.PolicyCounterAdd(ctx, "stats", "count", "row-1", 5)
+err = db.PolicySetAdd(ctx, "stats", "tags", "row-1", "blue")
+err = db.PolicySetRemove(ctx, "stats", "tags", "row-1", "blue")
+err = db.PolicyMax(ctx, "stats", "highest", "row-1", 42)
+err = db.PolicyMin(ctx, "stats", "lowest", "row-1", -1.5)
+```
+
+`PolicyMin`/`PolicyMax` take an int, a finite float, or a string; other
+types fail locally. A column without the matching policy fails with `22023`,
+a missing row with `02000`. See
+[USAGE](../../docs/USAGE.md#murmur-policy-counter_add-set_add-set_remove-min-max)
+for merge semantics, and run `go run ./examples/replication` for a checked
+two-node example.
+
+On a `[replication.bridge]` high-receiver, local writes shield the touched
+cells from later Low updates; `BridgeRelease` drops that shield for one
+single-TEXT-key row so Low data flows through again:
+
+```go
+released, err := db.BridgeRelease(ctx, "notes", "row-1", "title") // field
+released, err = db.BridgeRelease(ctx, "notes", "row-1")          // whole row
+```
+
+The optional column is at most one name. `true` means the release applied;
+`false` means the engine was busy, retry. A Low exporter, an unknown table,
+or a field that is not High-owned fails with `22023`; without enabled
+replication or a configured bridge the server fails with `55000`. Run
+`go run ./examples/bridge` for a checked single-node example.
 
 ## Features
 
-| Feature | Go entry points | Runnable examples |
-|---|---|---|
-| Lifecycle, recovery, durability | `Open`, `Clone`, `Close`, `Release`, `Flush`, `RetryStorage`, `OpenProgress`, `Options.OnOpenProgress`, `Options.FaultHooks` | [basic](examples/basic/main.go), [recovery](examples/recovery/main.go) |
-| Migrations and offline exchange | `Migrate`, `Schema`, `ExportState`, `MergeState`; share database ID and compatible schema, use distinct node IDs | [migrations](examples/migrations/main.go), [offline](examples/offline/main.go) |
-| FTS5 and vector indexes | `FTS5Index`, `VectorIndex`, `SetSearchIndexes`, `RefreshIndexes`; source tables replicate, derived virtual tables rebuild locally | [search](examples/search/main.go), [replication](examples/replication/main.go) |
-| Table replication | `SetReplication("docs", false)`, `ReplicationEnabled`; node-local settings survive reopen and migrations | [migrations](examples/migrations/main.go), [replication](examples/replication/main.go) |
-| Subscriptions | `SubscribeRows`, generic `Subscribe[T]`, `RowCodec[T]`, `RecvContext`, `RecvTimeout`, `TryRecv`, `Close` | [subscriptions](examples/subscriptions/main.go) |
-| Counters, sets, min/max | `sql.CounterAdd`, `SetAdd`, `SetRemove`, `Min`, `Max`; causal policies require replication configuration | [policies](examples/policies/main.go), [retention](examples/retention/main.go) |
-| Network replication | `NewReplicationConfig`, `Credentials`, trust/allow lists, `Options.Replication`, `DB.Replication`; returned `Replication` exposes peer management, status, sync and retention | [replication](examples/replication/main.go) |
-| Continuous replication and bounded batches | `BatchTransactions`, `BatchBytes`, opt-in `AdaptiveSync`; byte/count limits bound each batch, not transactions per second | [replication](examples/replication/main.go) |
-| Streamed snapshot installation | `BuildSnapshotStream`, `FinishSnapshot`; verified pages become visible incrementally, final progress waits for completion | [snapshots](examples/snapshots/main.go) |
-| Replication retention | `RetentionStatus`, `CollectRetention`, `RetirePeer`, minimum age/count and offline protection | [retention](examples/retention/main.go), [snapshots](examples/snapshots/main.go) |
-| Files | `NewFileConfig`, `UploadFile`, `GetFile`, `ListFiles`, `SearchFiles`, metadata/availability/deletion/key rotation; `Objects` exposes standalone lifecycle and chunk operations | [files](examples/files/main.go), [bridge](examples/bridge/main.go) |
-| Backup and key management | `Backup`, `VerifyBackup`, `Restore` with `RestoreOptions`, `RotateDataKey`, `RotateMasterKey`, `KeyInventory` | [backup](examples/backup/main.go), [keys](examples/keys/main.go) |
-| Scheduling and metrics | `Scheduler`, `NewWriterScheduler`, `Admit`, `AdmitTimeout`, `Ticket.Release`, scheduler snapshots, `Status`, `SQLiteMetrics`, `SpoolMetrics` | [scheduler](examples/scheduler/main.go) |
-| Batched backend reads | Optional `BatchBackend`, `BackendHandle.GetMany`, `GetManyBounded`; ordered bounded prefixes | [backend](examples/backend/main.go) |
-| Blocking scheduler utility | `RunBlocking` invokes Rust; ordinary Go calls run inline | [backend](examples/backend/main.go) |
-| Standalone backend | Implement `Backend`, `RegisterBackend`, `BindSigner`, `BackendHandle.Progress`, `GetMany`, `GetManyBounded`, optional `BatchBackend`, `RunBlocking`, `StartReplication`; record-only teaching implementation | [backend](examples/backend/main.go), [files](examples/files/main.go) |
-| High/Low bridge | `ExporterConfig`, `ReceiverConfig`, `OpenBridge`, `Capture`, `Export`, `Stage`, `Process`, `ReleaseOwnership`, `PublishHTTP`, `PublishFTP` | [bridge](examples/bridge/main.go), [bridge-transports](examples/bridge-transports/main.go) |
-| Snapshot protocol | `BuildSnapshot`, manifest `Verify`, `AcceptSnapshot`, `ReceiveSnapshot`, `MissingSnapshot`, `FinishSnapshot`, outgoing/cancel/maintenance/prune helpers | [snapshots](examples/snapshots/main.go), [retention](examples/retention/main.go) |
-| Transport, crypto and wire format | `NewEndpoint`, `Connect`/`Accept`, bidirectional streams, `ReadMessage`/`WriteMessage`, `Encode`/`Decode`, signing/verification, `StorageKey`, `Constants` | [protocol](examples/protocol/main.go), [bridge-transports](examples/bridge-transports/main.go) |
-| Unmanaged SQLite sessions | `OpenInMemory`, `RawConnection.Run`, `StartSession`, `Attach`, `Changeset`, `Patchset`, `SetEnabled`, `IsEmpty`; no managed persistence/replication | [sessions](examples/sessions/main.go) |
+| Feature            | Examples                  |
+|--------------------|---------------------------|
+| Connect and unlock | basic                     |
+| CRUD with parameters | basic, concurrency      |
+| DDL migrations     | migrations                |
+| Automatic replication keys | tables            |
+| Replication flags  | tables                    |
+| Durability flush   | tables                    |
+| Verified TLS       | tls                       |
+| Concurrent use     | concurrency               |
+| Remote backup and restore | backup             |
+| Backup file transfer | backup                  |
+| Key rotation       | keys                      |
+| Engine metrics     | metrics                   |
+| Column full-text search | search                |
+| Column vector search | vectors                    |
+| SQLite JSON queries | json                       |
+| Encrypted file transfer and cursors | files         |
+| Replication peer management | replication          |
+| Replication retention | replication              |
+| CRDT policy operations | replication             |
+| Bridge ownership release | bridge               |
 
-Detailed operational examples and restrictions remain in [USAGE.md](../../USAGE.md).
-The [example catalog](examples/README.md) provides executable programs with
-expected results and restrictions for every feature group. Their smoke tests
-exercise the same scenario functions as the commands.
-[API-COVERAGE.md](API-COVERAGE.md) explains the public API mapping and audit.
+The client covers the server SQL/MURMUR interface. Server configuration, node
+credentials, bridge transport, recovery tooling and scheduling stay on the
+server. Embedded callbacks, subscriptions and custom transport traits are not
+exposed by the PostgreSQL protocol.
 
-Subscribe to an owned row projection:
+Backup downloads return `io.ErrShortWrite` if the destination accepts fewer
+bytes than supplied without reporting an error; other writer errors propagate.
 
-```go
-sub, err := db.SubscribeRows("SELECT id,title FROM docs", nil, []int{0}, murmur.DefaultSubscriptionOptions())
-if err != nil { return err }
-defer sub.Close()
-event, err := sub.RecvContext(ctx) // Initial, Update, or Reset
-```
+Browse the [runnable examples](examples/README.md). Each creates its scratch
+server automatically and verifies its result.
 
-Subscriptions have bounded queues. Overflow, schema changes, or shutdown can
-issue `Reset`; recreate the subscription to obtain fresh rows. An incompatible
-resume cursor returns `ErrInvalid`. Valid resume cursors provide the current
-snapshot, not historical replay. SQL subscriptions use binary value encoding.
-For custom Go rows, provide stable unique keys and a `RowCodec[T]`; `JSONRowCodec[T]`
-is convenient for JSON-compatible types. Callback failures/panics become errors;
-background subscription errors follow Rust's subscription behavior.
+## Development
 
-Close every owned native handle explicitly. `DB.Close` closes its shared core,
-including clones; `DB.Release` drops only that handle. Closing a borrowed scheduler
-with `Close` stops the shared scheduler; use `Release` to drop its handle.
-Replication handles and endpoints have explicit close semantics. Stream `Close`
-cancels pending frame reads/writes. Blocking network operations otherwise use Rust's
-timeouts; they do not accept Go contexts. Subscription context cancellation is
-polled at up to 100 ms intervals. Go garbage collection does not release native
-handles. Callbacks can arrive on Rust threads; backend and fault-hook implementations
-must be concurrency safe. Keep callbacks short and avoid reentering blocking native
-operations on the same resource.
+Go 1.24+ and a Rust toolchain (edition 2024) with a C linker are required;
+tests and examples build `murmur-server` with `--features replication` via cargo on first use. Set
+`MURMUR_SERVER_BIN` to reuse a prebuilt server binary instead; it must include
+the `replication` feature for file tests/examples.
 
-Windows skips directory fsync where the underlying Rust store does; file contents
-are synchronized, but crash durability of directory entries depends on Windows.
-Keys cross an owned native control buffer and are zeroized where Rust already
-zeroizes them; Go keys/control JSON cannot promise secure memory erasure.
-
-## Validation
+From this directory:
 
 ```sh
-cd clients/go
-./build.sh test -count=1 -timeout 180s ./...
-go test -race -count=1 -timeout 180s ./...
-GOEXPERIMENT=cgocheck2 go test -count=1 -timeout 180s ./...
 go vet ./...
-cargo test --locked --manifest-path native/Cargo.toml
-mkdir -p build
-cargo run --locked --quiet --manifest-path native/Cargo.toml --example api_inventory > build/current-api.json
-go run ./internal/apiaudit -inventory build/current-api.json
+go test -count=1 -timeout 300s ./...
+go test -race -count=1 -timeout 300s ./...
 ```
 
-The build script builds a direct Rust peer fixture for `go test`; the mixed Rust/Go
-test exchanges persisted source rows and checks a Go FTS index. Running tests without
-a fixture skips that test with an explicit reason. Set `MURMUR_RUST_FIXTURE` to the
-fixture binary to choose its path. Native ABI tests cover malformed requests,
-invalid scopes, unwind containment, defaults, and integer codec fidelity.
-
-Database capture now defaults to one second. Incoming application drains continuously;
-`IncomingInterval` is a recovery retry interval capped at one second, not a throughput ceiling.
-`BatchTransactions` defaults to 64, `BatchBytes` to 4 MiB, and `AdaptiveSync` to false.
-A larger transaction is admitted alone. `ApplyBatches`, `ApplyBytes`, and `ApplyNanos`
-report completed incoming work. Optional `PagedBackend.KeysPage` avoids materializing
-large prefixes; existing custom backends receive a sorted fallback over `Keys`.
-`BuildSnapshotStream` persists encoded `Content` pages through Rust; its Go input slice
-is materialized. Managed database exports instead stream from an immutable Spool checkpoint.
-Protocol version 10 and database format 5 require new databases and upgraded peers;
-older formats are rejected, and no migration is provided.
-
-Custom backends may implement optional `CancellableBackend.CancelPending` to interrupt
-pending owner/admission waits during `Replication.Close`; active durable commits must
-finish. Backends that leave synchronous calls blocked cannot guarantee bounded shutdown.
-
-Batched backend reads preserve input order and missing values (`nil` in `[]*Bytes`);
-a pointer to empty bytes represents an existing empty value. `BatchBackend.GetMany`
-receives a nullable byte budget: nil requests every key, otherwise return a bounded
-prefix with one oversized first value allowed. Custom backends without this optional
-interface fall back to `Get` inside one native callback. These are not atomic read
-snapshots. The backend example implements batching under one storage lock and
-checks missing/empty results. `RunBlocking` delegates to Rust's scheduler utility;
-ordinary Go callers execute inline rather than launching a goroutine.
+`CGO_ENABLED=0` works; nothing here needs cgo.

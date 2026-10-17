@@ -291,6 +291,177 @@ fn tomb_proof_blocks_and_converges() {
 }
 
 #[test]
+fn compaction_uses_live_bytes_not_tomb_count() {
+    // A sealed file whose live content is tiny by bytes but heavy by
+    // tombstone count must still compact: tombstones cost ~100 bytes
+    // to rewrite and must not veto reclamation. Under a count ratio a
+    // few hundred stranded markers pin a 99%+ garbage file forever
+    // (resource-exhaustion gridlock: reclaim a permanent no-op).
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let st = open(&compact_options(dir)).unwrap();
+    // Generation 0: small values, deleted while file 1 is active so
+    // their tombstones strand inside the sealed file.
+    for i in 0..20 {
+        st.put(
+            format!("g{i:02}").as_bytes(),
+            &incompressible(100, i as u64),
+        )
+        .unwrap();
+    }
+    st.flush().unwrap();
+    for i in 0..20 {
+        st.delete(format!("g{i:02}").as_bytes()).unwrap();
+    }
+    st.flush().unwrap();
+    // Live stragglers pin file 1 off the deletion path.
+    for i in 0..3 {
+        st.put(
+            format!("s{i}").as_bytes(),
+            &incompressible(100, 1000 + i as u64),
+        )
+        .unwrap();
+    }
+    st.flush().unwrap();
+    // Bulk sealers, then deleted so dead bytes dominate file 1.
+    for i in 0..8 {
+        st.put(
+            format!("b{i}").as_bytes(),
+            &incompressible(2000, 2000 + i as u64),
+        )
+        .unwrap();
+    }
+    st.flush().unwrap();
+    for i in 0..8 {
+        st.delete(format!("b{i}").as_bytes()).unwrap();
+    }
+    st.flush().unwrap();
+    // Precondition: a sealed file heavy on tombstones with tiny live
+    // content (count ratio far over the threshold, byte ratio tiny).
+    // Tomb proofs stay parked (default 1024 markers) to isolate the
+    // compaction gate.
+    let files = st.file_stats();
+    assert!(
+        files.iter().any(|f| {
+            f.state == spool::SegmentState::Sealed
+                && f.live_tombs >= 15
+                && (1..=10).contains(&f.live_records)
+        }),
+        "setup did not strand tombs in a sealed file: {files:?}"
+    );
+    assert!(segment_count(dir) >= 2);
+    for _ in 0..20 {
+        st.reclaim().unwrap();
+    }
+    assert!(
+        st.stats().compactions > 0,
+        "tomb-heavy file never compacted; stats: {:?}",
+        st.stats()
+    );
+    st.close().unwrap();
+    let got = load_all(dir);
+    assert_eq!(got.len(), 3);
+    for i in 0..3 {
+        assert!(got.contains_key(format!("s{i}").as_bytes()), "s{i} lost");
+    }
+}
+
+#[test]
+fn tomb_cascade_drains_across_reclaims() {
+    // Cross-file delete chain (resource-exhaustion shape): a sealed
+    // tomb file whose values live in an older straggler file cannot
+    // drain until the older file compacts away, so the segment count
+    // drops only across successive reclaims. With the count-ratio gate
+    // the straggler file is never eligible and the count never drops.
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    let mut o = compact_options(dir);
+    o.tomb_proof_threshold = 4; // proofs run at test scale
+    let st = open(&o).unwrap();
+    // File 1: live stragglers plus a deleted generation whose
+    // tombstones strand in file 1.
+    for i in 0..3 {
+        st.put(
+            format!("s{i}").as_bytes(),
+            &incompressible(100, i as u64),
+        )
+        .unwrap();
+    }
+    for i in 0..20 {
+        st.put(
+            format!("a{i:02}").as_bytes(),
+            &incompressible(100, 100 + i as u64),
+        )
+        .unwrap();
+    }
+    st.flush().unwrap();
+    for i in 0..20 {
+        st.delete(format!("a{i:02}").as_bytes()).unwrap();
+    }
+    st.flush().unwrap();
+    // Bulk sealers for file 1, then deleted (tombs land in file 2).
+    for i in 0..8 {
+        st.put(
+            format!("b1-{i}").as_bytes(),
+            &incompressible(2000, 200 + i as u64),
+        )
+        .unwrap();
+    }
+    st.flush().unwrap();
+    for i in 0..8 {
+        st.delete(format!("b1-{i}").as_bytes()).unwrap();
+    }
+    st.flush().unwrap();
+    // Bulk sealers for file 2, then deleted (tombs land in the active file).
+    for i in 0..8 {
+        st.put(
+            format!("b2-{i}").as_bytes(),
+            &incompressible(2000, 300 + i as u64),
+        )
+        .unwrap();
+    }
+    st.flush().unwrap();
+    for i in 0..8 {
+        st.delete(format!("b2-{i}").as_bytes()).unwrap();
+    }
+    st.flush().unwrap();
+    let before = segment_count(dir);
+    assert!(before >= 3, "want >= 3 segments, got {before}");
+    let files = st.file_stats();
+    assert!(
+        files.iter().any(|f| {
+            f.state == spool::SegmentState::Sealed
+                && (1..=10).contains(&f.live_records)
+                && f.live_tombs >= 15
+        }),
+        "no sealed straggler+tomb file: {files:?}"
+    );
+    assert!(
+        files.iter().any(|f| {
+            f.state == spool::SegmentState::Sealed
+                && f.live_records == 0
+                && f.live_tombs >= 5
+        }),
+        "no sealed drained tomb file: {files:?}"
+    );
+    for _ in 0..20 {
+        st.reclaim().unwrap();
+        if segment_count(dir) < before {
+            break;
+        }
+    }
+    assert!(
+        segment_count(dir) < before,
+        "segments stuck at {before}; stats: {:?}",
+        st.stats()
+    );
+    assert!(st.stats().compactions > 0);
+    st.close().unwrap();
+    let got = load_all(dir);
+    assert_eq!(got.len(), 3);
+}
+
+#[test]
 fn dead_file_removal() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = tmp.path();

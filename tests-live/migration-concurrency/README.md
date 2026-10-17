@@ -1,55 +1,22 @@
-# migration-concurrency (Rust port)
+# Concurrent SQL migrations
 
-Go source:
-`/media/marc/2TB/Archives/MURMUR/tests-live/migration-concurrency/`
-(`migration_concurrency_test.go`, `TestSimultaneousMigrationConverges`).
+Race the same ADD COLUMN on two servers while a third writes 60 acknowledged records. Require a successful migration, one complete column on every server, every acknowledged record, and replicated writes to the new column from each server.
 
-## What it proves
+Each node is a separate `murmur-server` process. Application operations use
+[`murmur-client`](../../clients/rust/README.md) over the PostgreSQL wire protocol;
+these tests do not open an embedded database.
 
-The same additive Note migration fires simultaneously on two of three meshed
-nodes while all keep writing. Both migrating nodes must land well-defined
-(old or new, never mixed), mixed-version replication must flow in both
-directions during the overlap, and after the straggler migrates the whole
-mesh converges fully migrated with identical counts, digests, and
-materialized new-column reads on every node.
-
-## Pass criteria (same as Go)
-
-- `MURMUR_MIGRATION_CONCURRENCY_SEED` rows (default 60) converge everywhere
-  within 60 s; all nodes old.
-- Node 1 is peer-isolated; background writers flow on all nodes; the
-  simultaneous migrate fires on nodes 2-3; at least one overlap write is
-  acknowledged (else the overlap proved nothing).
-- Both racers classify well-defined (column exposed iff new); node 1 still
-  old; at least one racer new; laggards migrated sequentially.
-- Heal re-adds the isolated edges; all overlap writes converge by name
-  within 90 s in both directions.
-- New-column writes from a new node plus an old-schema `post-race` insert
-  from node 1 converge within 90 s.
-- After migrating the third node, exact counts plus ordered-digest equality
-  within 90 s, new schema everywhere, and `seed-0 == 100` / `seed-4 == 104`
-  read identically on all nodes.
-
-## Deviations from the Go original
-
-- In-process multi-`Database` cluster instead of daemon processes; peer
-  isolation/heal via `remove_peer`/`add_peer` (no explicit re-mesh needed:
-  no restarts, no port rebinds).
-- Plain SQL replaces the typed-records HTTP API: table
-  `live_typed_records(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL)` plus
-  `ALTER TABLE ... ADD COLUMN note TEXT`.
-- Epoch assertions are `PRAGMA table_info` column-presence checks (the
-  established `typed-records` port pattern); the Note exposed/hidden probe
-  is a raw `SELECT note` succeeding vs failing with no-such-column.
-- Go `MigrateTypedRecords` is an idempotent manifest bind; Rust DDL errors
-  on a duplicate column, so every migrate is guarded by a column-presence
-  check (`migrate_unless_adopted`).
-- Background writers are scoped threads on cloned `Database` handles with a
-  25 ms tick and an `AtomicBool` stop flag.
-
-## Compile check (only gate; never run here)
+Run from the repository root:
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/migration-concurrency/Cargo.toml
+CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path tests-live/migration-concurrency/Cargo.toml -- --nocapture
 ```
+
+The process harness builds `murmur-server` and `murmur-admin` with the
+`replication` feature, or reuses `MURMUR_SERVER_BIN` and `MURMUR_ADMIN_BIN`
+(the admin binary defaults to a sibling of the server). `MURMUR_LIVE_RUNTIME`
+selects the parent directory for unique per-test runtime folders. Successful
+tests remove their runtime folders; failures retain the config and server logs
+at the path printed in the test output.
+
+A duplicate migration may fail after another server has applied it; at least one migration must succeed. Every application write must succeed.

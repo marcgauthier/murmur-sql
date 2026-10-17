@@ -16,6 +16,7 @@ fn options() -> Options {
 fn create(path: &std::path::Path) -> Result<Database> {
     let db = Database::open(path, [7; 32], options())?;
     db.migrate(Migration::new("CREATE TABLE items(id TEXT PRIMARY KEY NOT NULL, a TEXT NOT NULL, b INTEGER NOT NULL); CREATE INDEX items_b ON items(b);"))?;
+    db.set_replication("items", true)?;
     Ok(db)
 }
 fn count(db: &Database) -> Result<i64> {
@@ -116,17 +117,21 @@ fn migrations_preserve_mapped_versions() -> Result<()> {
         Ok(())
     })?;
     let old = db.export_state()?;
+    // Renames require a local-only table; re-enable afterwards so exports
+    // include the rows again.
+    db.set_replication("items", false)?;
     db.migrate(Migration{sql:"ALTER TABLE items RENAME TO things; ALTER TABLE things RENAME COLUMN a TO title; ALTER TABLE things ADD COLUMN extra TEXT NOT NULL DEFAULT 'x'; UPDATE things SET b=b+1;".into(),mappings:vec![TableMapping{old_name:"items".into(),new_name:"things".into(),columns:vec![("a".into(),"title".into())]}]})?;
+    db.set_replication("things", true)?;
     let new = db.export_state()?;
-    assert_eq!(old.rows[0].generation, new.rows[0].generation);
+    assert!(new.rows[0].generation > old.rows[0].generation);
     let a = old.schema.tables[0]
         .columns
         .iter()
         .find(|c| c.name == "a")
         .unwrap();
     assert_eq!(
-        old.rows[0].cells.iter().find(|c| c.column == a.id),
-        new.rows[0].cells.iter().find(|c| c.column == a.id)
+        old.rows[0].cells.iter().find(|c| c.column == a.id).map(|c|&c.value),
+        new.rows[0].cells.iter().find(|c| c.column == a.id).map(|c|&c.value)
     );
     db.close()?;
     let db = Database::open(path, [7; 32], Options::default())?;
@@ -143,6 +148,7 @@ fn snapshots_reclaim_without_losing_history() -> Result<()> {
     db.migrate(Migration::new(
         "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)",
     ))?;
+    db.set_replication("items", true)?;
     for n in 0..8 {
         db.transaction(move |c| {
             c.execute(
@@ -153,9 +159,12 @@ fn snapshots_reclaim_without_losing_history() -> Result<()> {
         })?;
         db.flush()?;
     }
+    // Drops require a local-only table; re-enable before exporting.
+    db.set_replication("items", false)?;
     db.migrate(Migration::new(
         "ALTER TABLE items DROP COLUMN value; CREATE INDEX items_id ON items(id)",
     ))?;
+    db.set_replication("items", true)?;
     let state = db.export_state()?;
     db.close()?;
     let db = Database::open(path, [7; 32], Options::default())?;
@@ -180,6 +189,7 @@ fn storage_failure_stops_mutations_and_preserves_reads() -> Result<()> {
     }));
     let db = Database::open(tmp.path().join("db"), [7; 32], opts)?;
     db.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY)"))?;
+    db.set_replication("items", true)?;
     db.flush()?;
     db.transaction(|c| {
         c.execute("INSERT INTO items VALUES(1)", [])?;
@@ -300,6 +310,7 @@ fn snapshot_failure_boundaries_are_retryable() -> Result<()> {
         db.migrate(Migration::new(
             "CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)",
         ))?;
+    db.set_replication("items", true)?;
         db.flush()?;
         db.transaction(|c| {
             c.execute("INSERT INTO items VALUES(1,'pending')", [])?;
@@ -387,6 +398,7 @@ fn queue_and_transaction_budgets_rollback() -> Result<()> {
     db.migrate(Migration::new(
         "CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB)",
     ))?;
+    db.set_replication("items", true)?;
     db.flush()?;
     assert!(matches!(
         db.transaction(|c| {
@@ -409,9 +421,12 @@ fn data_key_rotation_and_table_rebuild() -> Result<()> {
     })?;
     let before = db.export_state()?;
     db.rotate_data_key()?;
+    // Table rebuilds drop and rename; they require a local-only table.
+    db.set_replication("items", false)?;
     db.migrate(Migration{sql:"CREATE TABLE replacement(id TEXT PRIMARY KEY NOT NULL,a TEXT NOT NULL,b INTEGER NOT NULL); INSERT INTO replacement SELECT id,a,b+1 FROM items; DROP TABLE items; ALTER TABLE replacement RENAME TO items; CREATE INDEX items_b ON items(b);".into(),mappings:Vec::new()})?;
+    db.set_replication("items", true)?;
     let after = db.export_state()?;
-    assert_eq!(before.rows[0].generation, after.rows[0].generation);
+    assert!(after.rows[0].generation > before.rows[0].generation);
     db.close()?;
     let db = Database::open(path, [7; 32], Options::default())?;
     assert_eq!(after, db.export_state()?);
@@ -446,6 +461,7 @@ fn delete_reinsert_in_one_transaction_and_composite_keys() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let db = Database::open(tmp.path().join("db"), [7; 32], options())?;
     db.migrate(Migration::new("CREATE TABLE pairs(a TEXT NOT NULL,b INTEGER NOT NULL,v BLOB,PRIMARY KEY(a,b)) WITHOUT ROWID"))?;
+    db.set_replication("pairs", true)?;
     db.transaction(|c| {
         c.execute("INSERT INTO pairs VALUES('x',1,x'00ff')", [])?;
         Ok(())
@@ -493,6 +509,7 @@ fn bounded_queue_rejects_writes_without_blocking_sqlite() -> Result<()> {
     db.migrate(Migration::new(
         "CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB)",
     ))?;
+    db.set_replication("items", true)?;
     db.flush()?;
     armed.store(true, Ordering::SeqCst);
     let mut busy = false;
@@ -562,6 +579,7 @@ fn crash_during_checkpoint_child() {
         "CREATE TABLE items(id INTEGER PRIMARY KEY,value TEXT)",
     ))
     .unwrap();
+    db.set_replication("items", true).unwrap();
     db.flush().unwrap();
     db.transaction(|c| {
         c.execute("INSERT INTO items VALUES(1,'durable')", [])?;
@@ -601,8 +619,8 @@ fn process_crashes_during_snapshot_and_log_publication() -> Result<()> {
         let db = Database::open(path, [7; 32], Options::default())?;
         let state = db.export_state()?;
         assert!((1..=2).contains(&state.rows.len()));
-        assert!(state.rows.iter().any(|r| r.key == vec![Value::Integer(1)]));
-        assert!(state.rows.iter().all(|r| r.cells.len() == 2));
+        assert!(state.rows.iter().any(|r| r.cells.iter().any(|c|state.schema.tables.iter().flat_map(|t|&t.columns).any(|col|col.name=="id"&&col.id==c.column)&&c.value==Value::Integer(1))));
+        assert!(state.rows.iter().all(|r| r.cells.len() == 3));
         db.close()?;
     }
     Ok(())
@@ -670,6 +688,7 @@ fn versions_use_collection_time_while_worker_is_blocked() -> Result<()> {
     db.migrate(Migration::new(
         "CREATE TABLE items(id INTEGER PRIMARY KEY,value BLOB)",
     ))?;
+    db.set_replication("items", true)?;
     db.flush()?;
     let release = Release(gate);
     armed.store(true, Ordering::SeqCst);
@@ -703,7 +722,7 @@ fn versions_use_collection_time_while_worker_is_blocked() -> Result<()> {
     let row = state
         .rows
         .iter()
-        .find(|r| r.key == vec![Value::Integer(2)])
+        .find(|r| r.cells.iter().any(|c|state.schema.tables.iter().flat_map(|t|&t.columns).any(|col|col.name=="id"&&col.id==c.column)&&c.value==Value::Integer(2)))
         .unwrap();
     assert!(
         row.generation.millis <= collected_by,

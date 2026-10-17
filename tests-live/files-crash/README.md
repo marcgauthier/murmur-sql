@@ -5,8 +5,9 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/files-crash/`
 
 ## What it proves
 
-A two-node encrypted mesh (file object key `0x42..`, 4 MiB file cap)
-proves file crash consistency. One `#[test]`
+A two-node encrypted mesh (file object key `0x42..`, 4 MiB file cap,
+two `murmur-server` processes over the PostgreSQL wire protocol)
+proves file crash consistency. One async test
 (`file_crash_leaves_no_partial_or_phantom`, from
 `TestFileCrashLeavesNoPartialOrPhantom`) follows the Go phases in Go
 order: a positive control (upload/replicate/fetch/verify plus a clean
@@ -37,35 +38,40 @@ attributable, and are bounded by fetch attempts + 2.
 Convergence waits are 30 s with 50 ms polls (60 s for the final
 metadata settle), matching the Go bounds; peer fetch runs on a
 100 ms `fetch_interval` (the `files-soak` pattern). Kill
-coordination polls every 5 ms with a 15 s bound, as in Go.
+coordination polls every 5 ms with a 15 s bound, as in Go. The
+post-crash fetch wait alone is 90 s (deviation below).
 
 ## Deviations from the Go original
 
-- No HTTP: uploads, downloads, metadata, and search use the direct
-  `Database` file API (`upload_file`/`get_file`/`file_metadata`/
-  `list_files`); there is no HTTP server in the Rust product. File
-  names, sizes, object key, and the 4 MiB file cap keep the Go
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS
+  (per design).
+- No HTTP: uploads, downloads, and metadata use `MURMUR FILE` wire
+  commands (`UPLOAD BEGIN` / chunked `UPLOAD APPEND` / `UPLOAD
+  FINISH`; `DOWNLOAD` / `DOWNLOAD NEXT`; `LIST` + `NEXT` + `CLOSE`).
+  File names, sizes, object key, and the 4 MiB file cap keep the Go
   values.
 - No explicit fetch call exists in the Rust product: peer fetch is
   automatic on `fetch_interval`, so the Go `FetchFile` steps become
-  `file_available` waits (the `files-soak` pattern). The Go
-  negative fetch interval (disabled background worker) has no Rust
-  equivalent (`fetch_interval` must be non-zero); 100 ms keeps the
-  steps deterministic while converging fast. Each availability wait
-  counts one fetch attempt for the inventory bound.
-- Signals cannot target one in-process node, so the two SIGKILL legs
-  are modeled in-process (the `testnode` fixture has no
-  replication/files mode, so a fixture subprocess cannot upload or
-  fetch):
-  - Mid-upload kill: one upload per round runs over a byte stream
-    that aborts after 256 KiB; the product must drop the staged
-    temp and fail the upload, and the uploader is then
-    closed/reopened (crash aftermath) with a re-mesh. A round
-    counts as a valid kill when at least one upload errors, as in
-    Go.
-  - Mid-fetch kill: the fetcher is closed/reopened while a
-    `.part` transfer file is on disk in its `objects/staging`
-    dir (polled every 5 ms; the Go `FetchStats.InFlight`
+  `local`-flag waits. The Go negative fetch interval (disabled
+  background worker) has no Rust equivalent (`fetch_interval` must
+  be non-zero); 100 ms keeps the steps deterministic while
+  converging fast. Each availability wait counts one fetch attempt
+  for the inventory bound. Node restart is stop/respawn plus
+  re-mesh (fresh SQL ports; the unlock watchdog runs inside
+  `Cluster::start_node`).
+- Both kill legs are real process kills (the old in-process port
+  modeled them with an aborting byte stream, since signals cannot
+  target one in-process node):
+  - Mid-upload kill: one upload per round appends 256 KiB, then the
+    uploader is killed before FINISH; the product must drop the
+    staged upload and never publish it (asserted after restart),
+    and the uploader is then restarted with a re-mesh (crash
+    aftermath). A round counts as a valid kill when the kill
+    lands, as in Go.
+  - Mid-fetch kill: the fetcher is killed while a `.part`
+    transfer file is on disk in its `objects/staging` dir
+    (polled every 5 ms; the Go `FetchStats.InFlight`
     equivalent). A round that completes the fetch first retries,
     and the test fails loudly if no valid kill lands in 3
     rounds, as in Go.
@@ -86,4 +92,21 @@ coordination polls every 5 ms with a 15 s bound, as in Go.
   uploads) is kept unchanged.
 - The Go metadata digest (SHA-256 over the canonical listing)
   becomes a direct string comparison of the same canonical
-  `name|digest|size|deleted;` listing: no new registry dep.
+  `name|digest|size;` listing: no new registry dep (wire LIST shows
+  nondeleted files only, so there is no `deleted` column).
+- Standard harness knobs add `MURMUR_SERVER_BIN`.
+- The post-crash fetch wait is 90 s instead of Go's 30 s. Killing
+  the fetcher with both transfers in flight (the norm: 2 fetch
+  permits, several missing files) leaves two zombie serve tasks on
+  the uploader holding its whole serve semaphore until the dead
+  QUIC connections idle out (30 s `max_idle_timeout`); every new
+  file connection is refused until then, so recovery lands at
+  ~31 s. The product fails closed and self-heals; the port waits
+  out the recovery tail.
+
+## Compile check
+
+```sh
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/files-crash/Cargo.toml
+```

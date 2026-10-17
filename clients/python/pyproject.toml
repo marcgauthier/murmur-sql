@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "murmur-client"
+version = "0.1.0"
+description = "Pure-Python client for the Murmur in-memory SQLite server (PostgreSQL wire protocol)"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = ["pg8000>=1.31,<2"]
+
+[project.optional-dependencies]
+test = ["pytest>=7", "cryptography>=42"]
+
+[tool.setuptools]
+packages = ["murmur"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

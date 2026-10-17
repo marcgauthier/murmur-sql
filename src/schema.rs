@@ -58,7 +58,7 @@ pub(crate) fn inspect(c: &Connection, previous: &Schema, m: &Migration) -> Resul
                 ]
                 .concat())
             });
-            columns.push(Column {
+            columns.push(Column { vector: oldcol.and_then(|c| c.vector.clone()), fts: oldcol.is_some_and(|c| c.fts),
                 policy: oldcol.map(|c|c.policy).unwrap_or_default(),
                 id: column_id,
                 name: col,
@@ -66,6 +66,10 @@ pub(crate) fn inspect(c: &Connection, previous: &Schema, m: &Migration) -> Resul
                 declared_type,
                 not_null,
             });
+        }
+        let application_key = old.and_then(|t| t.application_key.clone());
+        if columns.iter().any(|c| c.name.eq_ignore_ascii_case(crate::primary_key::COLUMN)) && application_key.is_none() {
+            return Err(Error::Invalid("id_murmur_primary_key is reserved for replication".into()));
         }
         let pk: Vec<_> = columns.iter().filter(|c| c.primary_key > 0).collect();
         if pk.is_empty()
@@ -109,29 +113,130 @@ pub(crate) fn inspect(c: &Connection, previous: &Schema, m: &Migration) -> Resul
                 ));
             }
         }
+        let mut application_indexes = 0;
         let mut indexes = c.prepare(&format!("PRAGMA index_list({})", quote(&name)))?;
         for index in
-            indexes.query_map([], |r| Ok((r.get::<_, bool>(2)?, r.get::<_, String>(3)?)))?
+            indexes.query_map([], |r| Ok((r.get::<_, bool>(2)?, r.get::<_, String>(3)?, r.get::<_, String>(1)?)))?
         {
-            let (unique, origin) = index?;
+            let (unique, origin, index_name) = index?;
             if unique && origin != "pk" {
+                if let Some(key) = &application_key {
+                    let mut info = c.prepare(&format!("PRAGMA index_xinfo({})", quote(&index_name)))?;
+                    let parts = info.query_map([], |r| Ok((r.get::<_, Option<String>>(2)?, r.get::<_, bool>(3)?, r.get::<_, String>(4)?, r.get::<_, bool>(5)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+                    let parts = parts.into_iter().filter(|p|p.3).collect::<Vec<_>>();
+                    if origin == "u" && parts.len() == key.columns.len() && parts.iter().enumerate().all(|(i,p)|p.0.as_ref()==Some(&key.columns[i]) && p.1==key.descending[i] && p.2.eq_ignore_ascii_case(&key.collations[i])) {
+                        application_indexes += 1;
+                        continue;
+                    }
+                }
                 return Err(Error::Invalid(
                     "non-primary-key unique constraints unsupported".into(),
                 ));
             }
         }
+        if application_key.is_some() && application_indexes != 1 {
+            return Err(Error::Invalid("replicated table requires its application-key unique index".into()));
+        }
         tables.push(Table {
+            application_key,
             id: table_id,
             name,
             sql,
             columns,
         });
     }
+    for table in &tables { crate::primary_key::validate_table(table)?; }
     let forbidden:i64=c.query_row("SELECT count(*) FROM sqlite_schema WHERE type IN ('trigger','view') AND lower(name) NOT GLOB '_crdt_*'",[],|r|r.get(0))?;
     if forbidden > 0 {
         return Err(Error::Invalid(
             "application triggers and views unsupported".into(),
         ));
+    }
+    // Destructive statements against replicated tables are rejected even
+    // when the after-schema hides them: a rebuild that drops a table and
+    // reuses its name keeps the stable id, so the id diff below cannot see
+    // it. Bare names arrived uppercased from the scanner; SQLite identifiers
+    // are case-insensitive, so resolution ignores case.
+    for op in destructive_ops(&m.sql) {
+        let table = match &op {
+            DestructiveOp::DropTable(t)
+            | DestructiveOp::RenameTable(t)
+            | DestructiveOp::DropColumn(t, _)
+            | DestructiveOp::RenameColumn(t, _) => t,
+        };
+        if let Some(old) = previous.tables.iter().find(|t| t.name.eq_ignore_ascii_case(table)) {
+            if crate::table_replication::enabled(previous, &old.id) {
+                let what = match &op {
+                    DestructiveOp::DropTable(_) => "drop",
+                    DestructiveOp::RenameTable(_) => "rename",
+                    DestructiveOp::DropColumn(_, column) => {
+                        return Err(Error::Invalid(format!(
+                            "cannot drop column {column} from replicated table {}; disable replication first",
+                            old.name
+                        )));
+                    }
+                    DestructiveOp::RenameColumn(_, column) => {
+                        return Err(Error::Invalid(format!(
+                            "cannot rename column {column} in replicated table {}; disable replication first",
+                            old.name
+                        )));
+                    }
+                };
+                return Err(Error::Invalid(format!(
+                    "cannot {what} replicated table {}; disable replication first",
+                    old.name
+                )));
+            }
+        }
+    }
+    // Replicated tables keep stable identities: drops and renames would
+    // diverge peers that only adopt additive steps. Local-only tables may
+    // drop and rename freely. Unmapped renames surface as drop+create and
+    // are rejected the same way.
+    for old in &previous.tables {
+        let new = tables.iter().find(|t| t.id == old.id);
+        match new {
+            None => {
+                if crate::table_replication::enabled(previous, &old.id) {
+                    return Err(Error::Invalid(format!(
+                        "cannot drop replicated table {}; disable replication first",
+                        old.name
+                    )));
+                }
+            }
+            Some(new) => {
+                if new.name != old.name
+                    && crate::table_replication::enabled(previous, &old.id)
+                {
+                    return Err(Error::Invalid(format!(
+                        "cannot rename replicated table {}; disable replication first",
+                        old.name
+                    )));
+                }
+                for old_col in &old.columns {
+                    match new.columns.iter().find(|c| c.id == old_col.id) {
+                        None => {
+                            if crate::table_replication::enabled(previous, &old.id) {
+                                return Err(Error::Invalid(format!(
+                                    "cannot drop column {}.{} from replicated table {}; disable replication first",
+                                    old.name, old_col.name, old.name
+                                )));
+                            }
+                        }
+                        Some(new_col) => {
+                            if new_col.name != old_col.name
+                                && crate::table_replication::enabled(previous, &old.id)
+                            {
+                                return Err(Error::Invalid(format!(
+                                    "cannot rename column {}.{} in replicated table {}; disable replication first",
+                                    old.name, old_col.name, old.name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     let mut q = c.prepare(
         "SELECT sql FROM sqlite_schema WHERE type='index' AND sql IS NOT NULL ORDER BY name",
@@ -411,12 +516,14 @@ pub(crate) fn row_insert_sql(table:&Table)->String {
     format!("INSERT OR REPLACE INTO {}({}) VALUES({})",quote(&table.name),table.columns.iter().map(|column|quote(&column.name)).collect::<Vec<_>>().join(","),vec!["?";table.columns.len()].join(","))
 }
 pub(crate) fn put_user_row(c:&Connection,table:&Table,row:&RowState)->Result<()> {
+    crate::primary_key::validate_row(table,row)?;
     let values=row_values(table,row)?;
     c.prepare_cached(&row_insert_sql(table))?.execute(rusqlite::params_from_iter(&values))?;Ok(())
 }
 /// Preserve row order while reusing a statement for adjacent rows in a table.
 #[cfg(feature="replication")]
 pub(crate) fn put_user_rows(c:&Connection,schema:&Schema,rows:&[RowState])->Result<()> {
+    for row in rows { let table=schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;crate::primary_key::validate_row(table,row)?; }
     for group in rows.chunk_by(|a,b|a.table==b.table) {
         let table=schema.tables.iter().find(|table|table.id==group[0].table).ok_or(Error::SchemaMismatch)?;
         let mut statement=c.prepare_cached(&row_insert_sql(table))?;
@@ -425,6 +532,7 @@ pub(crate) fn put_user_rows(c:&Connection,schema:&Schema,rows:&[RowState])->Resu
 }
 #[cfg(feature="replication")]
 pub(crate) fn delete_user_rows(c:&Connection,schema:&Schema,rows:&[RowState])->Result<()> {
+    for row in rows { let table=schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;crate::primary_key::validate_row(table,row)?; }
     for group in rows.chunk_by(|a,b|a.table==b.table) {
         let table=schema.tables.iter().find(|table|table.id==group[0].table).ok_or(Error::SchemaMismatch)?;
         let predicate=pk_columns(table).iter().map(|column|format!("{} IS ?",quote(&column.name))).collect::<Vec<_>>().join(" AND ");
@@ -560,6 +668,236 @@ pub(crate) fn index_table(sql: &str) -> Option<String> {
 
 // Ignore quoted values/identifiers and comments when detecting unsupported
 // schema features. SQLite remains the SQL parser and validates syntax.
+/// Destructive DDL targeting a main-schema table, found by scanning
+/// migration statements. Callers resolve names against the previous schema
+/// and reject operations on replicated tables.
+pub(crate) enum DestructiveOp {
+    DropTable(String),
+    RenameTable(String),
+    DropColumn(String, String),
+    RenameColumn(String, String),
+}
+
+/// Statements that drop or rename main-schema tables or columns. Only
+/// statements starting with DROP or ALTER are examined, so trigger bodies
+/// and string literals elsewhere never match. `temp.` targets are skipped:
+/// managed TEMP objects are invisible to schema inspection.
+pub(crate) fn destructive_ops(sql: &str) -> Vec<DestructiveOp> {
+    enum T {
+        Bare(String),
+        Name(String),
+        Dot,
+        Semi,
+    }
+    // Tokenize one statement; quotes, escapes, and comments are honored so
+    // a ';' inside them never splits statements.
+    fn tokenize(stmt: &str) -> Vec<T> {
+        let b = stmt.as_bytes();
+        let mut toks = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' || c == b'"' || c == b'`' {
+                i += 1;
+                let mut raw: Vec<u8> = Vec::new();
+                while i < b.len() {
+                    if b[i] == c {
+                        if i + 1 < b.len() && b[i + 1] == c {
+                            raw.push(c);
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        raw.push(b[i]);
+                        i += 1;
+                    }
+                }
+                toks.push(T::Name(String::from_utf8_lossy(&raw).into_owned()));
+            } else if c == b'[' {
+                i += 1;
+                let mut raw: Vec<u8> = Vec::new();
+                while i < b.len() {
+                    if b[i] == b']' {
+                        if i + 1 < b.len() && b[i + 1] == b']' {
+                            raw.push(b']');
+                            i += 2;
+                        } else {
+                            i += 1;
+                            break;
+                        }
+                    } else {
+                        raw.push(b[i]);
+                        i += 1;
+                    }
+                }
+                toks.push(T::Name(String::from_utf8_lossy(&raw).into_owned()));
+            } else if c == b'-' && b[i..].starts_with(b"--") {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if c.is_ascii_alphabetic() || c == b'_' {
+                let start = i;
+                while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'$') {
+                    i += 1;
+                }
+                toks.push(T::Bare(stmt[start..i].to_ascii_uppercase()));
+            } else if c == b'.' {
+                toks.push(T::Dot);
+                i += 1;
+            } else if c == b';' {
+                toks.push(T::Semi);
+                i += 1;
+            } else {
+                i += 1;
+            }
+        }
+        toks
+    }
+
+    fn ident(toks: &[T], k: &mut usize) -> Option<String> {
+        match toks.get(*k) {
+            // A bare word is a name unless it is a clause keyword the caller
+            // already handled positionally; matching is positional, so any
+            // bare word is accepted here.
+            Some(T::Bare(w)) => {
+                *k += 1;
+                Some(w.clone())
+            }
+            Some(T::Name(n)) => {
+                *k += 1;
+                Some(n.clone())
+            }
+            _ => None,
+        }
+    }
+
+    // Optional `schema.` prefix; returns the table name or None for `temp.`.
+    fn table_name(toks: &[T], k: &mut usize) -> Option<Option<String>> {
+        let first = ident(toks, k)?;
+        if matches!(toks.get(*k), Some(T::Dot)) {
+            *k += 1;
+            let name = ident(toks, k)?;
+            if first.eq_ignore_ascii_case("temp") {
+                return Some(None);
+            }
+            return Some(Some(name));
+        }
+        Some(Some(first))
+    }
+
+    fn eat(toks: &[T], k: &mut usize, word: &str) -> bool {
+        if matches!(&toks.get(*k), Some(T::Bare(w)) if w == word) {
+            *k += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    let mut ops = Vec::new();
+    // Split on top-level semicolons; the tokenizer consumed quoted ones.
+    let mut depth_statements: Vec<&str> = Vec::new();
+    {
+        let b = sql.as_bytes();
+        let mut start = 0;
+        let mut i = 0;
+        while i < b.len() {
+            let c = b[i];
+            if c == b'\'' || c == b'"' || c == b'`' {
+                i += 1;
+                while i < b.len() {
+                    if b[i] == c {
+                        i += 1;
+                        if i < b.len() && b[i] == c {
+                            i += 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+            } else if c == b'[' {
+                i += 1;
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+                i = (i + 1).min(b.len());
+            } else if c == b'-' && b[i..].starts_with(b"--") {
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+            } else if c == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+            } else if c == b';' {
+                depth_statements.push(&sql[start..i]);
+                i += 1;
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        depth_statements.push(&sql[start..]);
+    }
+    for stmt in depth_statements {
+        let toks: Vec<T> = tokenize(stmt).into_iter().filter(|t| !matches!(t, T::Semi)).collect();
+        if toks.is_empty() {
+            continue;
+        }
+        let mut k = 0;
+        if eat(&toks, &mut k, "DROP") {
+            if !eat(&toks, &mut k, "TABLE") {
+                continue;
+            }
+            if eat(&toks, &mut k, "IF") {
+                if !eat(&toks, &mut k, "EXISTS") {
+                    continue;
+                }
+            }
+            if let Some(Some(name)) = table_name(&toks, &mut k) {
+                ops.push(DestructiveOp::DropTable(name));
+            }
+        } else if eat(&toks, &mut k, "ALTER") {
+            if !eat(&toks, &mut k, "TABLE") {
+                continue;
+            }
+            let Some(Some(table)) = table_name(&toks, &mut k) else {
+                continue;
+            };
+            if eat(&toks, &mut k, "RENAME") {
+                if eat(&toks, &mut k, "TO") {
+                    ops.push(DestructiveOp::RenameTable(table));
+                } else {
+                    eat(&toks, &mut k, "COLUMN");
+                    if let Some(column) = ident(&toks, &mut k) {
+                        if eat(&toks, &mut k, "TO") {
+                            ops.push(DestructiveOp::RenameColumn(table, column));
+                        }
+                    }
+                }
+            } else if eat(&toks, &mut k, "DROP") {
+                eat(&toks, &mut k, "COLUMN");
+                if let Some(column) = ident(&toks, &mut k) {
+                    ops.push(DestructiveOp::DropColumn(table, column));
+                }
+            }
+        }
+    }
+    ops
+}
+
 pub(crate) fn keywords(sql: &str) -> Vec<String> {
     let b = sql.as_bytes();
     let mut i = 0;
@@ -644,5 +982,74 @@ mod index_table_tests {
         assert_eq!(index_table("CREATE INDEX i"), None);
         assert_eq!(index_table("not sql at all"), None);
         assert_eq!(index_table(""), None);
+    }
+}
+
+#[cfg(test)]
+mod destructive_ops_tests {
+    use super::{destructive_ops, DestructiveOp};
+
+    fn shapes(sql: &str) -> Vec<String> {
+        destructive_ops(sql)
+            .into_iter()
+            .map(|op| match op {
+                DestructiveOp::DropTable(t) => format!("drop-table:{t}"),
+                DestructiveOp::RenameTable(t) => format!("rename-table:{t}"),
+                DestructiveOp::DropColumn(t, c) => format!("drop-column:{t}.{c}"),
+                DestructiveOp::RenameColumn(t, c) => format!("rename-column:{t}.{c}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn finds_all_drop_and_rename_forms() {
+        assert_eq!(shapes("DROP TABLE items"), ["drop-table:ITEMS"]);
+        assert_eq!(shapes("drop table if exists items"), ["drop-table:ITEMS"]);
+        assert_eq!(
+            shapes("ALTER TABLE items RENAME TO things"),
+            ["rename-table:ITEMS"]
+        );
+        assert_eq!(
+            shapes("ALTER TABLE items RENAME COLUMN a TO b; ALTER TABLE items DROP COLUMN c"),
+            ["rename-column:ITEMS.A", "drop-column:ITEMS.C"]
+        );
+        assert_eq!(
+            shapes("ALTER TABLE items RENAME a TO b"),
+            ["rename-column:ITEMS.A"]
+        );
+        assert_eq!(shapes("ALTER TABLE items DROP a"), ["drop-column:ITEMS.A"]);
+        assert_eq!(shapes("DROP TABLE main.items"), ["drop-table:ITEMS"]);
+    }
+
+    #[test]
+    fn honors_quoting_comments_and_temp_schema() {
+        assert_eq!(shapes("DROP TABLE \"my table\""), ["drop-table:my table"]);
+        assert_eq!(shapes("DROP TABLE [items]"), ["drop-table:items"]);
+        assert_eq!(
+            shapes("ALTER TABLE `items` RENAME TO `things`"),
+            ["rename-table:items"]
+        );
+        assert_eq!(
+            shapes("-- DROP TABLE items\nDROP TABLE real"),
+            ["drop-table:REAL"]
+        );
+        assert_eq!(shapes("DROP TABLE temp.cache"), Vec::<String>::new());
+        assert_eq!(
+            shapes("ALTER TABLE TEMP.t RENAME TO u"),
+            Vec::<String>::new()
+        );
+        // Trigger bodies and string literals never match: only statements
+        // starting with DROP or ALTER are examined.
+        assert_eq!(
+            shapes("CREATE TRIGGER tr AFTER INSERT ON t BEGIN DROP TABLE x; END"),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            shapes("INSERT INTO t VALUES('DROP TABLE x; ALTER TABLE y RENAME TO z')"),
+            Vec::<String>::new()
+        );
+        assert_eq!(shapes("CREATE INDEX i ON t(a)"), Vec::<String>::new());
+        assert_eq!(shapes("ALTER TABLE t ADD COLUMN c TEXT"), Vec::<String>::new());
+        assert_eq!(shapes("DROP INDEX i"), Vec::<String>::new());
     }
 }

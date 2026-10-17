@@ -9,11 +9,16 @@ mod files;
 pub use murmur_replication::files::{Availability as FileAvailability, Config as FileConfig, KeyRotationStatus as FileKeyRotationStatus, Metadata as FileMetadata};
 
 mod capture;
+pub mod config;
+pub mod logging;
+pub mod server;
 mod database;
 mod merge;
 mod metadata;
 mod model;
 mod schema;
+mod schema_codec;
+mod primary_key;
 mod search;
 mod progress;
 mod table_replication;
@@ -38,9 +43,9 @@ pub use scheduler::{
 };
 
 pub use database::{Database, Sql};
-pub use search::{DistanceMetric, Fts5Index, SearchIndex, SearchIndexStatus, VectorIndex};
+pub use search::{DistanceMetric, Fts5Index, SearchIndex, SearchIndexStatus, VectorColumnConfig, VectorIndex};
 pub use model::{
-    Cell, Column, MergePolicy, Migration, OpenMode, OpenPhase, OpenProgress, Options, ReplicaState,
+    ApplicationKey, Cell, Column, MergePolicy, Migration, OpenMode, OpenPhase, OpenProgress, Options, ReplicaState,
     RestoreOptions, RowState, Schema, SqliteMetrics, SpoolMetrics, Status, Table, TableMapping,
     Tombstone, Value, Version,
 };

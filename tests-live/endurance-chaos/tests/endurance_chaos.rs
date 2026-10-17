@@ -13,6 +13,12 @@
 //! typed-contention HTTP API; tc/netem impairment degrades to logical
 //! peer flaps and libfaketime clock skew is skipped (see the scenario
 //! README.md for the deviations).
+//!
+//! Nodes are `murmur-server` processes driven over the PostgreSQL wire
+//! protocol. Writers, the heartbeat sampler, the disk cycler, and the
+//! chaos director run as tokio tasks sharing the cluster through one
+//! async mutex (the Go goroutine/thread structure); every cluster touch
+//! locks, so lifecycle (stop/start) and reads never race.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -20,13 +26,16 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use murmur_live_harness::sqlite_session::{Database, Error as SessionError, Migration};
-use murmur_live_harness::{env_seconds, Cluster, ClusterOptions, ReplicationOptions};
+use murmur_live_harness::{env_seconds, hex, Cluster, ClusterOptions, ReplicationOptions};
+use tokio::sync::Mutex as AsyncMutex;
+
+/// Shared cluster handle: every task locks for each cluster touch.
+type Shared = Arc<AsyncMutex<Cluster>>;
 
 /// Mesh-size clamp (Go: `min(max(nodes, 3), 16)`).
 const MIN_NODES: usize = 3;
 const MAX_NODES: usize = 16;
-/// Writer-thread cap (Go: `min(max(nodes, 2), 8)`).
+/// Writer-task cap (Go: `min(max(nodes, 2), 8)`).
 const MAX_WRITERS: usize = 8;
 /// Bounded working-set floor (Go: `maxRows < 100` is fatal).
 const MIN_MAX_ROWS: usize = 100;
@@ -263,10 +272,7 @@ impl Reporter {
 
     /// Announce a phase transition (Go: `reporter.phase`).
     fn phase(&self, name: &str, detail: &str) {
-        self.emit(format!(
-            "{} === PHASE: {name} === {detail}",
-            self.stamp()
-        ));
+        self.emit(format!("{} === PHASE: {name} === {detail}", self.stamp()));
     }
 
     /// Record a timestamped progress line (Go: `reporter.logf`).
@@ -320,10 +326,7 @@ impl Reporter {
     /// `Cluster::finish`.
     fn verdict(&self, pass: bool, report_path: &Path, summary: &str) {
         let status = if pass { "PASS" } else { "FAIL" };
-        self.emit(format!(
-            "{} === VERDICT: {status} === {summary}",
-            self.stamp()
-        ));
+        self.emit(format!("{} === VERDICT: {status} === {summary}", self.stamp()));
         let events = self.events.lock().unwrap().clone();
         let err_sample = self.err_sample.lock().unwrap().clone();
         let err_seen = self.err_seen.lock().unwrap().clone();
@@ -347,10 +350,7 @@ impl Reporter {
         if !err_sample.is_empty() {
             b.push_str("## Distinct write errors\n\n");
             for s in &err_sample {
-                b.push_str(&format!(
-                    "- ({}x) {s}\n",
-                    err_seen.get(s).copied().unwrap_or(0)
-                ));
+                b.push_str(&format!("- ({}x) {s}\n", err_seen.get(s).copied().unwrap_or(0)));
             }
             b.push('\n');
         }
@@ -379,10 +379,7 @@ struct IdRegistryInner {
 impl IdRegistry {
     fn new() -> Self {
         Self {
-            inner: Mutex::new(IdRegistryInner {
-                ids: Vec::new(),
-                live: HashSet::new(),
-            }),
+            inner: Mutex::new(IdRegistryInner { ids: Vec::new(), live: HashSet::new() }),
         }
     }
 
@@ -417,16 +414,17 @@ impl IdRegistry {
     }
 }
 
-/// Restart-proof per-node GC history (Go: `chaosControl` GC latches):
-/// in-memory `retention_runs` resets on every restart, so the sampler
-/// records high-water observations and the verdict asserts on those.
+/// Restart-proof per-node GC history (Go: `chaosControl` GC latches).
+/// The sampler records high-water observations and the verdict asserts on
+/// those. No GC-runs counter exists over the wire, so a run is proven by
+/// `collected` advancing across samples (durable, restart-proof).
 struct GcHistory {
     inner: Mutex<Vec<GcHist>>,
 }
 
 struct GcHist {
-    ever: bool,
-    coll_ever: bool,
+    first: Option<u64>,
+    max: u64,
     gc_err: Option<String>,
 }
 
@@ -435,25 +433,17 @@ impl GcHistory {
         Self {
             inner: Mutex::new(
                 (0..nodes)
-                    .map(|_| GcHist {
-                        ever: false,
-                        coll_ever: false,
-                        gc_err: None,
-                    })
+                    .map(|_| GcHist { first: None, max: 0, gc_err: None })
                     .collect(),
             ),
         }
     }
 
-    fn observe(&self, idx: usize, runs: u64, collected: u64, last_error: &Option<String>) {
+    fn observe(&self, idx: usize, collected: u64, last_error: &Option<String>) {
         let mut inner = self.inner.lock().unwrap();
         let hist = &mut inner[idx];
-        if runs > 0 {
-            hist.ever = true;
-        }
-        if collected > 0 {
-            hist.coll_ever = true;
-        }
+        hist.first.get_or_insert(collected);
+        hist.max = hist.max.max(collected);
         if let Some(e) = last_error {
             if hist.gc_err.is_none() && is_gc_error(e) {
                 hist.gc_err = Some(e.chars().take(ERR_TRUNC_CHARS).collect());
@@ -461,10 +451,12 @@ impl GcHistory {
         }
     }
 
+    /// (runs observed, collected observed, first GC-shaped error).
     fn snapshot(&self, idx: usize) -> (bool, bool, Option<String>) {
         let inner = self.inner.lock().unwrap();
         let hist = &inner[idx];
-        (hist.ever, hist.coll_ever, hist.gc_err.clone())
+        let ever = hist.first.is_some_and(|f| hist.max > f);
+        (ever, hist.max > 0, hist.gc_err.clone())
     }
 }
 
@@ -475,67 +467,104 @@ impl GcHistory {
 /// counter — so only GC-substring matches fail the verdict.
 fn is_gc_error(msg: &str) -> bool {
     let lower = msg.to_lowercase();
-    lower.contains("retention")
-        || lower.contains("collect")
-        || lower.contains("gc_")
-        || lower.contains("prune")
+    lower.contains("retention") || lower.contains("collect") || lower.contains("gc_") || lower.contains("prune")
 }
 
-/// GC counters for one node (Go: scraped from `/metrics`): collection
-/// passes, collected transactions, latest engine error. `None` when the
-/// node is unreachable (stopped or mid-restart).
-fn gc_sample(db: &Database) -> Option<(u64, u64, Option<String>)> {
-    let status = db.replication()?.status();
-    let collected = db.retention_status().ok()?.collected_transactions;
-    Some((status.metrics.retention_runs, collected, status.last_error))
+/// GC counters for one node (Go: scraped from `/metrics`): collected
+/// transactions (`MURMUR SHOW RETENTION`) plus the latest engine error
+/// (`MURMUR SHOW REPLICATION`). `None` when the node is unreachable
+/// (stopped or mid-restart) or the mesh has no retention row yet.
+async fn gc_sample(cluster: &Shared, idx: usize) -> Option<(u64, Option<String>)> {
+    let guard = cluster.lock().await;
+    if guard.node_pid(idx).is_none() {
+        return None;
+    }
+    let repl = guard.node(idx).simple("MURMUR SHOW REPLICATION").await.ok()?;
+    let repl = repl.first()?;
+    if repl.len() < 8 {
+        return None;
+    }
+    let last_error = if repl[6].is_empty() { None } else { Some(repl[6].clone()) };
+    let rows = guard.node(idx).simple("MURMUR SHOW RETENTION").await.ok()?;
+    let row = rows.first()?;
+    if row.len() < 6 {
+        return None;
+    }
+    let collected: u64 = row[5].parse().ok()?;
+    Some((collected, last_error))
 }
 
 /// Log-path applied-transaction counter for one node (snapshot
 /// application bypasses it, so it underpins the snapshot proof).
-fn applied_count(db: &Database) -> Option<u64> {
-    db.replication()
-        .map(|h| h.status().metrics.applied_transactions)
+async fn applied_count(cluster: &Shared, idx: usize) -> Option<u64> {
+    let guard = cluster.lock().await;
+    if guard.node_pid(idx).is_none() {
+        return None;
+    }
+    let rows = guard.node(idx).simple("MURMUR SHOW REPLICATION").await.ok()?;
+    rows.first()?.get(5)?.parse::<u64>().ok()
 }
 
-/// Durably applied snapshot counter for one node (Go:
-/// `spedsql_repl_snapshots_received_total` equivalent).
-fn snapshots_applied(db: &Database) -> Option<u64> {
-    db.replication()
-        .map(|h| h.status().metrics.snapshots_applied)
+/// Spool on-disk bytes for one node (`MURMUR SHOW METRICS SPOOL`).
+async fn spool_disk_bytes(cluster: &Shared, idx: usize) -> Option<u64> {
+    let guard = cluster.lock().await;
+    if guard.node_pid(idx).is_none() {
+        return None;
+    }
+    let rows = guard.node(idx).simple("MURMUR SHOW METRICS SPOOL").await.ok()?;
+    rows.iter()
+        .find(|r| r.len() == 3 && r[0] == "spool" && r[1] == "disk_bytes")
+        .and_then(|r| r[2].parse::<u64>().ok())
 }
 
 /// Row count on one node, or `None` when the read fails.
-fn row_count(db: &Database) -> Option<usize> {
-    db.read(|sql| {
-        let n = sql.query_row("SELECT COUNT(*) FROM contention", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        Ok(n as usize)
-    })
-    .ok()
+async fn row_count(cluster: &Shared, idx: usize) -> Option<usize> {
+    let guard = cluster.lock().await;
+    if guard.node_pid(idx).is_none() {
+        return None;
+    }
+    let rows = guard
+        .node(idx)
+        .query("SELECT COUNT(*) FROM contention", &[])
+        .await
+        .ok()?;
+    let n: i64 = rows.first()?.try_get(0).ok()?;
+    Some(n as usize)
 }
 
 /// Canonical PK-ordered encoded rows on one node (Go: `enduranceNodeState`
 /// input: `id:name:phone:score` sorted by id), or `None` when the read
 /// fails.
-fn canonical_rows(db: &Database) -> Option<Vec<String>> {
-    db.read(|sql| {
-        let mut stmt =
-            sql.prepare("SELECT id, name, phone, score FROM contention ORDER BY id")?;
-        let mapped = stmt.query_map([], |row| {
-            let id: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            let phone: String = row.get(2)?;
-            let score: i64 = row.get(3)?;
-            Ok(format!("{id}:{name}:{phone}:{score}"))
-        })?;
-        let mut out = Vec::new();
-        for row in mapped {
-            out.push(row?);
-        }
-        Ok(out)
-    })
-    .ok()
+async fn canonical_rows(cluster: &Shared, idx: usize) -> Option<Vec<String>> {
+    let guard = cluster.lock().await;
+    if guard.node_pid(idx).is_none() {
+        return None;
+    }
+    let rows = guard
+        .node(idx)
+        .query("SELECT id, name, phone, score FROM contention ORDER BY id", &[])
+        .await
+        .ok()?;
+    let mut out = Vec::new();
+    for row in &rows {
+        let id: String = row.try_get(0).ok()?;
+        let name: String = row.try_get(1).ok()?;
+        let phone: String = row.try_get(2).ok()?;
+        let score: i64 = row.try_get(3).ok()?;
+        out.push(format!("{id}:{name}:{phone}:{score}"));
+    }
+    Some(out)
+}
+
+/// Connected-peer count on one node (`MURMUR SHOW PEERS`), or `None` when
+/// the node is down or unreadable.
+async fn connected_peers(cluster: &Shared, idx: usize) -> Option<usize> {
+    let guard = cluster.lock().await;
+    if guard.node_pid(idx).is_none() {
+        return None;
+    }
+    let rows = guard.node(idx).simple("MURMUR SHOW PEERS").await.ok()?;
+    Some(rows.iter().filter(|r| r.len() >= 3 && r[2] == "true").count())
 }
 
 /// Deterministic log-only digest over canonical rows (Go: sha256 hex of
@@ -577,14 +606,129 @@ fn pick_alive(alive: &[AtomicBool], rng: &mut Rng) -> Option<usize> {
     }
 }
 
-/// Bounded insert/update/delete writer (Go: `writerLoop`): inserts until
-/// `max_rows` live ids, then updates/deletes recycle the set so a long
-/// run keeps churning replication and GC without unbounded growth.
-/// Transient errors are counted, never fatal.
+/// One bounded insert/update/delete write on a live node (Go: `writerLoop`
+/// body): inserts until `max_rows` live ids, then updates/deletes recycle
+/// the set so a long run keeps churning replication and GC without
+/// unbounded growth. Transient errors are counted, never fatal. The
+/// alive re-check and the write run under one cluster lock, so a node
+/// the director stops mid-op is never touched.
 #[allow(clippy::too_many_arguments)]
-fn writer_loop(
+async fn write_one(
     id: usize,
-    handles: Arc<Vec<Mutex<Database>>>,
+    cluster: &Shared,
+    alive: &Arc<Vec<AtomicBool>>,
+    registry: &Arc<IdRegistry>,
+    rep: &Arc<Reporter>,
+    rng: &mut Rng,
+    seq: &mut u64,
+    max_rows: usize,
+    target: usize,
+) {
+    let roll = rng.float();
+    if registry.len() < max_rows && roll < 0.7 {
+        *seq += 1;
+        let row_id = format!("{id:08x}{:024x}", *seq);
+        let name = format!("writer-{id}");
+        let phone = format!("v-{id}-{seq}", seq = *seq);
+        let insert_id = row_id.clone();
+        let guard = cluster.lock().await;
+        if !alive[target].load(Ordering::SeqCst) {
+            return;
+        }
+        let outcome: Result<(), String> = async {
+            guard
+                .node(target)
+                .execute(
+                    "INSERT INTO contention(id, name, phone, score) VALUES($1, $2, $3, $4)",
+                    &[&row_id, &name, &phone, &0i64],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            guard.node(target).flush().await.map_err(|e| e.to_string())
+        }
+        .await;
+        drop(guard);
+        match outcome {
+            Ok(()) => {
+                registry.add(insert_id);
+                rep.count_attempt(true);
+            }
+            Err(e) => {
+                rep.count_attempt(false);
+                rep.sample_err(&e);
+            }
+        }
+    } else if roll < 0.85 {
+        let Some(row_id) = registry.pick(rng) else {
+            return;
+        };
+        *seq += 1;
+        let name = format!("writer-{id}");
+        let phone = format!("u-{id}-{seq}", seq = *seq);
+        let guard = cluster.lock().await;
+        if !alive[target].load(Ordering::SeqCst) {
+            return;
+        }
+        let outcome = async {
+            let changed = guard
+                .node(target)
+                .execute(
+                    "UPDATE contention SET name = $1, phone = $2 WHERE id = $3",
+                    &[&name, &phone, &row_id],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if changed != 1 {
+                return Err(format!("update hit {changed} rows"));
+            }
+            guard.node(target).flush().await.map_err(|e| e.to_string())
+        }
+        .await;
+        drop(guard);
+        match outcome {
+            Ok(()) => rep.count_attempt(true),
+            Err(e) => {
+                rep.count_attempt(false);
+                rep.sample_err(&e);
+            }
+        }
+    } else {
+        let Some(row_id) = registry.pick(rng) else {
+            return;
+        };
+        let del_id = row_id.clone();
+        let guard = cluster.lock().await;
+        if !alive[target].load(Ordering::SeqCst) {
+            return;
+        }
+        let outcome: Result<(), String> = async {
+            guard
+                .node(target)
+                .execute("DELETE FROM contention WHERE id = $1", &[&row_id])
+                .await
+                .map_err(|e| e.to_string())?;
+            guard.node(target).flush().await.map_err(|e| e.to_string())
+        }
+        .await;
+        drop(guard);
+        match outcome {
+            Ok(()) => {
+                registry.remove(&del_id);
+                rep.count_attempt(true);
+            }
+            Err(e) => {
+                rep.count_attempt(false);
+                rep.sample_err(&e);
+            }
+        }
+    }
+}
+
+/// Bounded writer task (Go: `writerLoop`).
+#[allow(clippy::too_many_arguments)]
+async fn writer_loop(
+    id: usize,
+    cluster: Shared,
     alive: Arc<Vec<AtomicBool>>,
     registry: Arc<IdRegistry>,
     rep: Arc<Reporter>,
@@ -602,105 +746,23 @@ fn writer_loop(
         let target = match pick_alive(&alive, &mut rng) {
             Some(t) => t,
             None => {
-                std::thread::sleep(write_interval);
+                tokio::time::sleep(write_interval).await;
                 continue;
             }
         };
-        let roll = rng.float();
-        let db = handles[target].lock().unwrap().clone();
-        if registry.len() < max_rows && roll < 0.7 {
-            seq += 1;
-            let row_id = format!("{id:08x}{seq:024x}");
-            let name = format!("writer-{id}");
-            let phone = format!("v-{id}-{seq}");
-            let insert_id = row_id.clone();
-            let outcome = db
-                .transaction(move |sql| {
-                    sql.execute(
-                        "INSERT INTO contention(id, name, phone, score) VALUES(?, ?, ?, ?)",
-                        (row_id, name, phone, 0i64),
-                    )?;
-                    Ok(())
-                })
-                .map_err(|e| e.to_string())
-                .and_then(|()| db.flush().map_err(|e| e.to_string()));
-            match outcome {
-                Ok(()) => {
-                    registry.add(insert_id);
-                    rep.count_attempt(true);
-                }
-                Err(e) => {
-                    rep.count_attempt(false);
-                    rep.sample_err(&e);
-                }
-            }
-        } else if roll < 0.85 {
-            let Some(row_id) = registry.pick(&mut rng) else {
-                std::thread::sleep(write_interval);
-                continue;
-            };
-            seq += 1;
-            let name = format!("writer-{id}");
-            let phone = format!("u-{id}-{seq}");
-            let outcome = db
-                .transaction(move |sql| {
-                    let changed = sql.execute(
-                        "UPDATE contention SET name = ?, phone = ? WHERE id = ?",
-                        (name, phone, row_id),
-                    )?;
-                    if changed != 1 {
-                        return Err(SessionError::Invalid(format!(
-                            "update hit {changed} rows"
-                        )));
-                    }
-                    Ok(())
-                })
-                .map_err(|e| e.to_string())
-                .and_then(|()| db.flush().map_err(|e| e.to_string()));
-            match outcome {
-                Ok(()) => rep.count_attempt(true),
-                Err(e) => {
-                    rep.count_attempt(false);
-                    rep.sample_err(&e);
-                }
-            }
-        } else {
-            let Some(row_id) = registry.pick(&mut rng) else {
-                std::thread::sleep(write_interval);
-                continue;
-            };
-            let del_id = row_id.clone();
-            let outcome = db
-                .transaction(move |sql| {
-                    sql.execute("DELETE FROM contention WHERE id = ?", (row_id,))?;
-                    Ok(())
-                })
-                .map_err(|e| e.to_string())
-                .and_then(|()| db.flush().map_err(|e| e.to_string()));
-            match outcome {
-                Ok(()) => {
-                    registry.remove(&del_id);
-                    rep.count_attempt(true);
-                }
-                Err(e) => {
-                    rep.count_attempt(false);
-                    rep.sample_err(&e);
-                }
-            }
-        }
+        write_one(id, &cluster, &alive, &registry, &rep, &mut rng, &mut seq, max_rows, target).await;
         if stop.load(Ordering::SeqCst) {
             return;
         }
-        std::thread::sleep(write_interval);
+        tokio::time::sleep(write_interval).await;
     }
 }
 
 /// Heartbeat sampler (Go: `statusLoop`): row spread, fault tallies, GC
-/// high-water observations, spool/disk pressure. Reads through the shared
-/// handle table, never through the cluster (the director owns it).
+/// high-water observations, spool/disk pressure.
 #[allow(clippy::too_many_arguments)]
-fn status_loop(
-    handles: Arc<Vec<Mutex<Database>>>,
+async fn status_loop(
+    cluster: Shared,
     node_dirs: Vec<PathBuf>,
     rep: Arc<Reporter>,
     gc_hist: Arc<GcHistory>,
@@ -709,15 +771,14 @@ fn status_loop(
     stop: Arc<AtomicBool>,
 ) {
     loop {
-        if !sleep_stop(status_every, &stop) {
+        if !sleep_stop(status_every, &stop).await {
             return;
         }
         let mut min: i64 = -1;
         let mut max: i64 = -1;
         let mut down = 0usize;
-        for h in handles.iter() {
-            let db = h.lock().unwrap().clone();
-            match row_count(&db) {
+        for i in 0..nodes {
+            match row_count(&cluster, i).await {
                 Some(c) => {
                     let c = c as i64;
                     if min < 0 || c < min {
@@ -731,13 +792,14 @@ fn status_loop(
             }
         }
         let mut spool_max: u64 = 0;
-        let mut gc_runs: u64 = 0;
-        for (i, h) in handles.iter().enumerate() {
-            let db = h.lock().unwrap().clone();
-            spool_max = spool_max.max(db.spool_metrics().disk_bytes);
-            if let Some((runs, collected, last_error)) = gc_sample(&db) {
-                gc_runs += runs;
-                gc_hist.observe(i, runs, collected, &last_error);
+        let mut collected_max: u64 = 0;
+        for i in 0..nodes {
+            if let Some(bytes) = spool_disk_bytes(&cluster, i).await {
+                spool_max = spool_max.max(bytes);
+            }
+            if let Some((collected, last_error)) = gc_sample(&cluster, i).await {
+                collected_max = collected_max.max(collected);
+                gc_hist.observe(i, collected, &last_error);
             }
         }
         let mut disk_min: Option<u64> = None;
@@ -748,7 +810,7 @@ fn status_loop(
         }
         let f = rep.fault_snapshot();
         rep.log(format!(
-            "status: writes ok={} err={} | rows min={min} max={max} down={down}/{nodes} | restart={} rotate={} impair={} disk={} snap={} skew={} | gcRuns={gc_runs} spoolMax={}MiB diskFreeMin={}MiB",
+            "status: writes ok={} err={} | rows min={min} max={max} down={down}/{nodes} | restart={} rotate={} impair={} disk={} snap={} skew={} | gcCollectedMax={collected_max} spoolMax={}MiB diskFreeMin={}MiB",
             rep.succeeded(),
             rep.failed(),
             f.restarts,
@@ -765,7 +827,7 @@ fn status_loop(
 
 /// Disk-pressure cycler (Go: `diskLoop`): holds a filler file in each node
 /// dir in turn, then releases. Filesystem paths only, no cluster use.
-fn disk_loop(
+async fn disk_loop(
     node_dirs: Vec<PathBuf>,
     rep: Arc<Reporter>,
     disk_every: Duration,
@@ -773,7 +835,7 @@ fn disk_loop(
     filler_mb: u64,
     stop: Arc<AtomicBool>,
 ) {
-    if !sleep_stop(DISK_WARMUP, &stop) {
+    if !sleep_stop(DISK_WARMUP, &stop).await {
         return;
     }
     let mut idx = 0usize;
@@ -795,7 +857,7 @@ fn disk_loop(
                     free_after >> 20,
                     fmt_dur(disk_hold),
                 ));
-                let interrupted = !sleep_stop(disk_hold, &stop);
+                let interrupted = !sleep_stop(disk_hold, &stop).await;
                 remove_filler(&path);
                 rep.count_fault("disk");
                 if interrupted {
@@ -808,7 +870,7 @@ fn disk_loop(
             }
         }
         // Wait out the remainder of the period after the hold.
-        if disk_every > disk_hold && !sleep_stop(disk_every - disk_hold, &stop) {
+        if disk_every > disk_hold && !sleep_stop(disk_every - disk_hold, &stop).await {
             return;
         }
     }
@@ -816,17 +878,17 @@ fn disk_loop(
 
 /// Sleep `d`, waking early when `stop` is set. Reports false when
 /// interrupted (Go: `sleepInterruptible`).
-fn sleep_stop(d: Duration, stop: &AtomicBool) -> bool {
-    let deadline = Instant::now() + d;
+async fn sleep_stop(d: Duration, stop: &AtomicBool) -> bool {
+    let deadline = tokio::time::Instant::now() + d;
     loop {
         if stop.load(Ordering::SeqCst) {
             return false;
         }
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         if now >= deadline {
             return true;
         }
-        std::thread::sleep(Duration::from_millis(100).min(deadline - now));
+        tokio::time::sleep(Duration::from_millis(100).min(deadline - now)).await;
     }
 }
 
@@ -907,57 +969,55 @@ struct SnapObservation {
 }
 
 /// Decide whether a rejoined snapshot victim caught up via the snapshot
-/// path. Go proves this with `spedsql_repl_snapshots_received_total`; the
-/// Rust proof is event-driven off the equivalent `snapshots_applied`
-/// counter: every writer op is one transaction, and the victim missed
-/// every acked op from its outage, so the window counts as proven when a
-/// snapshot applies and the post-apply sample shows the bulk arrived via
-/// the snapshot path (row drift below the outage's acked count while the
-/// log-path applied delta since the apply stays below it too — a pure
-/// log catch-up would advance `applied_transactions` by at least the
-/// outage's count). Writers keep running throughout (Go parity: no
+/// path. Go proves this with `spedsql_repl_snapshots_received_total`;
+/// the Rust wire protocol exposes no snapshot counter, so the proof is
+/// event-driven off the log-path `applied_transactions` counter
+/// instead: every writer op is one transaction, and the victim missed
+/// every acked op from its outage, so the window counts as proven when
+/// the post-rejoin sample shows the bulk arrived off the log path (row
+/// drift below the outage's acked count while the log-path applied
+/// delta since the rejoin stays below it too — a pure log catch-up
+/// would advance `applied_transactions` by at least the outage's
+/// count). The outage (75 s floor) outlasts retention plus the offline
+/// pin, so survivors GC the victim's ranges and only a snapshot can
+/// deliver the bulk. Writers keep running throughout (Go parity: no
 /// quiesce); the victim's own restart plus a donor build plus the chunk
 /// transfer can take ~45 s under chaos, and a stale donor winning the
 /// race forces a second cycle, so the proof polls up to
 /// `SNAP_PROOF_TIMEOUT` instead of sampling once at a fixed delay.
-fn observe_snapshot_proof(
-    cluster: &Cluster,
+async fn observe_snapshot_proof(
+    cluster: &Shared,
     victim: usize,
     rep: &Reporter,
     acked_at_stop: u64,
+    nodes: usize,
 ) -> SnapObservation {
     let acked_at_rejoin = rep.succeeded();
     let outage_acked = acked_at_rejoin.saturating_sub(acked_at_stop);
-    let snaps_at_rejoin = snapshots_applied(cluster.node(victim)).unwrap_or(0);
-    let start = std::time::Instant::now();
+    let applied_at_rejoin = applied_count(cluster, victim).await.unwrap_or(0);
+    let start = tokio::time::Instant::now();
     let mut obs = SnapObservation {
         victim,
         outage_acked,
         applied_delta: 0,
         diff_rows: row_diff(
-            &canonical_rows(cluster.node(victim)).unwrap_or_default(),
-            &canonical_rows(cluster.node((victim + 1) % cluster.len())).unwrap_or_default(),
+            &canonical_rows(cluster, victim).await.unwrap_or_default(),
+            &canonical_rows(cluster, (victim + 1) % nodes).await.unwrap_or_default(),
         ),
         rows: 0,
         proven: false,
     };
-    let mut applied_at_apply: Option<u64> = None;
     while start.elapsed() < SNAP_PROOF_TIMEOUT {
-        std::thread::sleep(SNAP_PROOF_POLL);
-        let snaps = snapshots_applied(cluster.node(victim)).unwrap_or(snaps_at_rejoin);
-        if snaps <= snaps_at_rejoin {
-            continue;
-        }
-        let applied_now = applied_count(cluster.node(victim)).unwrap_or(0);
-        let base = *applied_at_apply.get_or_insert(applied_now);
-        let victim_rows = canonical_rows(cluster.node(victim)).unwrap_or_default();
-        let survivor = (victim + 1) % cluster.len();
-        let survivor_rows = canonical_rows(cluster.node(survivor)).unwrap_or_default();
+        tokio::time::sleep(SNAP_PROOF_POLL).await;
+        let applied_now = applied_count(cluster, victim).await.unwrap_or(applied_at_rejoin);
+        let victim_rows = canonical_rows(cluster, victim).await.unwrap_or_default();
+        let survivor = (victim + 1) % nodes;
+        let survivor_rows = canonical_rows(cluster, survivor).await.unwrap_or_default();
         obs.diff_rows = row_diff(&victim_rows, &survivor_rows);
         obs.rows = survivor_rows.len();
-        obs.applied_delta = applied_now.saturating_sub(base);
+        obs.applied_delta = applied_now.saturating_sub(applied_at_rejoin);
         // The snapshot covered the bulk of the outage when neither the
-        // remaining drift nor the post-apply log tail reaches the
+        // remaining drift nor the post-rejoin log tail reaches the
         // outage's acked count.
         obs.proven = outage_acked > 100
             && (obs.diff_rows as u64) < outage_acked
@@ -978,28 +1038,21 @@ fn observe_snapshot_proof(
     obs
 }
 
-/// Tells the verdict which scheduled legs actually fit in the run, so
-/// short dev passes skip legs loudly instead of failing on coverage they
-/// could never have produced (Go: `directorReport`).
+/// Director outcome (Go: snapshot/skew scheduling flags).
 struct DirectorReport {
     snapshots_possible: bool,
     skew_scheduled: bool,
 }
 
-/// Chaos director (Go: `runDirector`): all node lifecycle runs here, on
-/// the test thread. Owns restarts, rotations, snapshot windows, and the
-/// impairment flaps (integrated here rather than on a background thread
-/// because peer add/remove borrows the cluster).
 #[allow(clippy::too_many_arguments)]
-fn run_director(
-    cluster: &mut Cluster,
-    handles: &[Mutex<Database>],
-    alive: &[AtomicBool],
-    rep: &Reporter,
+async fn run_director(
+    cluster: &Shared,
+    alive: &Arc<Vec<AtomicBool>>,
+    rep: &Arc<Reporter>,
     cfg: &Config,
     cur_keys: &mut [[u8; 32]],
-    snap_proofs: &Mutex<Vec<SnapObservation>>,
-) -> DirectorReport {
+    snap_proofs: &mut Vec<SnapObservation>,
+) -> Result<DirectorReport, String> {
     let mut rng = Rng::new(cfg.seed.wrapping_mul(7919).wrapping_add(17));
     let start = Instant::now();
     let deadline = start + cfg.duration;
@@ -1023,13 +1076,13 @@ fn run_director(
     let mut snap_restart_at = Instant::now();
     let mut snap_acked_at_stop: u64 = 0;
 
-    // Clock skew is degraded away: in-process nodes share the test driver
-    // clock, so no node can run under libfaketime. (Go runs one +5min
-    // window on the last node when libfaketime calibrates.)
+    // Clock skew is degraded away: server children share the host clock,
+    // so no node can run under libfaketime. (Go runs one +5min window on
+    // the last node when libfaketime calibrates.)
     let skew_scheduled = false;
 
     // Impairment phases cycle latency -> loss -> both, all implemented as
-    // logical edge flaps (no tc privilege model in-process).
+    // logical edge flaps (no tc privilege model for child processes).
     let phases = ["latency", "loss", "latency+loss"];
     let mut phase = 0usize;
     let mut next_impair = start + IMPAIR_WARMUP;
@@ -1040,7 +1093,7 @@ fn run_director(
             break;
         }
         // Sleep to the next tick, then re-sample time (Go: 1 s ticker).
-        std::thread::sleep(DIRECTOR_TICK);
+        tokio::time::sleep(DIRECTOR_TICK).await;
         let now = Instant::now();
         if now >= deadline {
             break;
@@ -1049,15 +1102,14 @@ fn run_director(
         // Restore an expired impairment flap.
         if let Some((a, b, restore_at)) = impair_active {
             if now >= restore_at {
-                let _ = cluster.add_peer(a, b);
-                let _ = cluster.add_peer(b, a);
+                {
+                    let guard = cluster.lock().await;
+                    let _ = guard.add_peer(a, b).await;
+                    let _ = guard.add_peer(b, a).await;
+                }
                 impair_active = None;
                 rep.count_fault("impair");
-                rep.log(format!(
-                    "impair: edge node{} <-> node{} restored",
-                    a + 1,
-                    b + 1
-                ));
+                rep.log(format!("impair: edge node{} <-> node{} restored", a + 1, b + 1));
                 next_impair = now + cfg.impair_off;
             }
         }
@@ -1065,10 +1117,13 @@ fn run_director(
         if impair_active.is_none() && now >= next_impair {
             let a = rng.below(cfg.nodes);
             let b = (a + 1 + rng.below(cfg.nodes - 1)) % cfg.nodes;
-            let _ = cluster.remove_peer(a, b);
-            let _ = cluster.remove_peer(b, a);
+            {
+                let guard = cluster.lock().await;
+                let _ = guard.remove_peer(a, b).await;
+                let _ = guard.remove_peer(b, a).await;
+            }
             rep.log(format!(
-                "impair: flap {} (logical) node{} <-> node{} for {} (no tc privilege model in-process)",
+                "impair: flap {} (logical) node{} <-> node{} for {} (no tc privilege model for child processes)",
                 phases[phase % phases.len()],
                 a + 1,
                 b + 1,
@@ -1088,29 +1143,37 @@ fn run_director(
                 }
                 idx = rng.below(cfg.nodes);
             }
-            // In-process close()+reopen for every restart: true SIGKILL
-            // vs graceful cannot target one in-process node without
-            // freezing the test driver, so the Go alternating mix has no
-            // effect here.
+            // Alternate graceful and crash restarts (Go parity): the
+            // harness kills real child processes either way.
+            let crash = rng.below(2) == 0;
             rep.log(format!(
-                "restart: node{} going down ({} downtime)",
+                "restart: node{} going down ({} downtime, {})",
                 idx + 1,
-                fmt_dur(cfg.restart_down)
+                fmt_dur(cfg.restart_down),
+                if crash { "crash" } else { "graceful" },
             ));
-            alive[idx].store(false, Ordering::SeqCst);
-            cluster.stop_node(idx);
-            std::thread::sleep(cfg.restart_down);
-            cluster
-                .start_node(idx)
-                .unwrap_or_else(|e| panic!("node{} restart failed: {e}", idx + 1));
-            cluster.mesh().expect("re-mesh after restart");
-            *handles[idx].lock().unwrap() = cluster.node(idx).clone();
-            alive[idx].store(true, Ordering::SeqCst);
+            {
+                let mut guard = cluster.lock().await;
+                alive[idx].store(false, Ordering::SeqCst);
+                if crash {
+                    guard.kill_node(idx).await;
+                } else {
+                    guard.stop_node(idx).await;
+                }
+            }
+            tokio::time::sleep(cfg.restart_down).await;
+            {
+                let mut guard = cluster.lock().await;
+                guard
+                    .start_node(idx)
+                    .await
+                    .map_err(|e| format!("node{} restart failed: {e}", idx + 1))?;
+                guard.mesh().await.map_err(|e| format!("re-mesh after restart: {e}"))?;
+                alive[idx].store(true, Ordering::SeqCst);
+            }
             rep.count_fault("restart");
             rep.log(format!("restart: node{} back", idx + 1));
-            let half_ms = (cfg.restart_every.as_millis() / 2)
-                .min(usize::MAX as u128)
-                .max(1) as usize;
+            let half_ms = (cfg.restart_every.as_millis() / 2).min(usize::MAX as u128).max(1) as usize;
             let jitter = Duration::from_millis(rng.below(half_ms) as u64);
             next_restart = Instant::now() + cfg.restart_every + jitter;
         }
@@ -1128,11 +1191,8 @@ fn run_director(
             match idx {
                 None => rep.log("rotate: skipped, no node available".to_string()),
                 Some(i) => {
-                    if let Err(e) = rotate_node(&mut *cluster, &mut *cur_keys, i, rep) {
-                        rep.log(format!(
-                            "rotate: node{} FAILED: {e} (counted, chaos continues)",
-                            i + 1
-                        ));
+                    if let Err(e) = rotate_node(cluster, cur_keys, i, rep).await {
+                        rep.log(format!("rotate: node{} FAILED: {e} (counted, chaos continues)", i + 1));
                     }
                 }
             }
@@ -1146,27 +1206,30 @@ fn run_director(
                 v + 1,
                 fmt_dur(cfg.snapshot_off),
             ));
-            alive[v].store(false, Ordering::SeqCst);
-            cluster.stop_node(v);
+            {
+                let mut guard = cluster.lock().await;
+                alive[v].store(false, Ordering::SeqCst);
+                guard.stop_node(v).await;
+            }
             snap_victim = Some(v);
             snap_acked_at_stop = rep.succeeded();
             snap_restart_at = Instant::now() + cfg.snapshot_off;
         }
         if let Some(v) = snap_victim {
             if now >= snap_restart_at {
-                cluster
-                    .start_node(v)
-                    .unwrap_or_else(|e| panic!("node{} snapshot rejoin failed: {e}", v + 1));
-                cluster.mesh().expect("re-mesh after snapshot rejoin");
-                *handles[v].lock().unwrap() = cluster.node(v).clone();
-                alive[v].store(true, Ordering::SeqCst);
+                {
+                    let mut guard = cluster.lock().await;
+                    guard
+                        .start_node(v)
+                        .await
+                        .map_err(|e| format!("node{} snapshot rejoin failed: {e}", v + 1))?;
+                    guard.mesh().await.map_err(|e| format!("re-mesh after snapshot rejoin: {e}"))?;
+                    alive[v].store(true, Ordering::SeqCst);
+                }
                 rep.count_fault("snapshot");
-                rep.log(format!(
-                    "snapshot: node{} rejoined, must resync via snapshot",
-                    v + 1
-                ));
-                let obs = observe_snapshot_proof(cluster, v, rep, snap_acked_at_stop);
-                snap_proofs.lock().unwrap().push(obs);
+                rep.log(format!("snapshot: node{} rejoined, must resync via snapshot", v + 1));
+                let obs = observe_snapshot_proof(cluster, v, rep, snap_acked_at_stop, cfg.nodes).await;
+                snap_proofs.push(obs);
                 snap_victim = None;
                 next_snap_stop = Instant::now() + cfg.snapshot_every;
             }
@@ -1176,109 +1239,108 @@ fn run_director(
     // Restore any open impairment flap without counting it (Go: an
     // interrupted cycle returns before the count).
     if let Some((a, b, _)) = impair_active {
-        let _ = cluster.add_peer(a, b);
-        let _ = cluster.add_peer(b, a);
-        rep.log(format!(
-            "impair: edge node{} <-> node{} restored at chaos end (uncounted)",
-            a + 1,
-            b + 1
-        ));
+        let guard = cluster.lock().await;
+        let _ = guard.add_peer(a, b).await;
+        let _ = guard.add_peer(b, a).await;
+        rep.log(format!("impair: edge node{} <-> node{} restored at chaos end (uncounted)", a + 1, b + 1));
     }
-    cluster.mesh().expect("final re-mesh");
+    cluster.lock().await.mesh().await.map_err(|e| format!("final re-mesh: {e}"))?;
 
     // Rejoin anyone still down when the chaos window closes.
     if let Some(v) = snap_victim {
-        cluster
-            .start_node(v)
-            .unwrap_or_else(|e| panic!("node{} end-of-chaos rejoin failed: {e}", v + 1));
-        cluster.mesh().expect("re-mesh after end-of-chaos rejoin");
-        *handles[v].lock().unwrap() = cluster.node(v).clone();
-        alive[v].store(true, Ordering::SeqCst);
+        {
+            let mut guard = cluster.lock().await;
+            guard
+                .start_node(v)
+                .await
+                .map_err(|e| format!("node{} end-of-chaos rejoin failed: {e}", v + 1))?;
+            guard.mesh().await.map_err(|e| format!("re-mesh after end-of-chaos rejoin: {e}"))?;
+            alive[v].store(true, Ordering::SeqCst);
+        }
         rep.count_fault("snapshot");
         rep.log(format!("snapshot: node{} rejoined at chaos end", v + 1));
-        let obs = observe_snapshot_proof(cluster, v, rep, snap_acked_at_stop);
-        snap_proofs.lock().unwrap().push(obs);
+        let obs = observe_snapshot_proof(cluster, v, rep, snap_acked_at_stop, cfg.nodes).await;
+        snap_proofs.push(obs);
     }
-    DirectorReport {
-        snapshots_possible: snap_ok,
-        skew_scheduled,
-    }
+    Ok(DirectorReport { snapshots_possible: snap_ok, skew_scheduled })
 }
 
 /// Online storage-key rotation on one node (Go: `rotateNode`): rotate to
-/// a fresh random key without downtime, then record it for later
-/// restarts (Go rewrites the node config; here the harness stored key).
-fn rotate_node(
-    cluster: &mut Cluster,
+/// a fresh random key without downtime via `MURMUR ROTATE`, then record
+/// it for later restarts (Go rewrites the node config; here the harness
+/// stored key).
+async fn rotate_node(
+    cluster: &Shared,
     cur_keys: &mut [[u8; 32]],
     idx: usize,
     rep: &Reporter,
 ) -> Result<(), String> {
     let new_key = random_key();
     let n = rep.next_rotation();
-    cluster
-        .node(idx)
-        .rotate_master_key(new_key)
-        .map_err(|e| e.to_string())?;
-    // No key IDs exist in the Rust product (Go asserts the active
-    // ApplicationKeyID); staying online plus later restarts on the new key
-    // carry that proof instead.
-    let rows = row_count(cluster.node(idx))
-        .ok_or_else(|| "node unreadable after rotation".to_string())?;
-    cur_keys[idx] = new_key;
-    cluster
-        .set_node_key(idx, new_key)
-        .map_err(|e| e.to_string())?;
+    let rows = {
+        let mut guard = cluster.lock().await;
+        guard
+            .node(idx)
+            .simple(&format!("MURMUR ROTATE KEY '{}' '{}'", hex(&cur_keys[idx]), hex(&new_key)))
+            .await
+            .map_err(|e| format!("rotate failed: {e}"))?;
+        // No key IDs exist in the Rust product (Go asserts the active
+        // ApplicationKeyID); staying online plus later restarts on the new
+        // key carry that proof instead.
+        let rows = guard
+            .node(idx)
+            .query("SELECT COUNT(*) FROM contention", &[])
+            .await
+            .map_err(|_| "node unreadable after rotation".to_string())?;
+        let rows: i64 = rows
+            .first()
+            .and_then(|r| r.try_get(0).ok())
+            .ok_or_else(|| "node unreadable after rotation".to_string())?;
+        cur_keys[idx] = new_key;
+        guard.set_node_key(idx, new_key).map_err(|e| format!("{e}"))?;
+        rows
+    };
     rep.count_fault("rotate");
-    rep.log(format!(
-        "rotate: node{} now on endurance-k{n} ({rows} rows live)",
-        idx + 1
-    ));
+    rep.log(format!("rotate: node{} now on endurance-k{n} ({rows} rows live)", idx + 1));
     Ok(())
 }
 
 /// Restart any node the director left down so the verdict window starts
 /// with a full mesh (Go: `ensureAllUp`).
-fn ensure_all_up(
-    cluster: &mut Cluster,
-    handles: &[Mutex<Database>],
-    alive: &[AtomicBool],
-    rep: &Reporter,
-) {
+async fn ensure_all_up(cluster: &Shared, alive: &[AtomicBool], rep: &Reporter) -> Result<(), String> {
     let mut rejoined = false;
-    for i in 0..cluster.len() {
+    let nodes = alive.len();
+    for i in 0..nodes {
         if alive[i].load(Ordering::SeqCst) {
             continue;
         }
-        rep.log(format!(
-            "cleanup: node{} still down at chaos end, restarting",
-            i + 1
-        ));
+        rep.log(format!("cleanup: node{} still down at chaos end, restarting", i + 1));
         cluster
+            .lock()
+            .await
             .start_node(i)
-            .unwrap_or_else(|e| panic!("node{} cleanup restart failed: {e}", i + 1));
+            .await
+            .map_err(|e| format!("node{} cleanup restart failed: {e}", i + 1))?;
         rejoined = true;
     }
     if rejoined {
-        cluster.mesh().expect("re-mesh after cleanup restarts");
+        cluster.lock().await.mesh().await.map_err(|e| format!("re-mesh after cleanup restarts: {e}"))?;
     }
-    for i in 0..cluster.len() {
-        if !alive[i].load(Ordering::SeqCst) {
-            *handles[i].lock().unwrap() = cluster.node(i).clone();
-            alive[i].store(true, Ordering::SeqCst);
-        }
+    for a in alive.iter() {
+        a.store(true, Ordering::SeqCst);
     }
+    Ok(())
 }
 
 /// Poll until every node holds `want` rows with identical contents (Go:
 /// `waitAgreement`).
-fn wait_agreement(cluster: &Cluster, want: usize, timeout: Duration) -> Result<(), String> {
-    let deadline = Instant::now() + timeout;
+async fn wait_agreement(cluster: &Shared, nodes: usize, want: usize, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let mut ok = true;
         let mut first: Option<Vec<String>> = None;
-        for i in 0..cluster.len() {
-            match canonical_rows(cluster.node(i)) {
+        for i in 0..nodes {
+            match canonical_rows(cluster, i).await {
                 Some(rows) if rows.len() == want => match &first {
                     None => first = Some(rows),
                     Some(f) => {
@@ -1297,26 +1359,20 @@ fn wait_agreement(cluster: &Cluster, want: usize, timeout: Duration) -> Result<(
         if ok {
             return Ok(());
         }
-        if Instant::now() >= deadline {
-            return Err(format!(
-                "row agreement on {want} rows not reached within {timeout:?}"
-            ));
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("row agreement on {want} rows not reached within {timeout:?}"));
         }
-        std::thread::sleep(Duration::from_millis(200));
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
 /// Poll until every node is reachable with equal row counts and identical
 /// digests. Counts are compared to each other, not to a fixed target,
 /// because deletes move the total during chaos (Go: `waitConverged`).
-fn wait_converged(
-    cluster: &Cluster,
-    timeout: Duration,
-) -> (Vec<i64>, Vec<String>, Result<(), String>) {
-    let nodes = cluster.len();
-    let deadline = Instant::now() + timeout;
-    let start = Instant::now();
-    let mut last_sample = Instant::now() - Duration::from_secs(3600);
+async fn wait_converged(cluster: &Shared, nodes: usize, timeout: Duration) -> (Vec<i64>, Vec<String>, Result<(), String>) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let start = tokio::time::Instant::now();
+    let mut last_sample = tokio::time::Instant::now() - Duration::from_secs(3600);
     loop {
         let mut counts = vec![0i64; nodes];
         let mut digests = vec![String::new(); nodes];
@@ -1324,7 +1380,7 @@ fn wait_converged(
         let mut agree = 0usize;
         let mut ok = true;
         for i in 0..nodes {
-            match canonical_rows(cluster.node(i)) {
+            match canonical_rows(cluster, i).await {
                 Some(rows) => {
                     counts[i] = rows.len() as i64;
                     digests[i] = digest_hex(&rows);
@@ -1351,11 +1407,11 @@ fn wait_converged(
         if ok {
             return (counts, digests, Ok(()));
         }
-        if Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
         if last_sample.elapsed() >= Duration::from_secs(15) {
-            last_sample = Instant::now();
+            last_sample = tokio::time::Instant::now();
             let lo = counts.iter().min().copied().unwrap_or(-1);
             let hi = counts.iter().max().copied().unwrap_or(-1);
             eprintln!(
@@ -1364,14 +1420,14 @@ fn wait_converged(
                 hi - lo,
             );
         }
-        std::thread::sleep(VERDICT_POLL);
+        tokio::time::sleep(VERDICT_POLL).await;
     }
     // Final best-effort re-sample for the failure report (Go parity).
     let mut counts = vec![0i64; nodes];
     let mut digests = vec![String::new(); nodes];
     let mut snapshots: Vec<Vec<String>> = Vec::new();
     for i in 0..nodes {
-        match canonical_rows(cluster.node(i)) {
+        match canonical_rows(cluster, i).await {
             Some(rows) => {
                 counts[i] = rows.len() as i64;
                 digests[i] = digest_hex(&rows);
@@ -1396,52 +1452,28 @@ fn wait_converged(
             let b: HashSet<&String> = snapshots[j].iter().collect();
             let only_a: Vec<&&String> = a.difference(&b).take(5).collect();
             let only_b: Vec<&&String> = b.difference(&a).take(5).collect();
-            eprintln!(
-                "[verdict-diff] node1-only({}) sample={only_a:?}",
-                a.difference(&b).count(),
-            );
-            eprintln!(
-                "[verdict-diff] node{}-only({}) sample={only_b:?}",
-                j + 1,
-                b.difference(&a).count(),
-            );
+            eprintln!("[verdict-diff] node1-only({}) sample={only_a:?}", a.difference(&b).count());
+            eprintln!("[verdict-diff] node{}-only({}) sample={only_b:?}", j + 1, b.difference(&b).count());
             break;
         }
     }
-    (
-        counts,
-        digests,
-        Err(format!("nodes did not converge within {timeout:?}")),
-    )
+    (counts, digests, Err(format!("nodes did not converge within {timeout:?}")))
 }
 
 /// True when every node reports a live replication session to every other
 /// node (Go: `connectedPeers == nodes-1` per node off `/v1/status`).
-fn mesh_connected(cluster: &Cluster) -> bool {
-    for i in 0..cluster.len() {
-        let status = match cluster.node(i).replication() {
-            Some(h) => h.status(),
-            None => return false,
-        };
-        for j in 0..cluster.len() {
-            if i == j {
-                continue;
-            }
-            let want = cluster.node_id(j);
-            let connected = status
-                .peers_diagnostics
-                .iter()
-                .any(|d| d.node_id == want && d.connected);
-            if !connected {
-                return false;
-            }
+async fn mesh_connected(cluster: &Shared, nodes: usize) -> bool {
+    for i in 0..nodes {
+        match connected_peers(cluster, i).await {
+            Some(n) if n >= nodes - 1 => {}
+            _ => return false,
         }
     }
     true
 }
 
-#[test]
-fn endurance_chaos() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+async fn endurance_chaos() {
     let cfg = load_config();
     // Deterministic distinct node ids so snapshot trust can be wired up
     // front (the engine only requests snapshots from explicitly trusted
@@ -1460,7 +1492,7 @@ fn endurance_chaos() {
         trusted_snapshot_sources.insert(i, all.clone());
     }
     let initial_key = [9u8; 32];
-    let mut cluster = Cluster::new(ClusterOptions {
+    let cluster = Cluster::new(ClusterOptions {
         name: "endurance-chaos".into(),
         num_nodes: cfg.nodes,
         node_ids,
@@ -1479,406 +1511,334 @@ fn endurance_chaos() {
         trusted_snapshot_sources,
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
+    let runtime_dir = cluster.runtime_dir().clone();
+    let cluster: Shared = Arc::new(AsyncMutex::new(cluster));
 
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let rep = Arc::new(Reporter::new());
-        rep.log(format!(
-            "config: nodes={} duration={} settle={} writeInterval={} maxRows={} seed={}",
-            cfg.nodes,
-            fmt_dur(cfg.duration),
-            fmt_dur(cfg.settle),
-            fmt_dur(cfg.write_interval),
-            cfg.max_rows,
-            cfg.seed,
-        ));
-        rep.log(format!(
-            "fault cadence: restart={} rotate={} snapshot={}/{} impair={}/{} disk={}/{} skew={} (degraded)",
-            fmt_dur(cfg.restart_every),
-            fmt_dur(cfg.rotate_every),
-            fmt_dur(cfg.snapshot_every),
-            fmt_dur(cfg.snapshot_off),
-            fmt_dur(cfg.impair_on),
-            fmt_dur(cfg.impair_off),
-            fmt_dur(cfg.disk_every),
-            fmt_dur(cfg.disk_hold),
-            fmt_dur(cfg.skew_dur),
-        ));
-
-        // Same schema on every node (Go: typed-contention fixture table).
-        for i in 0..cluster.len() {
-            cluster
-                .node(i)
-                .migrate(Migration::new(
-                    "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, score INTEGER NOT NULL)",
-                ))
-                .expect("migrate contention table");
-            cluster.node(i).flush().expect("flush schema");
-        }
-
-        // Baseline: one row everywhere before chaos starts.
-        cluster
-            .node(0)
-            .transaction(|sql| {
-                sql.execute(
-                    "INSERT INTO contention(id, name, phone, score) VALUES(?, ?, ?, ?)",
-                    (format!("{:032x}", 0), "baseline", "baseline", 0i64),
-                )?;
-                Ok(())
-            })
-            .expect("baseline insert");
-        cluster.node(0).flush().expect("flush baseline");
-        wait_agreement(&cluster, 1, BASELINE_TIMEOUT).expect("baseline replication");
-        rep.log(format!(
-            "baseline row converged on all {} nodes",
-            cfg.nodes
-        ));
-
-        // Preflights: detect degraded modes before the long run.
-        rep.log(format!(
-            "network impairment: logical peer flaps (tc/netem latency={}ms loss={}% has no in-process QUIC equivalent)",
-            cfg.impair_latency_ms, cfg.impair_loss_pct,
-        ));
-        rep.log("clock skew: DEGRADED away (in-process nodes share the test driver clock; no daemon for libfaketime)".to_string());
-
-        let mut filler_mb = cfg.disk_mb;
-        if let Some(free) = dir_free_bytes(cluster.runtime_dir()) {
-            // Never risk the host filesystem: filler must leave 1 GiB free.
-            if free.saturating_sub(DISK_HEADROOM_BYTES) < (filler_mb << 20) {
-                let headroom = free.saturating_sub(DISK_HEADROOM_BYTES) >> 20;
-                if headroom < DISK_MIN_MB {
-                    filler_mb = 0;
-                    rep.log(format!(
-                        "disk pressure: DEGRADED away (only {} MiB free)",
-                        free >> 20
-                    ));
-                } else {
-                    filler_mb = headroom;
-                    rep.log(format!(
-                        "disk pressure: filler reduced to {filler_mb} MiB ({} MiB free)",
-                        free >> 20
-                    ));
-                }
-            } else {
-                rep.log(format!(
-                    "disk pressure: {filler_mb} MiB filler ({} MiB free)",
-                    free >> 20
-                ));
-            }
-        } else {
-            rep.log(format!(
-                "disk pressure: {filler_mb} MiB filler (free-space probe unavailable)"
-            ));
-        }
-
-        // Shared chaos state.
-        let mut cur_keys = vec![initial_key; cfg.nodes];
-        let registry = Arc::new(IdRegistry::new());
-        let gc_hist = Arc::new(GcHistory::new(cfg.nodes));
-        let snap_proofs = Mutex::new(Vec::<SnapObservation>::new());
-        let stop = Arc::new(AtomicBool::new(false));
-
-        // Writer threads share a handle table with the director: the entry
-        // for a restarted node is swapped for the reopened database (Go:
-        // writers address daemons by stable address across restarts), and
-        // an alive-set steers targeting away from stopped nodes.
-        let handles: Arc<Vec<Mutex<Database>>> = Arc::new(
-            (0..cfg.nodes)
-                .map(|i| Mutex::new(cluster.node(i).clone()))
-                .collect(),
-        );
-        let alive: Arc<Vec<AtomicBool>> = Arc::new(
-            (0..cfg.nodes)
-                .map(|_| AtomicBool::new(true))
-                .collect(),
-        );
-        let node_dirs: Vec<PathBuf> = (0..cfg.nodes)
-            .map(|i| cluster.node_info(i).dir.clone())
-            .collect();
-
-        let num_writers = cfg.nodes.clamp(2, MAX_WRITERS);
-        let (seed, write_interval, max_rows) = (cfg.seed, cfg.write_interval, cfg.max_rows);
-        let mut writers = Vec::with_capacity(num_writers);
-        for w in 0..num_writers {
-            let (handles, alive, registry, rep, stop) = (
-                handles.clone(),
-                alive.clone(),
-                registry.clone(),
-                rep.clone(),
-                stop.clone(),
-            );
-            writers.push(
-                std::thread::Builder::new()
-                    .name(format!("endurance-writer-{w}"))
-                    .spawn(move || {
-                        writer_loop(
-                            w,
-                            handles,
-                            alive,
-                            registry,
-                            rep,
-                            seed,
-                            write_interval,
-                            max_rows,
-                            stop,
-                        );
-                    })
-                    .expect("spawn writer thread"),
-            );
-        }
-
-        let status_handle = {
-            let (handles, rep, gc_hist, stop) =
-                (handles.clone(), rep.clone(), gc_hist.clone(), stop.clone());
-            let node_dirs = node_dirs.clone();
-            let (status_every, nodes) = (cfg.status_every, cfg.nodes);
-            std::thread::Builder::new()
-                .name("endurance-status".into())
-                .spawn(move || {
-                    status_loop(handles, node_dirs, rep, gc_hist, nodes, status_every, stop);
-                })
-                .expect("spawn status thread")
-        };
-        let disk_handle = if filler_mb > 0 {
-            let (rep, stop) = (rep.clone(), stop.clone());
-            let node_dirs = node_dirs.clone();
-            let (disk_every, disk_hold) = (cfg.disk_every, cfg.disk_hold);
-            Some(
-                std::thread::Builder::new()
-                    .name("endurance-disk".into())
-                    .spawn(move || {
-                        disk_loop(node_dirs, rep, disk_every, disk_hold, filler_mb, stop);
-                    })
-                    .expect("spawn disk thread"),
-            )
-        } else {
-            None
-        };
-
-        // Chaos director (test thread: owns all node lifecycle).
-        rep.phase(
-            "chaos",
-            &format!("all fault injectors live for {}", fmt_dur(cfg.duration)),
-        );
-        let directive = run_director(
-            &mut cluster,
-            &handles,
-            &alive,
-            &rep,
-            &cfg,
-            &mut cur_keys,
-            &snap_proofs,
-        );
-
-        // Faults stop; every node must be up before the verdict window.
-        stop.store(true, Ordering::SeqCst);
-        if let Some(h) = disk_handle {
-            h.join().unwrap_or_else(|_| panic!("disk thread panicked"));
-        }
-        status_handle
-            .join()
-            .unwrap_or_else(|_| panic!("status thread panicked"));
-        ensure_all_up(&mut cluster, &handles, &alive, &rep);
-        rep.log(format!(
-            "writers stopping: attempted={} acked={} transient-errors={} live-ids={}",
-            rep.attempted(),
-            rep.succeeded(),
-            rep.failed(),
-            registry.len(),
-        ));
-        for (w, worker) in writers.into_iter().enumerate() {
-            worker
-                .join()
-                .unwrap_or_else(|_| panic!("writer thread {w} panicked"));
-        }
-
-        let report_path = cluster
-            .runtime_dir()
-            .join(format!("endurance-report-{}.md", unix_now()));
-        if rep.succeeded() == 0 {
-            rep.verdict(false, &report_path, "no writes acked during the entire run");
-            panic!(
-                "endurance verdict: 0 of {} writes acked; see report for distinct errors",
-                rep.attempted()
-            );
-        }
-
-        rep.phase(
-            "verdict",
-            &format!("waiting up to {} for exact convergence", fmt_dur(cfg.settle)),
-        );
-        let (counts, digests, converged) = wait_converged(&cluster, cfg.settle);
-        if let Err(e) = converged {
-            rep.verdict(false, &report_path, &e);
-            panic!("endurance verdict: {e}\ncounts={counts:?}\ndigests={digests:?}");
-        }
-        rep.log(format!(
-            "converged: all {} nodes hold {} rows with digest {}",
-            cfg.nodes, counts[0], digests[0]
-        ));
-
-        // Counter-proven post-checks: every claimed fault must have fired.
-        // GC history (not base/after snapshots): in-memory runs reset on
-        // every restart, so a node revived seconds before the verdict
-        // would falsely fail a snapshot comparison. The sampler observed
-        // throughout the run.
-        for i in 0..cfg.nodes {
-            let (ever, coll_ever, gc_err) = gc_hist.snapshot(i);
-            if !ever {
-                rep.verdict(false, &report_path, &format!("node{} GC never ran", i + 1));
-                panic!("node{} GC never observed running during chaos", i + 1);
-            }
-            if !coll_ever {
-                rep.verdict(
-                    false,
-                    &report_path,
-                    &format!("node{} GC collected nothing", i + 1),
-                );
-                panic!("node{} GC never observed collecting during chaos", i + 1);
-            }
-            if let Some(e) = gc_err {
-                rep.verdict(
-                    false,
-                    &report_path,
-                    &format!("node{} GC failures observed", i + 1),
-                );
-                panic!("node{i} GC failure observed during chaos: {e}", i = i + 1);
-            }
-        }
-        rep.log(format!(
-            "GC proven on all {} nodes (runs/collect observed, GC failures flat)",
-            cfg.nodes
-        ));
-
-        let faults = rep.fault_snapshot();
-        if faults.restarts == 0 {
-            rep.verdict(false, &report_path, "zero restarts executed");
-            panic!("chaos ran zero restarts; restart injector never fired");
-        }
-        if faults.rotations == 0 {
-            rep.verdict(false, &report_path, "zero key rotations executed");
-            panic!("chaos ran zero key rotations; rotation injector never fired");
-        }
-        if faults.impair_cycles == 0 {
-            rep.verdict(false, &report_path, "zero network-impairment cycles executed");
-            panic!("chaos ran zero network-impairment cycles");
-        }
-        if filler_mb > 0 && faults.disk_cycles == 0 {
-            rep.verdict(false, &report_path, "zero disk-pressure cycles executed");
-            panic!("chaos ran zero disk-pressure cycles");
-        }
-        if directive.snapshots_possible {
-            if faults.snapshots == 0 {
-                rep.verdict(false, &report_path, "zero snapshot offline windows executed");
-                panic!("chaos ran zero snapshot offline windows");
-            }
-            let proofs = snap_proofs.lock().unwrap();
-            let proven = proofs.iter().filter(|o| o.proven).count();
-            if proven < 1 {
-                rep.verdict(false, &report_path, "no snapshot resync observed");
-                panic!(
-                    "offline windows ran but no resync proved the snapshot path (log catch-up hid the path?)"
-                );
-            }
-            rep.log(format!(
-                "snapshots proven: {proven} resyncs over {} offline windows",
-                proofs.len()
-            ));
-        } else {
-            rep.log("snapshots: leg skipped (run too short for an offline window)".to_string());
-        }
-        if directive.skew_scheduled && faults.skews == 0 {
-            rep.verdict(false, &report_path, "skew scheduled but never executed");
-            panic!("clock skew was scheduled but the skew window never ran");
-        }
-
-        // Full mesh must be back: every node sees every peer.
-        let meshed = {
-            let deadline = Instant::now() + MESH_TIMEOUT;
-            loop {
-                if mesh_connected(&cluster) {
-                    break true;
-                }
-                if Instant::now() >= deadline {
-                    break false;
-                }
-                std::thread::sleep(VERDICT_POLL);
-            }
-        };
-        if !meshed {
-            let mut detail = Vec::new();
-            for i in 0..cfg.nodes {
-                let n = cluster
-                    .node(i)
-                    .replication()
-                    .map(|h| {
-                        h.status()
-                            .peers_diagnostics
-                            .iter()
-                            .filter(|d| d.connected)
-                            .count()
-                    })
-                    .unwrap_or(0);
-                detail.push(format!("node{}:{n}", i + 1));
-            }
-            rep.verdict(false, &report_path, "mesh not fully reconnected");
-            panic!(
-                "mesh not fully reconnected (connected peers per node: {}), want {}",
-                detail.join(" "),
-                cfg.nodes - 1
-            );
-        }
-
-        // A post-chaos write must traverse the healed mesh.
-        cluster
-            .node(0)
-            .transaction(|sql| {
-                sql.execute(
-                    "INSERT INTO contention(id, name, phone, score) VALUES(?, ?, ?, ?)",
-                    (
-                        format!("{:032x}", 999_999_999u64),
-                        "post-chaos",
-                        "post-chaos",
-                        0i64,
-                    ),
-                )?;
-                Ok(())
-            })
-            .unwrap_or_else(|e| {
-                rep.verdict(false, &report_path, "post-chaos write rejected");
-                panic!("post-chaos write: {e}");
-            });
-        cluster.node(0).flush().expect("flush post-chaos write");
-        if let Err(e) = wait_agreement(&cluster, counts[0] as usize + 1, cfg.settle) {
-            rep.verdict(false, &report_path, "post-chaos write did not converge");
-            panic!("post-chaos convergence: {e}");
-        }
-
-        rep.verdict(
-            true,
-            &report_path,
-            &format!(
-                "all {} nodes hold {} rows digest {} after {} of combined chaos (restarts={} rotations={} impair=flap/{} disk={} snapshots={} skews={})",
-                cfg.nodes,
-                counts[0] + 1,
-                digests[0],
-                fmt_dur(cfg.duration),
-                faults.restarts,
-                faults.rotations,
-                faults.impair_cycles,
-                faults.disk_cycles,
-                faults.snapshots,
-                faults.skews,
-            ),
-        );
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("endurance-verdict");
+    let result = run_body(&cluster, &cfg, &runtime_dir, initial_key).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
-    );
+    // All spawned tasks joined inside run_body, so the only remaining
+    // reference is this one; unwrap for forensics/finish.
+    let cluster = match Arc::try_unwrap(cluster) {
+        Ok(mutex) => mutex.into_inner(),
+        Err(_) => {
+            eprintln!("scenario failed: cluster still shared at teardown");
+            return;
+        }
+    };
+    if failed {
+        cluster.dump_forensics("endurance-verdict").await;
+    }
+    cluster.finish(failed).await;
+    assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }
+
+async fn run_body(cluster: &Shared, cfg: &Config, runtime_dir: &Path, initial_key: [u8; 32]) -> Result<(), String> {
+    let rep = Arc::new(Reporter::new());
+    rep.log(format!(
+        "config: nodes={} duration={} settle={} writeInterval={} maxRows={} seed={}",
+        cfg.nodes,
+        fmt_dur(cfg.duration),
+        fmt_dur(cfg.settle),
+        fmt_dur(cfg.write_interval),
+        cfg.max_rows,
+        cfg.seed,
+    ));
+    rep.log(format!(
+        "fault cadence: restart={} rotate={} snapshot={}/{} impair={}/{} disk={}/{} skew={} (degraded)",
+        fmt_dur(cfg.restart_every),
+        fmt_dur(cfg.rotate_every),
+        fmt_dur(cfg.snapshot_every),
+        fmt_dur(cfg.snapshot_off),
+        fmt_dur(cfg.impair_on),
+        fmt_dur(cfg.impair_off),
+        fmt_dur(cfg.disk_every),
+        fmt_dur(cfg.disk_hold),
+        fmt_dur(cfg.skew_dur),
+    ));
+
+    // Same schema on every node (Go: typed-contention fixture table),
+    // then replicate it: convergence needs the per-table flag on each
+    // node.
+    for i in 0..cfg.nodes {
+        cluster
+            .lock()
+            .await
+            .ensure_migrated(i, "CREATE TABLE contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL, phone TEXT NOT NULL, score INTEGER NOT NULL)")
+            .await
+            .map_err(|e| format!("migrate node{}: {e}", i + 1))?;
+    }
+    for i in 0..cfg.nodes {
+        let guard = cluster.lock().await;
+        guard
+            .node(i)
+            .simple("MURMUR SET TABLE contention REPLICATED true")
+            .await
+            .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
+        guard.node(i).flush().await.map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
+    }
+
+    // Baseline: one row everywhere before chaos starts.
+    {
+        let guard = cluster.lock().await;
+        guard
+            .node(0)
+            .execute(
+                "INSERT INTO contention(id, name, phone, score) VALUES($1, $2, $3, $4)",
+                &[&format!("{:032x}", 0), &"baseline", &"baseline", &0i64],
+            )
+            .await
+            .map_err(|e| format!("baseline insert: {e}"))?;
+        guard.node(0).flush().await.map_err(|e| format!("flush baseline: {e}"))?;
+    }
+    wait_agreement(cluster, cfg.nodes, 1, BASELINE_TIMEOUT).await?;
+    rep.log(format!("baseline row converged on all {} nodes", cfg.nodes));
+
+    // Preflights: detect degraded modes before the long run.
+    rep.log(format!(
+        "network impairment: logical peer flaps (tc/netem latency={}ms loss={}% has no child-process QUIC equivalent)",
+        cfg.impair_latency_ms, cfg.impair_loss_pct,
+    ));
+    rep.log("clock skew: DEGRADED away (server children share the host clock; no daemon for libfaketime)".to_string());
+
+    let mut filler_mb = cfg.disk_mb;
+    let free_probe = {
+        let guard = cluster.lock().await;
+        let dir = guard.runtime_dir().clone();
+        dir_free_bytes(&dir)
+    };
+    if let Some(free) = free_probe {
+        // Never risk the host filesystem: filler must leave 1 GiB free.
+        if free.saturating_sub(DISK_HEADROOM_BYTES) < (filler_mb << 20) {
+            let headroom = free.saturating_sub(DISK_HEADROOM_BYTES) >> 20;
+            if headroom < DISK_MIN_MB {
+                filler_mb = 0;
+                rep.log(format!("disk pressure: DEGRADED away (only {} MiB free)", free >> 20));
+            } else {
+                filler_mb = headroom;
+                rep.log(format!("disk pressure: filler reduced to {filler_mb} MiB ({} MiB free)", free >> 20));
+            }
+        } else {
+            rep.log(format!("disk pressure: {filler_mb} MiB filler ({} MiB free)", free >> 20));
+        }
+    } else {
+        rep.log(format!("disk pressure: {filler_mb} MiB filler (free-space probe unavailable)"));
+    }
+
+    // Shared chaos state.
+    let mut cur_keys = vec![initial_key; cfg.nodes];
+    let registry = Arc::new(IdRegistry::new());
+    let gc_hist = Arc::new(GcHistory::new(cfg.nodes));
+    let mut snap_proofs = Vec::<SnapObservation>::new();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // An alive-set steers writer targeting away from stopped nodes (Go:
+    // writers address daemons by stable address across restarts); every
+    // write re-checks under the cluster lock, so lifecycle and reads
+    // never race.
+    let alive: Arc<Vec<AtomicBool>> =
+        Arc::new((0..cfg.nodes).map(|_| AtomicBool::new(true)).collect());
+    let node_dirs: Vec<PathBuf> = {
+        let guard = cluster.lock().await;
+        (0..cfg.nodes).map(|i| guard.node_info(i).dir.clone()).collect()
+    };
+
+    let num_writers = cfg.nodes.clamp(2, MAX_WRITERS);
+    let mut writers = Vec::with_capacity(num_writers);
+    for w in 0..num_writers {
+        let (cluster, alive, registry, rep, stop) =
+            (cluster.clone(), alive.clone(), registry.clone(), rep.clone(), stop.clone());
+        let (seed, write_interval, max_rows) = (cfg.seed, cfg.write_interval, cfg.max_rows);
+        writers.push(tokio::spawn(async move {
+            writer_loop(w, cluster, alive, registry, rep, seed, write_interval, max_rows, stop).await;
+        }));
+    }
+
+    let status_handle = {
+        let (cluster, rep, gc_hist, stop) =
+            (cluster.clone(), rep.clone(), gc_hist.clone(), stop.clone());
+        let node_dirs = node_dirs.clone();
+        let (status_every, nodes) = (cfg.status_every, cfg.nodes);
+        tokio::spawn(async move {
+            status_loop(cluster, node_dirs, rep, gc_hist, nodes, status_every, stop).await;
+        })
+    };
+    let disk_handle = if filler_mb > 0 {
+        let (rep, stop) = (rep.clone(), stop.clone());
+        let (disk_every, disk_hold) = (cfg.disk_every, cfg.disk_hold);
+        Some(
+            tokio::spawn(async move {
+                disk_loop(node_dirs, rep, disk_every, disk_hold, filler_mb, stop).await;
+            }),
+        )
+    } else {
+        None
+    };
+
+    // Chaos director (test task: owns all node lifecycle).
+    rep.phase("chaos", &format!("all fault injectors live for {}", fmt_dur(cfg.duration)));
+    let directive = run_director(cluster, &alive, &rep, cfg, &mut cur_keys, &mut snap_proofs).await?;
+
+    // Faults stop; every node must be up before the verdict window.
+    stop.store(true, Ordering::SeqCst);
+    if let Some(h) = disk_handle {
+        h.await.map_err(|e| format!("disk task panicked: {e}"))?;
+    }
+    status_handle.await.map_err(|e| format!("status task panicked: {e}"))?;
+    ensure_all_up(cluster, &alive, &rep).await?;
+    rep.log(format!(
+        "writers stopping: attempted={} acked={} transient-errors={} live-ids={}",
+        rep.attempted(),
+        rep.succeeded(),
+        rep.failed(),
+        registry.len(),
+    ));
+    for (w, worker) in writers.into_iter().enumerate() {
+        worker.await.map_err(|e| format!("writer task {w} panicked: {e}"))?;
+    }
+
+    let report_path = runtime_dir.join(format!("endurance-report-{}.md", unix_now()));
+    if rep.succeeded() == 0 {
+        rep.verdict(false, &report_path, "no writes acked during the entire run");
+        return Err(format!(
+            "endurance verdict: 0 of {} writes acked; see report for distinct errors",
+            rep.attempted()
+        ));
+    }
+
+    rep.phase("verdict", &format!("waiting up to {} for exact convergence", fmt_dur(cfg.settle)));
+    let (counts, digests, converged) = wait_converged(cluster, cfg.nodes, cfg.settle).await;
+    if let Err(e) = converged {
+        rep.verdict(false, &report_path, &e);
+        return Err(format!("endurance verdict: {e}\ncounts={counts:?}\ndigests={digests:?}"));
+    }
+    rep.log(format!("converged: all {} nodes hold {} rows with digest {}", cfg.nodes, counts[0], digests[0]));
+
+    // Counter-proven post-checks: every claimed fault must have fired.
+    // GC history (not base/after snapshots): `collected` is durable, so
+    // high-water observations survive restarts; a node revived seconds
+    // before the verdict still carries its proven history.
+    for i in 0..cfg.nodes {
+        let (ever, coll_ever, gc_err) = gc_hist.snapshot(i);
+        if !ever {
+            rep.verdict(false, &report_path, &format!("node{} GC never ran", i + 1));
+            return Err(format!("node{} GC never observed running during chaos", i + 1));
+        }
+        if !coll_ever {
+            rep.verdict(false, &report_path, &format!("node{} GC collected nothing", i + 1));
+            return Err(format!("node{} GC never observed collecting during chaos", i + 1));
+        }
+        if let Some(e) = gc_err {
+            rep.verdict(false, &report_path, &format!("node{} GC failures observed", i + 1));
+            return Err(format!("node{i} GC failure observed during chaos: {e}", i = i + 1));
+        }
+    }
+    rep.log(format!("GC proven on all {} nodes (collection observed advancing, GC failures flat)", cfg.nodes));
+
+    let faults = rep.fault_snapshot();
+    if faults.restarts == 0 {
+        rep.verdict(false, &report_path, "zero restarts executed");
+        return Err("chaos ran zero restarts; restart injector never fired".into());
+    }
+    if faults.rotations == 0 {
+        rep.verdict(false, &report_path, "zero key rotations executed");
+        return Err("chaos ran zero key rotations; rotation injector never fired".into());
+    }
+    if faults.impair_cycles == 0 {
+        rep.verdict(false, &report_path, "zero network-impairment cycles executed");
+        return Err("chaos ran zero network-impairment cycles".into());
+    }
+    if filler_mb > 0 && faults.disk_cycles == 0 {
+        rep.verdict(false, &report_path, "zero disk-pressure cycles executed");
+        return Err("chaos ran zero disk-pressure cycles".into());
+    }
+    if directive.snapshots_possible {
+        if faults.snapshots == 0 {
+            rep.verdict(false, &report_path, "zero snapshot offline windows executed");
+            return Err("chaos ran zero snapshot offline windows".into());
+        }
+        let proven = snap_proofs.iter().filter(|o| o.proven).count();
+        if proven < 1 {
+            rep.verdict(false, &report_path, "no snapshot resync observed");
+            return Err("offline windows ran but no resync proved the snapshot path (log catch-up hid the path?)".into());
+        }
+        rep.log(format!("snapshots proven: {proven} resyncs over {} offline windows", snap_proofs.len()));
+    } else {
+        rep.log("snapshots: leg skipped (run too short for an offline window)".to_string());
+    }
+    if directive.skew_scheduled && faults.skews == 0 {
+        rep.verdict(false, &report_path, "skew scheduled but never executed");
+        return Err("clock skew was scheduled but the skew window never ran".into());
+    }
+
+    // Full mesh must be back: every node sees every peer.
+    let meshed = {
+        let deadline = tokio::time::Instant::now() + MESH_TIMEOUT;
+        loop {
+            if mesh_connected(cluster, cfg.nodes).await {
+                break true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break false;
+            }
+            tokio::time::sleep(VERDICT_POLL).await;
+        }
+    };
+    if !meshed {
+        let mut detail = Vec::new();
+        for i in 0..cfg.nodes {
+            detail.push(format!("node{}:{}", i + 1, connected_peers(cluster, i).await.unwrap_or(0)));
+        }
+        rep.verdict(false, &report_path, "mesh not fully reconnected");
+        return Err(format!(
+            "mesh not fully reconnected (connected peers per node: {}), want {}",
+            detail.join(" "),
+            cfg.nodes - 1
+        ));
+    }
+
+    // A post-chaos write must traverse the healed mesh.
+    {
+        let guard = cluster.lock().await;
+        if let Err(e) = guard
+            .node(0)
+            .execute(
+                "INSERT INTO contention(id, name, phone, score) VALUES($1, $2, $3, $4)",
+                &[&format!("{:032x}", 999_999_999u64), &"post-chaos", &"post-chaos", &0i64],
+            )
+            .await
+        {
+            rep.verdict(false, &report_path, "post-chaos write rejected");
+            return Err(format!("post-chaos write: {e}"));
+        }
+        guard.node(0).flush().await.map_err(|e| format!("flush post-chaos write: {e}"))?;
+    }
+    if let Err(e) = wait_agreement(cluster, cfg.nodes, counts[0] as usize + 1, cfg.settle).await {
+        rep.verdict(false, &report_path, "post-chaos write did not converge");
+        return Err(format!("post-chaos convergence: {e}"));
+    }
+
+    rep.verdict(
+        true,
+        &report_path,
+        &format!(
+            "all {} nodes hold {} rows digest {} after {} of combined chaos (restarts={} rotations={} impair=flap/{} disk={} snapshots={} skews={})",
+            cfg.nodes,
+            counts[0] + 1,
+            digests[0],
+            fmt_dur(cfg.duration),
+            faults.restarts,
+            faults.rotations,
+            faults.impair_cycles,
+            faults.disk_cycles,
+            faults.snapshots,
+            faults.skews,
+        ),
+    );
+    Ok(())
+}
+

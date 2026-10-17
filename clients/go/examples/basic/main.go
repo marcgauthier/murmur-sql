@@ -1,96 +1,59 @@
+// Example basic opens a scratch server, unlocks it, and runs CRUD with
+// parameters over database/sql.
 package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"math"
 
 	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/demo"
+	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
 )
 
-func run(ctx context.Context, e *demo.Env) error {
-	db, err := e.Open("db", demo.Options())
-	if err != nil {
-		return err
-	}
-	if err = db.Migrate(murmur.NewMigration("CREATE TABLE docs(id INTEGER PRIMARY KEY,title TEXT,n INTEGER,r REAL,b BLOB,optional TEXT)")); err != nil {
-		return err
-	}
-	err = db.Transaction(func(s *murmur.Sql) error {
-		stmt, err := s.Prepare("INSERT INTO docs VALUES(?,?,?,?,?,?)")
+func main() {
+	run.Main(func(t servertest.TB, dir string) {
+		ctx := context.Background()
+		server := servertest.Start(t, dir, servertest.Options{})
+		db, err := murmur.Open(ctx, murmur.Config{
+			Host: "127.0.0.1", Port: server.Port,
+			User: "admin", Password: "test-password", Key: "example-key",
+		})
 		if err != nil {
-			return err
+			t.Fatalf("open: %v", err)
 		}
-		defer stmt.Close()
-		result, err := stmt.Exec(1, "Hello\x00Murmur", int64(math.MaxInt64), math.Inf(1), []byte{}, nil)
-		if err == nil {
-			e.Print("Inserted %d row; last row ID %d", result.RowsAffected, result.LastInsertRowID)
+		defer db.Close()
+
+		must := func(err error) {
+			if err != nil {
+				t.Fatalf("%v", err)
+			}
 		}
-		return err
-	})
-	if err != nil {
-		return err
-	}
-	rollback := errors.New("cancel this transaction")
-	err = db.Transaction(func(s *murmur.Sql) error {
-		if _, err := s.Exec("DELETE FROM docs"); err != nil {
-			return err
+		_, err = db.ExecContext(ctx, `CREATE TABLE greetings(
+			id INTEGER PRIMARY KEY, lang TEXT NOT NULL, text TEXT NOT NULL)`)
+		must(err)
+		for id, greeting := range map[int][2]string{
+			1: {"en", "hello"}, 2: {"fr", "bonjour"}, 3: {"es", "hola"},
+		} {
+			_, err = db.ExecContext(ctx,
+				"INSERT INTO greetings VALUES ($1, $2, $3)", id, greeting[0], greeting[1])
+			must(err)
 		}
-		return rollback
-	})
-	if !errors.Is(err, rollback) {
-		return fmt.Errorf("rollback: %w", err)
-	}
-	err = db.Read(func(s *murmur.Sql) error {
-		rows, err := s.Query("SELECT title,n,r,b,optional FROM docs ORDER BY id")
-		if err != nil {
-			return err
-		}
+		rows, err := db.QueryContext(ctx,
+			"SELECT lang, text FROM greetings WHERE id >= $1 ORDER BY id", 1)
+		must(err)
 		defer rows.Close()
-		if !rows.Next() {
-			return fmt.Errorf("missing row: %v", rows.Err())
+		count := 0
+		for rows.Next() {
+			var lang, text string
+			must(rows.Scan(&lang, &text))
+			fmt.Printf("%s: %s\n", lang, text)
+			count++
 		}
-		var title string
-		var n int64
-		var real float64
-		var blob []byte
-		var nullable murmur.Value
-		if err = rows.Scan(&title, &n, &real, &blob, &nullable); err != nil {
-			return err
+		must(rows.Err())
+		if count != 3 {
+			t.Fatalf("got %d rows, want 3", count)
 		}
-		if err = demo.Require(title == "Hello\x00Murmur" && n == math.MaxInt64 && math.IsInf(real, 1) && blob != nil && nullable.Kind == murmur.NullKind, "typed values changed"); err != nil {
-			return err
-		}
-		e.Print("Read int64, infinity, NUL text, empty BLOB, and NULL; rollback preserved the row")
-		return rows.Err()
+		fmt.Println("basic: verified 3 rows")
 	})
-	if err != nil {
-		return err
-	}
-	clone, err := db.Clone()
-	if err != nil {
-		return err
-	}
-	if err = clone.Release(); err != nil {
-		return err
-	}
-	if err = db.Flush(); err != nil {
-		return err
-	}
-	if err = db.Close(); err != nil {
-		return err
-	}
-	reopened, err := e.Open("db", murmur.DefaultOptions())
-	if err != nil {
-		return err
-	}
-	n, err := demo.Int(reopened, "SELECT count(*) FROM docs")
-	if err != nil {
-		return err
-	}
-	e.Print("Reopened durable database: %d row", n)
-	return demo.Require(n == 1, "recovery lost row")
 }
-func main() { demo.Main("basic", run) }

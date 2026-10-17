@@ -46,12 +46,10 @@ nodes, and both clusters must stay internally healthy.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` clusters (QUIC mesh, ephemeral
-  `127.0.0.1:0`) instead of `testnode` daemon processes over
-  HTTPS+mTLS (per design). Cross edges are dialed directly through
-  the replication `Handle::add_peer(SocketAddr)` / `remove_peer(NodeId)`
-  with the peer cluster's bound address, since `Cluster::add_peer`
-  only addresses intra-cluster indices.
+- Real SQL servers (`murmur-server` spawned as child processes, PostgreSQL wire protocol)
+  managed via `murmur-live-sql-harness`. Cross-database peering is configured via
+  `config.toml` bootstrap lists and shared CA certificates. Cross edges are dialed
+  directly through QUIC replication endpoints.
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`,
   `cluster-a-marker` / `cluster-b-marker`) instead of the managed
   typed-records HTTP API (`TypedInsert`, `TypedNames`); canonical

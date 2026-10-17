@@ -1,18 +1,17 @@
 //! Rust port of the Go `flap-partition` live scenario.
 //!
 //! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/flap-partition/`
-//! (`flap_partition_test.go`). Three fully meshed nodes take continuous
-//! writes from all nodes while node3's links flap through split/heal
-//! cycles. The first split carries an isolation proof (a marker written on
-//! node1 must reach node2 but never node3); no write to a live node may
-//! fail, and the final heal must converge every written row with equal
-//! contents. Plain SQL replaces the Go typed-records HTTP API (see the
+//! (`flap_partition_test.go`). Three fully meshed `murmur-server` processes
+//! take continuous writes on every node while node3's links flap through
+//! split/heal cycles. The first split carries an isolation proof (a marker
+//! written on node1 must reach node2 but never node3); no write to a live
+//! node may fail, and the final heal must converge every written row with
+//! equal contents. Plain SQL replaces the Go typed-records HTTP API (see the
 //! scenario README.md).
 
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
-use murmur_live_harness::sqlite_session::{Database, Migration};
 use murmur_live_harness::{env_seconds, Cluster, ClusterOptions};
 
 /// Convergence poll interval (Go: 200 ms).
@@ -43,108 +42,110 @@ const ISOLATION_MARKER_ID: i64 = 90_001_001;
 const ISOLATION_MARKER: &str = "isolation-marker";
 
 /// All record names on one node (Go: `Cluster.TypedNames`).
-fn names(db: &Database) -> Vec<String> {
-    db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT name FROM records")?;
-        let mapped = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for name in mapped {
-            out.push(name?);
-        }
-        Ok(out)
-    })
-    .expect("read record names")
+async fn names(cluster: &Cluster, idx: usize) -> Result<Vec<String>, String> {
+    let rows = cluster
+        .node(idx)
+        .query("SELECT name FROM records", &[])
+        .await
+        .map_err(|e| format!("node{} SELECT names: {e}", idx + 1))?;
+    rows.iter()
+        .map(|row| {
+            row.try_get::<_, String>(0)
+                .map_err(|e| format!("node{} decode name: {e}", idx + 1))
+        })
+        .collect()
 }
 
-/// Ordered name-set equality (Go: `sameNames`; inputs must be sorted).
-fn same_names(a: &[String], b: &[String]) -> bool {
-    a == b
-}
-
-/// Insert one uniquely-named row (Go: `Cluster.TypedInsert`).
-fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) -> Result<(), String> {
-    let value = name.to_string();
+/// Insert one uniquely-named row plus a durability barrier (Go:
+/// `Cluster.TypedInsert` + flush).
+async fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) -> Result<(), String> {
     cluster
         .node(node)
-        .transaction(move |sql| {
-            sql.execute("INSERT INTO records(id, name) VALUES(?, ?)", (id, value))?;
-            Ok(())
-        })
-        .map_err(|e| format!("node{} insert '{name}' failed: {e}", node + 1))?;
+        .execute("INSERT INTO records(id, name) VALUES($1, $2)", &[&id, &name])
+        .await
+        .map_err(|e| format!("node{} insert '{name}': {e}", node + 1))?;
     cluster
         .node(node)
         .flush()
-        .map_err(|e| format!("node{} flush after '{name}' failed: {e}", node + 1))?;
+        .await
+        .map_err(|e| format!("node{} flush after '{name}': {e}", node + 1))?;
     Ok(())
 }
 
 /// Whether one node currently holds `name` (Go: `hasName`).
-fn has_name(cluster: &Cluster, idx: usize, name: &str) -> bool {
-    names(cluster.node(idx)).iter().any(|got| got == name)
+async fn has_name(cluster: &Cluster, idx: usize, name: &str) -> Result<bool, String> {
+    Ok(names(cluster, idx).await?.iter().any(|got| got == name))
 }
 
 /// Isolate (true) or rejoin (false) node index 2 (Go: `setPartition`).
-fn set_partition(cluster: &Cluster, isolate: bool) {
+async fn set_partition(cluster: &Cluster, isolate: bool) -> Result<(), String> {
     for peer in [0, 1] {
         if isolate {
-            cluster.remove_peer(2, peer).unwrap_or_else(|e| {
-                panic!("partition link 2<->{} (isolate=true): {e}", peer + 1)
-            });
-            cluster.remove_peer(peer, 2).unwrap_or_else(|e| {
-                panic!("partition link {}<->2 (isolate=true): {e}", peer + 1)
-            });
+            cluster
+                .remove_peer(2, peer)
+                .await
+                .map_err(|e| format!("partition link 2<->{} (isolate=true): {e}", peer + 1))?;
+            cluster
+                .remove_peer(peer, 2)
+                .await
+                .map_err(|e| format!("partition link {}<->2 (isolate=true): {e}", peer + 1))?;
         } else {
             cluster
                 .add_peer(2, peer)
-                .unwrap_or_else(|e| panic!("partition link 2<->{} (heal): {e}", peer + 1));
+                .await
+                .map_err(|e| format!("partition link 2<->{} (heal): {e}", peer + 1))?;
             cluster
                 .add_peer(peer, 2)
-                .unwrap_or_else(|e| panic!("partition link {}<->2 (heal): {e}", peer + 1));
+                .await
+                .map_err(|e| format!("partition link {}<->2 (heal): {e}", peer + 1))?;
         }
     }
+    Ok(())
 }
 
 /// Write a marker row on node 0 while node 2 is split off and prove the
 /// split is real: node 1 must observe it, node 2 must never observe it
 /// during the whole window (Go: `proveIsolated`). The marker counts in
 /// `written` so the final want stays exact.
-fn prove_isolated(cluster: &Cluster, written: &AtomicI64) {
+async fn prove_isolated(cluster: &Cluster, written: &AtomicI64) -> Result<(), String> {
     insert(cluster, 0, ISOLATION_MARKER_ID, ISOLATION_MARKER)
-        .expect("isolation marker write");
+        .await
+        .map_err(|e| format!("isolation marker write: {e}"))?;
     written.fetch_add(1, Ordering::SeqCst);
     // Node 1 must see the marker: proves cross-node traffic flows on the
     // intact side while we watch node 2 for leaks.
-    let deadline = std::time::Instant::now() + ISOLATION_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + ISOLATION_TIMEOUT;
     loop {
-        if has_name(cluster, 1, ISOLATION_MARKER) {
+        if has_name(cluster, 1, ISOLATION_MARKER).await? {
             break;
         }
-        if has_name(cluster, 2, ISOLATION_MARKER) {
-            panic!("isolation violated: node3 observed the marker while split (remove_peer ineffective?)");
+        if has_name(cluster, 2, ISOLATION_MARKER).await? {
+            return Err("isolation violated: node3 observed the marker while split (remove_peer ineffective?)".into());
         }
-        if std::time::Instant::now() >= deadline {
-            panic!("node2 never observed the isolation marker within {ISOLATION_TIMEOUT:?}");
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("node2 never observed the isolation marker within {ISOLATION_TIMEOUT:?}"));
         }
-        std::thread::sleep(ISOLATION_POLL);
+        tokio::time::sleep(ISOLATION_POLL).await;
     }
     // Node 1 has it; give a leak one more second to show on node 2.
-    std::thread::sleep(LEAK_WINDOW);
-    if has_name(cluster, 2, ISOLATION_MARKER) {
-        panic!("isolation violated: node3 observed the marker while split (remove_peer ineffective?)");
+    tokio::time::sleep(LEAK_WINDOW).await;
+    if has_name(cluster, 2, ISOLATION_MARKER).await? {
+        return Err("isolation violated: node3 observed the marker while split (remove_peer ineffective?)".into());
     }
     eprintln!("isolation proven: marker reached node2, never node3");
+    Ok(())
 }
 
 /// Wait until every node holds exactly `want` rows with equal ordered
 /// contents (Go: `waitConverged`).
-fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) {
-    let deadline = std::time::Instant::now() + timeout;
-    let mut last_log = std::time::Instant::now();
+async fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) -> Result<(), String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_log = tokio::time::Instant::now();
     loop {
         let mut ok = true;
         let mut first: Vec<String> = Vec::new();
         for i in 0..cluster.len() {
-            let mut node_names = names(cluster.node(i));
+            let mut node_names = names(cluster, i).await?;
             if node_names.len() != want {
                 ok = false;
                 break;
@@ -152,33 +153,32 @@ fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) {
             node_names.sort();
             if i == 0 {
                 first = node_names;
-            } else if !same_names(&node_names, &first) {
+            } else if node_names != first {
                 ok = false;
                 break;
             }
         }
         if ok {
-            return;
+            return Ok(());
         }
-        if std::time::Instant::now() >= deadline {
+        if tokio::time::Instant::now() >= deadline {
             break;
         }
         if last_log.elapsed() > PROGRESS_LOG_INTERVAL {
-            last_log = std::time::Instant::now();
-            let counts: Vec<usize> =
-                (0..cluster.len()).map(|i| names(cluster.node(i)).len()).collect();
+            last_log = tokio::time::Instant::now();
+            let mut counts = Vec::new();
+            for i in 0..cluster.len() {
+                counts.push(names(cluster, i).await?.len());
+            }
             eprintln!("converge progress: counts={counts:?} want={want}");
         }
-        std::thread::sleep(POLL_INTERVAL);
+        tokio::time::sleep(POLL_INTERVAL).await;
     }
     for i in 0..cluster.len() {
-        eprintln!(
-            "node{} at timeout: count={}",
-            i + 1,
-            names(cluster.node(i)).len()
-        );
+        let count = names(cluster, i).await?.len();
+        eprintln!("node{} at timeout: count={count}", i + 1);
     }
-    panic!("nodes did not converge on {want} rows with equal contents within {timeout:?}");
+    Err(format!("nodes did not converge on {want} rows with equal contents within {timeout:?}"))
 }
 
 /// Positive-integer env knob with fallback (Go: `envInt`).
@@ -190,21 +190,133 @@ fn env_int(name: &str, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
-/// Stops the writer threads when a flap-cycle assertion unwinds, so a
-/// failed proof cannot deadlock the thread scope waiting for writers that
-/// never observe the stop flag (idempotent on the success path).
-struct StopOnDrop<'a> {
-    stop: &'a AtomicBool,
-}
-
-impl Drop for StopOnDrop<'_> {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+/// One continuous writer: inserts on `node` every [`WRITE_INTERVAL`] until
+/// `stop` is set. Runs as a borrowed future inside `tokio::join!` (no
+/// `'static` spawn), so it always observes the stop flag.
+async fn writer(
+    cluster: &Cluster,
+    node: usize,
+    written: &AtomicI64,
+    failed: &AtomicI64,
+    stop: &AtomicBool,
+) {
+    let mut seq: i64 = 0;
+    while !stop.load(Ordering::SeqCst) {
+        tokio::time::sleep(WRITE_INTERVAL).await;
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        seq += 1;
+        let name = format!("n{node}-s{seq}");
+        match insert(cluster, node, node as i64 * ID_STRIDE + seq, &name).await {
+            Ok(()) => {
+                written.fetch_add(1, Ordering::SeqCst);
+            }
+            Err(e) => {
+                eprintln!("writer node{} failed: {e}", node + 1);
+                failed.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 }
 
-#[test]
-fn flapping_partition_loses_no_writes() {
+async fn run_body(
+    cluster: &Cluster,
+    cycles: usize,
+    split: Duration,
+    heal_gap: Duration,
+) -> Result<(), String> {
+    for i in 0..cluster.len() {
+        let info = cluster.node_info(i);
+        eprintln!("{} dir={} sql={} repl={}", info.label, info.dir.display(), info.sql_addr, info.repl_addr);
+    }
+    // Same schema on every node (Go: TypedRecords fixture tables), then
+    // replicate it: row convergence needs the per-table flag on each node.
+    for i in 0..cluster.len() {
+        cluster
+            .ensure_migrated(i, "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .map_err(|e| format!("migrate node{}: {e}", i + 1))?;
+    }
+    for i in 0..cluster.len() {
+        cluster
+            .node(i)
+            .simple("MURMUR SET TABLE records REPLICATED true")
+            .await
+            .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
+        cluster
+            .node(i)
+            .flush()
+            .await
+            .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
+    }
+
+    // Baseline converges before flapping (honest-path control).
+    for i in 0..BASELINE_ROWS {
+        insert(cluster, 0, BASELINE_ID_BASE + i, &format!("base-{i}"))
+            .await
+            .map_err(|e| format!("baseline write: {e}"))?;
+    }
+    wait_converged(cluster, BASELINE_ROWS as usize, CONVERGE_TIMEOUT).await?;
+
+    // Continuous writers on every node; node3 stays live (running, only
+    // unreachable), so its local commits must succeed too. The driver sets
+    // `stop` on every exit path so a failed phase cannot hang the join.
+    let written = AtomicI64::new(0);
+    let failed = AtomicI64::new(0);
+    let stop = AtomicBool::new(false);
+    let driver = async {
+        let result = async {
+            for c in 0..cycles {
+                set_partition(cluster, true).await?;
+                eprintln!("cycle {}/{}: node3 isolated for {split:?}", c + 1, cycles);
+                if c == 0 {
+                    // Isolation proof (F1): while split, a marker written on
+                    // node0 must reach node1 but never node2. Without this,
+                    // a no-op remove_peer would pass vacuously. The marker is
+                    // counted in written so the final want stays exact.
+                    prove_isolated(cluster, &written).await?;
+                }
+                tokio::time::sleep(split).await;
+                set_partition(cluster, false).await?;
+                eprintln!("cycle {}/{}: healed, settling {heal_gap:?}", c + 1, cycles);
+                tokio::time::sleep(heal_gap).await;
+            }
+            Ok::<(), String>(())
+        }
+        .await;
+        stop.store(true, Ordering::SeqCst);
+        result
+    };
+    let (_, _, _, driver_result) = tokio::join!(
+        writer(cluster, 0, &written, &failed, &stop),
+        writer(cluster, 1, &written, &failed, &stop),
+        writer(cluster, 2, &written, &failed, &stop),
+        driver,
+    );
+    driver_result?;
+
+    // Final heal (idempotent) then full convergence on everything written.
+    set_partition(cluster, false).await?;
+    cluster.sync_all().await.map_err(|e| format!("final sync: {e}"))?;
+    let want = (BASELINE_ROWS + written.load(Ordering::SeqCst)) as usize;
+    eprintln!(
+        "flapping done: {cycles} cycles, {want} rows written, {} failed",
+        failed.load(Ordering::SeqCst)
+    );
+    if failed.load(Ordering::SeqCst) != 0 {
+        return Err(format!(
+            "partition failed {} writes to live nodes, want 0",
+            failed.load(Ordering::SeqCst)
+        ));
+    }
+    wait_converged(cluster, want, CONVERGE_TIMEOUT).await?;
+    eprintln!("post-flap convergence: {want} rows, identical digests");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn flapping_partition_loses_no_writes() {
     let cycles = env_int("MURMUR_FLAP_CYCLES", 5) as usize;
     let split = env_seconds("MURMUR_FLAP_SPLIT_SECONDS", 3);
     let heal_gap = env_seconds("MURMUR_FLAP_HEAL_SECONDS", 2);
@@ -214,114 +326,17 @@ fn flapping_partition_loses_no_writes() {
         num_nodes: 3,
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Share explicit `&` bindings: the writer threads below are `move`
-        // closures, which would otherwise take the owned values.
-        let cluster = &cluster;
-        for i in 0..cluster.len() {
-            let info = cluster.node_info(i);
-            eprintln!(
-                "{} dir={} repl={}",
-                info.label,
-                info.dir.display(),
-                info.repl_addr
-            );
-        }
-        // Same schema on every node (Go: TypedRecords fixture tables).
-        for i in 0..cluster.len() {
-            cluster
-                .node(i)
-                .migrate(Migration::new(
-                    "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-                ))
-                .expect("migrate records table");
-            cluster.node(i).flush().expect("flush schema");
-        }
-
-        // Baseline converges before flapping (honest-path control).
-        for i in 0..BASELINE_ROWS {
-            insert(cluster, 0, BASELINE_ID_BASE + i, &format!("base-{i}"))
-                .expect("baseline write");
-        }
-        wait_converged(cluster, BASELINE_ROWS as usize, CONVERGE_TIMEOUT);
-
-        // Continuous writers on every node; node3 stays live (running,
-        // only unreachable), so its local commits must succeed too.
-        let written = AtomicI64::new(0);
-        let failed = AtomicI64::new(0);
-        let stop = AtomicBool::new(false);
-        let written = &written;
-        let failed = &failed;
-        let stop = &stop;
-
-        std::thread::scope(|s| {
-            for node in 0..cluster.len() {
-                s.spawn(move || {
-                    let mut seq: i64 = 0;
-                    while !stop.load(Ordering::SeqCst) {
-                        std::thread::sleep(WRITE_INTERVAL);
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        seq += 1;
-                        let name = format!("n{node}-s{seq}");
-                        match insert(cluster, node, node as i64 * ID_STRIDE + seq, &name) {
-                            Ok(()) => {
-                                written.fetch_add(1, Ordering::SeqCst);
-                            }
-                            Err(_) => {
-                                failed.fetch_add(1, Ordering::SeqCst);
-                            }
-                        }
-                    }
-                });
-            }
-            // Unwind guard: a failed phase assertion must still release the
-            // writers so the scope can join them.
-            let _stop_guard = StopOnDrop { stop };
-
-            // Flap node3's partition: split from both peers, hold, heal, settle.
-            for c in 0..cycles {
-                set_partition(cluster, true);
-                eprintln!("cycle {}/{}: node3 isolated for {split:?}", c + 1, cycles);
-                if c == 0 {
-                    // Isolation proof (F1): while split, a marker written on
-                    // node0 must reach node1 but never node2. Without this,
-                    // a no-op remove_peer would pass vacuously. The marker is
-                    // counted in written so the final want stays exact.
-                    prove_isolated(cluster, written);
-                }
-                std::thread::sleep(split);
-                set_partition(cluster, false);
-                eprintln!("cycle {}/{}: healed, settling {heal_gap:?}", c + 1, cycles);
-                std::thread::sleep(heal_gap);
-            }
-            stop.store(true, Ordering::SeqCst);
-        });
-
-        // Final heal (idempotent) then full convergence on everything written.
-        set_partition(cluster, false);
-        let want = (BASELINE_ROWS + written.load(Ordering::SeqCst)) as usize;
-        eprintln!(
-            "flapping done: {cycles} cycles, {want} rows written, {} failed",
-            failed.load(Ordering::SeqCst)
-        );
-        assert!(
-            failed.load(Ordering::SeqCst) == 0,
-            "partition failed {} writes to live nodes, want 0",
-            failed.load(Ordering::SeqCst)
-        );
-        wait_converged(cluster, want, CONVERGE_TIMEOUT);
-        eprintln!("post-flap convergence: {want} rows, identical digests");
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("flap-partition-no-convergence");
+    assert_eq!(cluster.len(), 3, "this scenario is written for 3 nodes");
+    let result = run_body(&cluster, cycles, split, heal_gap).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
-    );
+    if failed {
+        cluster.dump_forensics("flap-partition-no-convergence").await;
+    }
+    cluster.finish(failed).await;
+    assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }

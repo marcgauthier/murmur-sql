@@ -29,23 +29,30 @@ per-row visibility latencies are recorded with relaxed p95 bounds.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster instead of daemon processes; plain
-  SQL replaces the typed-contention HTTP API
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS (per
+  design); plain SQL replaces the typed-contention HTTP API
   (`contention(id, name)`); ordered-vec equality replaces the digest.
-- Go subtests become sequential phases in one `#[test]` (same
+  The table is explicitly flagged replicated on each node.
+- Go subtests become sequential phases in one async test (same
   assertions, same order).
-- Membership assertions use `status().members` (excluding self, so want
-  is 2; established `swim-discovery` port pattern); the alive-count
-  check has no Rust equivalent (evictions still fail the member view).
-- GC passes run on demand (`collect_retention` in the poll loop) instead
-  of waiting for the background tick (established `graceful-shutdown`
-  port pattern).
+- Membership assertions use the `members` column of
+  `MURMUR SHOW REPLICATION` (excluding self, so want is 2); the
+  alive-count check has no Rust equivalent (evictions still fail the
+  member view).
+- GC passes run on demand (`MURMUR RETENTION COLLECT` in the poll loop,
+  observed via the `last_collection_millis` marker of
+  `MURMUR SHOW RETENTION`) instead of waiting for the background tick.
 - The snapshot-path proof uses the flat post-restart log-counter pair
-  (established `snapshot-resync` port pattern).
+  (`staged_transactions`, `applied_transactions` from
+  `MURMUR SHOW REPLICATION`).
+- The stale-node restart rebinds a fresh replication port, so the tbf
+  filters are re-steered after the restart (otherwise the rejoining
+  node's new port would bypass the cap).
 
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/impaired-network/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/impaired-network/Cargo.toml
 ```

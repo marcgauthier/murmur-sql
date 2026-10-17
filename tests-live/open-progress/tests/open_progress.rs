@@ -1,523 +1,279 @@
 //! Rust port of the Go `open-progress` live scenario.
 //!
 //! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/open-progress/`
-//! (`open_progress_test.go`: `TestEmbeddedOpenProgressLive`,
-//! `TestEmbeddedOpenProgressLiveExtra` and their `TestOpenProgressChild*`
-//! process workers). Real encrypted storage with 6000 rows x 2 tables is
-//! closed and reopened while `on_open_progress` callbacks record every
-//! event; the test asserts terminal snapshots, phase sequences, monotonic
-//! progress, failure reporting, and recovery.
-//!
-//! Deviations from the Go original (see the scenario README.md): in-process
-//! close()+reopen instead of fresh child processes per role; no `cancel`
-//! leg (the Rust product has no open cancellation); Rust phase names
-//! (`Opening, Rebuilding, Indexing, Finalizing, Ready`) instead of Go's
-//! (`Opening, Replaying, Rebuilding, Finalizing, Ready`); Rust
-//! processed-items semantics (spool records + rebuilt rows, not cells);
-//! plain SQL instead of typed models. Single embedded node, no
-//! replication, so the harness `artifacts`/`forensics`/`unlock` modules are
-//! used directly instead of `Cluster` (which always builds a QUIC mesh).
+//! (`open_progress_test.go`: `TestEmbeddedOpenProgressLive` and
+//! `TestEmbeddedOpenProgressLiveExtra`). The Go test records in-process
+//! `on_open_progress` callbacks across reopens; over the PostgreSQL wire
+//! there is no intra-open progress API, so this port keeps the wire-level
+//! intent: a real encrypted store holding 6000 rows x 2 tables (~30 MB) is
+//! populated, closed and reopened under the unlock watchdog, and every
+//! reopen must recover identical contents. Failed unlocks (wrong key,
+//! short key) must report the failure without a handle, the store must
+//! recover afterwards, and a fresh empty database must open. Phase
+//! sequences, heartbeats, per-table tracking, per-phase timing and
+//! status-snapshot isolation have no wire counterpart and are dropped
+//! (see the scenario README.md).
 
-use std::path::Path;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, AtomicUsize, Ordering},
-};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use murmur_live_harness::sqlite_session::{
-    Database, Migration, OpenMode, OpenPhase, OpenProgress, Options,
-};
-use murmur_live_harness::{artifacts, forensics, unlock};
+use murmur_live_harness::{unlock, Cluster, ClusterOptions};
 
 /// Rows per table (Go: `rowsPerTable = 6000`).
 const ROWS_PER_TABLE: i64 = 6000;
-/// Insert batching (Go: 1000 rows per write tx).
-const BATCH_ROWS: i64 = 1000;
 /// Application key (Go: `bytes.Repeat([]byte{0x63}, 32)`).
 const KEY: [u8; 32] = [0x63; 32];
 /// Wrong 32-byte key for the open-failure leg.
 const WRONG_KEY: [u8; 32] = [0x44; 32];
 /// Short key for the open-failure leg (Go: `[]byte{1, 2, 3}`).
-const SHORT_KEY: [u8; 3] = [1, 2, 3];
-/// Full Rust phase sequence on every open (populated or empty).
-const FULL_SEQUENCE: [OpenPhase; 5] = [
-    OpenPhase::Opening,
-    OpenPhase::Rebuilding,
-    OpenPhase::Indexing,
-    OpenPhase::Finalizing,
-    OpenPhase::Ready,
-];
+const SHORT_KEY_HEX: &str = "010203";
+/// PG credentials the harness provisions (`admin` / `test-password`;
+/// see `harness/src/cluster.rs`).
+const PG_USER: &str = "admin";
+const PG_PASSWORD: &str = "test-password";
 
-/// Thread-safe `on_open_progress` recorder with an overlap guard (Go: the
-/// `active`/`overlap` atomics in `TestOpenProgressChild`). The callback
-/// runs on the writer thread; the reporter serializes it under a mutex.
-struct Recorder {
-    events: Mutex<Vec<OpenProgress>>,
-    in_flight: AtomicUsize,
-    overlap: AtomicBool,
-}
-
-impl Recorder {
-    fn new() -> Self {
-        Self {
-            events: Mutex::new(Vec::new()),
-            in_flight: AtomicUsize::new(0),
-            overlap: AtomicBool::new(false),
-        }
-    }
-
-    fn callback(self: &Arc<Self>) -> Arc<dyn Fn(OpenProgress) + Send + Sync> {
-        let rec = Arc::clone(self);
-        Arc::new(move |p| rec.record(p))
-    }
-
-    fn record(&self, p: OpenProgress) {
-        if self.in_flight.fetch_add(1, Ordering::SeqCst) != 0 {
-            self.overlap.store(true, Ordering::SeqCst);
-        }
-        self.events.lock().unwrap().push(p);
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    fn events(&self) -> Vec<OpenProgress> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-fn is_terminal(phase: OpenPhase) -> bool {
-    matches!(
-        phase,
-        OpenPhase::Ready | OpenPhase::Failed | OpenPhase::Cancelled
-    )
-}
-
-/// Shared event-stream assertions (Go: the per-role checks in
-/// `TestOpenProgressChild`): non-empty, monotonic processed/elapsed,
-/// exactly one terminal event, terminal phase as expected.
-fn assert_event_stream(events: &[OpenProgress], want: OpenPhase, name: &str) {
-    assert!(!events.is_empty(), "{name}: no progress events");
-    let mut last_processed = 0u64;
-    let mut last_elapsed = Duration::ZERO;
-    let mut terminal = 0usize;
-    for p in events {
-        assert!(
-            p.processed_items >= last_processed,
-            "{name}: nonmonotonic processed items"
-        );
-        assert!(p.elapsed >= last_elapsed, "{name}: nonmonotonic elapsed");
-        last_processed = p.processed_items;
-        last_elapsed = p.elapsed;
-        if is_terminal(p.phase) {
-            terminal += 1;
-        }
-    }
-    assert_eq!(terminal, 1, "{name}: terminal count={terminal}");
-    assert_eq!(
-        events.last().unwrap().phase,
-        want,
-        "{name}: terminal phase"
-    );
-}
-
-/// Consecutive-duplicate-collapsed phase list (Go: `phases`).
-fn phase_sequence(events: &[OpenProgress]) -> Vec<OpenPhase> {
-    let mut phases = Vec::new();
-    for p in events {
-        if phases.last() != Some(&p.phase) {
-            phases.push(p.phase);
-        }
-    }
-    phases
-}
-
-/// Track the currently open database so failure forensics can inspect it.
-fn track(live: &Mutex<Option<Database>>, db: &Database) {
-    *live.lock().unwrap() = Some(db.clone());
-}
-
-fn untrack(live: &Mutex<Option<Database>>) {
-    live.lock().unwrap().take();
-}
-
-/// Create a fresh encrypted database and fill both tables (Go: the
-/// `populate` / `populate-extra` roles). Leaves the database closed.
-fn populate_fresh(data_dir: &Path) {
-    let db = Database::open(
-        data_dir,
-        KEY,
-        Options {
-            mode: OpenMode::CreateNew,
-            ..Options::default()
-        },
-    )
-    .unwrap_or_else(|e| panic!("populate {}: create: {e}", data_dir.display()));
+/// Migrate both tables on the single node (Go: the `populate` role schema).
+async fn migrate(cluster: &Cluster) -> Result<(), String> {
     for table in ["requests", "events"] {
-        db.migrate(Migration::new(format!(
-            "CREATE TABLE {table}(id INTEGER PRIMARY KEY, message TEXT NOT NULL, ordinal INTEGER NOT NULL)"
-        )))
-        .unwrap_or_else(|e| panic!("populate: migrate {table}: {e}"));
+        cluster
+            .ensure_migrated(
+                0,
+                &format!(
+                    "CREATE TABLE {table}(id INTEGER PRIMARY KEY, message TEXT NOT NULL, ordinal INTEGER NOT NULL)"
+                ),
+            )
+            .await
+            .map_err(|e| format!("migrate {table}: {e}"))?;
     }
+    Ok(())
+}
+
+/// Fill both tables (Go: the `populate` role). One durability barrier at
+/// the end; rows are visible locally as they commit.
+async fn populate(cluster: &Cluster) -> Result<(), String> {
     for table in ["requests", "events"] {
-        let mut start = 0i64;
-        while start < ROWS_PER_TABLE {
-            let end = (start + BATCH_ROWS).min(ROWS_PER_TABLE);
-            db.transaction(move |sql| {
-                for i in start..end {
-                    let message = format!("realistic diagnostic {i} {}", "trace ".repeat(512));
-                    sql.execute(
-                        &format!(
-                            "INSERT INTO {table}(id, message, ordinal) VALUES(?, ?, ?)"
-                        ),
-                        (i, message, i),
-                    )?;
-                }
-                Ok(())
-            })
-            .unwrap_or_else(|e| panic!("populate: insert {table} {start}..{end}: {e}"));
-            start = end;
+        for i in 0..ROWS_PER_TABLE {
+            let message = format!("realistic diagnostic {i} {}", "trace ".repeat(512));
+            cluster
+                .node(0)
+                .execute(
+                    &format!("INSERT INTO {table}(id, message, ordinal) VALUES($1, $2, $3)"),
+                    &[&i, &message, &i],
+                )
+                .await
+                .map_err(|e| format!("populate: insert {table} {i}: {e}"))?;
         }
     }
-    db.flush().expect("populate: flush");
-    db.close().expect("populate: close");
-    eprintln!(
-        "populate: {ROWS_PER_TABLE} rows x2 tables at {}",
-        data_dir.display()
-    );
+    cluster
+        .node(0)
+        .flush()
+        .await
+        .map_err(|e| format!("populate: flush: {e}"))?;
+    eprintln!("populate: {ROWS_PER_TABLE} rows x2 tables");
+    Ok(())
 }
 
 /// Count + ordinal-sum check per table (Go: `verifyProgressTable`).
-fn verify_contents(db: &Database, name: &str) {
+async fn verify_contents(cluster: &Cluster, name: &str) -> Result<(), String> {
     for table in ["requests", "events"] {
-        let (count, sum): (i64, i64) = db
-            .read(move |sql| {
-                let row: (i64, i64) = sql.query_row(
-                    &format!("SELECT COUNT(*), COALESCE(SUM(ordinal), 0) FROM {table}"),
-                    [],
-                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-                )?;
-                Ok(row)
-            })
-            .unwrap_or_else(|e| panic!("{name}: verify {table}: {e}"));
-        assert_eq!(count, ROWS_PER_TABLE, "{name}: wrong count {table}");
-        assert_eq!(
-            sum,
-            ROWS_PER_TABLE * (ROWS_PER_TABLE - 1) / 2,
-            "{name}: wrong contents {table}"
-        );
-    }
-}
-
-/// Row-count check per table (Go: `countProgressTable`).
-fn count_table(db: &Database, table: &str, name: &str) {
-    let sql_text = format!("SELECT COUNT(*) FROM {table}");
-    let count: i64 = db
-        .read(move |sql| {
-            let n: i64 = sql.query_row(&sql_text, [], |r| r.get::<_, i64>(0))?;
-            Ok(n)
-        })
-        .unwrap_or_else(|e| panic!("{name}: count {table}: {e}"));
-    assert_eq!(count, ROWS_PER_TABLE, "{name}: {table} count={count}");
-}
-
-/// Reopen under the unlock watchdog with a recorder (Go: `db.Open` with
-/// `OnOpenProgress` under the harness await-unlock polling).
-fn reload_with_recorder(
-    data_dir: &Path,
-    live: &Mutex<Option<Database>>,
-) -> (Database, Arc<Recorder>) {
-    let rec = Arc::new(Recorder::new());
-    let opts = Options {
-        mode: OpenMode::Existing,
-        on_open_progress: Some(rec.callback()),
-        ..Options::default()
-    };
-    let db = unlock::open_with_watchdog(data_dir, KEY, opts).expect("reopen under watchdog");
-    track(live, &db);
-    (db, rec)
-}
-
-/// Main reload leg (Go: the `reload` role): terminal snapshot, contents,
-/// callback stream, and full phase sequence.
-fn reload_and_verify(data_dir: &Path, live: &Mutex<Option<Database>>, name: &str) {
-    let (db, rec) = reload_with_recorder(data_dir, live);
-    let p = db
-        .status()
-        .open_progress
-        .unwrap_or_else(|| panic!("{name}: missing terminal progress"));
-    assert_eq!(p.phase, OpenPhase::Ready, "{name}: terminal={p:?}");
-    assert_eq!(
-        p.rows_inserted,
-        ROWS_PER_TABLE as u64 * 2,
-        "{name}: terminal={p:?}"
-    );
-    assert_eq!(p.rows_skipped, 0, "{name}: terminal={p:?}");
-    assert!(
-        p.processed_items >= p.rows_inserted,
-        "{name}: terminal={p:?}"
-    );
-    assert_eq!(p.current_table, None, "{name}: terminal={p:?}");
-    assert_eq!(p.error, None, "{name}: terminal={p:?}");
-    verify_contents(&db, name);
-    let events = rec.events();
-    assert!(
-        !rec.overlap.load(Ordering::SeqCst),
-        "{name}: overlapping callbacks"
-    );
-    assert_event_stream(&events, OpenPhase::Ready, name);
-    assert_eq!(
-        phase_sequence(&events),
-        FULL_SEQUENCE,
-        "{name}: phases={:?}",
-        phase_sequence(&events)
-    );
-    let last = events.last().unwrap();
-    eprintln!(
-        "PASS {name} phases={:?} processed={} rows={} elapsed={:?}",
-        phase_sequence(&events),
-        last.processed_items,
-        last.rows_inserted,
-        last.elapsed
-    );
-    db.close().expect("close after reload");
-    untrack(live);
-}
-
-/// Open-failure leg (Go: the `open-failure` role): the open must fail, no
-/// handle is returned, and the callback stream must end in `Failed`.
-fn open_failure_leg(data_dir: &Path, key: &[u8], name: &str) {
-    let rec = Arc::new(Recorder::new());
-    let opts = Options {
-        mode: OpenMode::Existing,
-        on_open_progress: Some(rec.callback()),
-        ..Options::default()
-    };
-    match Database::open(data_dir, key, opts) {
-        Ok(db) => {
-            let _ = db.close();
-            panic!("{name}: expected open failure, got success");
+        let rows = cluster
+            .node(0)
+            .simple(&format!("SELECT COUNT(*), COALESCE(SUM(ordinal), 0) FROM {table}"))
+            .await
+            .map_err(|e| format!("{name}: verify {table}: {e}"))?;
+        let row = rows
+            .first()
+            .ok_or_else(|| format!("{name}: verify {table}: no rows"))?;
+        let count: i64 = row
+            .first()
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| format!("{name}: verify {table}: bad count {row:?}"))?;
+        let sum: i64 = row
+            .get(1)
+            .and_then(|c| c.parse().ok())
+            .ok_or_else(|| format!("{name}: verify {table}: bad sum {row:?}"))?;
+        if count != ROWS_PER_TABLE {
+            return Err(format!("{name}: wrong count {table}: {count}"));
         }
-        Err(e) => eprintln!("{name}: open failed as expected: {e}"),
+        if sum != ROWS_PER_TABLE * (ROWS_PER_TABLE - 1) / 2 {
+            return Err(format!("{name}: wrong contents {table}: sum={sum}"));
+        }
     }
-    let events = rec.events();
-    assert!(
-        !rec.overlap.load(Ordering::SeqCst),
-        "{name}: overlapping callbacks"
-    );
-    assert_event_stream(&events, OpenPhase::Failed, name);
-    assert_eq!(
-        events.first().unwrap().phase,
-        OpenPhase::Opening,
-        "{name}: first phase"
-    );
-    eprintln!("PASS {name} phases={:?}", phase_sequence(&events));
+    Ok(())
 }
 
-/// Extra leg: both tables rebuilt (Go: `table-tracking` role).
-fn table_tracking_leg(data_dir: &Path, live: &Mutex<Option<Database>>) {
-    populate_fresh(data_dir);
-    let (db, rec) = reload_with_recorder(data_dir, live);
-    let p = db
-        .status()
-        .open_progress
-        .unwrap_or_else(|| panic!("table-tracking: missing terminal progress"));
-    assert_eq!(p.phase, OpenPhase::Ready, "table-tracking: terminal={p:?}");
-    assert_eq!(
-        p.rows_inserted,
-        ROWS_PER_TABLE as u64 * 2,
-        "table-tracking: RowsInserted={} (both tables)",
-        p.rows_inserted
-    );
-    assert_eq!(
-        p.current_table, None,
-        "table-tracking: CurrentTable not cleared after open"
-    );
-    count_table(&db, "requests", "table-tracking");
-    count_table(&db, "events", "table-tracking");
-    let events = rec.events();
-    let found = events.iter().any(|ev| {
-        ev.phase == OpenPhase::Rebuilding
-            && (ev.current_table.is_some() || ev.rows_inserted > 0)
+/// Open a raw PG connection to the single node (mirrors the harness
+/// unlock dial so failure legs speak to a real server).
+async fn raw_connect(
+    cluster: &Cluster,
+) -> Result<murmur_live_harness::tokio_postgres::Client, String> {
+    let addr = cluster.node_info(0).sql_addr;
+    let mut config = murmur_live_harness::tokio_postgres::Config::new();
+    config
+        .host(addr.ip().to_string())
+        .port(addr.port())
+        .user(PG_USER)
+        .password(PG_PASSWORD)
+        .dbname("murmur")
+        .connect_timeout(Duration::from_secs(5));
+    let (client, connection) = config
+        .connect(murmur_live_harness::tokio_postgres::NoTls)
+        .await
+        .map_err(|e| format!("raw connect to {addr}: {e}"))?;
+    tokio::spawn(async move {
+        let _ = connection.await;
     });
-    if !found {
-        eprintln!(
-            "table-tracking: no rebuilding event carried CurrentTable or RowsInserted>0 (fast machine, heartbeat not captured -- OK)"
-        );
-    }
-    eprintln!(
-        "PASS table-tracking RowsInserted={} events={}",
-        p.rows_inserted,
-        events.len()
-    );
-    db.close().expect("close");
-    untrack(live);
+    Ok(client)
 }
 
-/// Extra leg: periodic progress events inside the rebuild (Go: `heartbeat`).
-fn heartbeat_leg(data_dir: &Path, live: &Mutex<Option<Database>>) {
-    populate_fresh(data_dir);
-    let (db, rec) = reload_with_recorder(data_dir, live);
-    let n = rec
-        .events()
-        .iter()
-        .filter(|ev| ev.phase == OpenPhase::Rebuilding)
-        .count();
-    assert!(n >= 1, "heartbeat: rebuilding events={n}, expected >=1");
-    eprintln!("PASS heartbeat rebuilding-events={n}");
-    db.close().expect("close");
-    untrack(live);
+/// Reload leg (Go: the `reload` role): stop + restart under the unlock
+/// watchdog, then contents must verify exactly.
+async fn reload_and_verify(cluster: &mut Cluster, name: &str) -> Result<(), String> {
+    let start = Instant::now();
+    cluster.stop_node(0).await;
+    cluster.start_node(0).await.map_err(|e| format!("{name}: restart under watchdog: {e}"))?;
+    eprintln!("{name}: reopened under watchdog in {:?}", start.elapsed());
+    verify_contents(cluster, name).await?;
+    eprintln!("PASS {name}: contents identical after reopen");
+    Ok(())
 }
 
-/// Extra leg: brand-new empty database still fires every phase with zero
-/// counts (Go: `empty-db` role).
-fn empty_db_leg(data_dir: &Path) {
-    let rec = Arc::new(Recorder::new());
-    let opts = Options {
-        mode: OpenMode::CreateNew,
-        on_open_progress: Some(rec.callback()),
-        ..Options::default()
-    };
-    let db = Database::open(data_dir, KEY, opts).expect("create empty db");
-    let p = db
-        .status()
-        .open_progress
-        .unwrap_or_else(|| panic!("empty-db: missing terminal progress"));
-    assert_eq!(p.phase, OpenPhase::Ready, "empty-db terminal={p:?}");
-    assert_eq!(p.processed_items, 0, "empty-db terminal={p:?}");
-    assert_eq!(p.rows_inserted, 0, "empty-db terminal={p:?}");
-    assert_eq!(p.rows_skipped, 0, "empty-db terminal={p:?}");
-    let events = rec.events();
-    assert_event_stream(&events, OpenPhase::Ready, "empty-db");
-    assert_eq!(
-        phase_sequence(&events),
-        FULL_SEQUENCE,
-        "empty-db phases={:?}",
-        phase_sequence(&events)
-    );
-    eprintln!("PASS empty-db phases={:?}", phase_sequence(&events));
-    db.close().expect("close");
-}
-
-/// Extra leg: per-event timing sanity and per-phase timer reset (Go:
-/// `phase-elapsed` role; the `StartedAt` check has no Rust counterpart).
-fn phase_elapsed_leg(data_dir: &Path, live: &Mutex<Option<Database>>) {
-    populate_fresh(data_dir);
-    let (db, rec) = reload_with_recorder(data_dir, live);
-    let events = rec.events();
-    for ev in &events {
-        assert!(
-            ev.phase_elapsed <= ev.elapsed,
-            "phase-elapsed: PhaseElapsed > Elapsed in phase {:?}",
-            ev.phase
-        );
-    }
-    for pair in events.windows(2) {
-        if pair[1].phase != pair[0].phase {
-            if pair[1].phase_elapsed > Duration::from_millis(100) {
-                eprintln!(
-                    "phase-elapsed: first event of {:?} has PhaseElapsed={:?} (>100ms, possible, not fatal)",
-                    pair[1].phase, pair[1].phase_elapsed
-                );
+/// Open-failure leg (Go: the `open-failure` role): the unlock must fail,
+/// no usable handle is returned, and the correct key still works after.
+async fn open_failure_legs(cluster: &Cluster) -> Result<(), String> {
+    // Wrong 32-byte key: rejected, naming the cause.
+    let client = raw_connect(cluster).await?;
+    match client
+        .simple_query(&format!("MURMUR UNLOCK KEY '{}'", murmur_live_harness::hex(&WRONG_KEY)))
+        .await
+    {
+        Ok(_) => return Err("open-failure-wrong-key: expected unlock failure, got success".into()),
+        Err(e) => {
+            // `Display` is a bare `db error`; the cause-naming text lives
+            // in the source chain (`28000: incorrect key`).
+            let msg = murmur_live_harness::db_message(&e);
+            if !msg.contains("incorrect key") {
+                return Err(format!("open-failure-wrong-key: error {msg:?} does not name the cause"));
             }
-            break;
+            eprintln!("open-failure-wrong-key: unlock failed as expected: {msg}");
         }
     }
-    eprintln!("PASS phase-elapsed events={}", events.len());
-    db.close().expect("close");
-    untrack(live);
+    // Short key: rejected (passphrase-hash fallback never matches).
+    let client = raw_connect(cluster).await?;
+    match client.simple_query(&format!("MURMUR UNLOCK KEY '{SHORT_KEY_HEX}'")).await {
+        Ok(_) => return Err("open-failure-short-key: expected unlock failure, got success".into()),
+        Err(e) => eprintln!("open-failure-short-key: unlock failed as expected: {e}"),
+    }
+    // The failures left no usable handle, and the store still opens with
+    // the right key on a fresh connection.
+    let client = raw_connect(cluster).await?;
+    client
+        .simple_query(&format!("MURMUR UNLOCK KEY '{}'", murmur_live_harness::hex(&KEY)))
+        .await
+        .map_err(|e| format!("unlock with correct key after failures: {e}"))?;
+    eprintln!("PASS open-failure: wrong/short keys rejected, correct key accepted");
+    Ok(())
 }
 
-/// Extra leg: repeated status snapshots are independent and stable (Go:
-/// `status-snapshot` role).
-fn status_snapshot_leg(data_dir: &Path, live: &Mutex<Option<Database>>) {
-    populate_fresh(data_dir);
-    let no_op: Arc<dyn Fn(OpenProgress) + Send + Sync> = Arc::new(|_| {});
-    let opts = Options {
-        mode: OpenMode::Existing,
-        on_open_progress: Some(no_op),
-        ..Options::default()
-    };
-    let db = unlock::open_with_watchdog(data_dir, KEY, opts).expect("reopen");
-    track(live, &db);
-    let mut snaps: Vec<OpenProgress> = Vec::new();
-    for i in 0..10 {
-        let s = db
-            .status()
-            .open_progress
-            .unwrap_or_else(|| panic!("status-snapshot: snapshot {i} is nil"));
-        assert_eq!(s.phase, OpenPhase::Ready, "status-snapshot: snapshot {i}");
-        snaps.push(s);
+/// Watchdog leg: an unlock that can never succeed must fail closed after
+/// the stall window instead of hanging. The stall knob is tightened for
+/// this leg only and restored afterwards.
+async fn watchdog_leg(cluster: &Cluster) -> Result<(), String> {
+    const STALL_ENV: &str = "MURMUR_LIVE_UNLOCK_STALL_SECONDS";
+    let saved = std::env::var(STALL_ENV).ok();
+    std::env::set_var(STALL_ENV, "2");
+    let addr = cluster.node_info(0).sql_addr;
+    let start = Instant::now();
+    let outcome = unlock::connect_with_watchdog(addr, PG_USER, PG_PASSWORD, &murmur_live_harness::hex(&WRONG_KEY)).await;
+    match saved {
+        Some(v) => std::env::set_var(STALL_ENV, v),
+        None => std::env::remove_var(STALL_ENV),
     }
-    snaps[0].phase = OpenPhase::Failed;
-    assert_eq!(
-        snaps[1].phase,
-        OpenPhase::Ready,
-        "status-snapshot: snapshots are aliased (mutation propagated)"
-    );
-    let base = snaps[0].processed_items;
-    for (i, s) in snaps.iter().enumerate() {
-        assert_eq!(
-            s.processed_items, base,
-            "status-snapshot: snapshot {i} ProcessedItems={} != base={base}",
-            s.processed_items
-        );
+    match outcome {
+        Ok(_) => Err("watchdog: unlock with wrong key unexpectedly succeeded".into()),
+        Err(e) => {
+            eprintln!("PASS watchdog: unopenable unlock failed closed in {:?}: {e}", start.elapsed());
+            Ok(())
+        }
     }
-    assert_eq!(
-        snaps[0].rows_inserted,
-        ROWS_PER_TABLE as u64 * 2,
-        "status-snapshot: RowsInserted={}",
-        snaps[0].rows_inserted
-    );
-    eprintln!("PASS status-snapshot snapshots=10 ProcessedItems={base}");
-    db.close().expect("close");
-    untrack(live);
 }
 
-fn run_all_legs(runtime: &Path, live: &Mutex<Option<Database>>) {
-    // Main flow (Go: populate, reload, cancel, reload, open-failure,
-    // reload). The cancel role has no Rust counterpart: `Database::open`
-    // takes no context and the product never emits `OpenPhase::Cancelled`.
-    let main = runtime.join("main").join("data");
-    populate_fresh(&main);
-    reload_and_verify(&main, live, "reload-1");
-    open_failure_leg(&main, &SHORT_KEY, "open-failure-short-key");
-    open_failure_leg(&main, &WRONG_KEY, "open-failure-wrong-key");
-    reload_and_verify(&main, live, "reload-2-recovery");
+/// Empty-database leg (Go: the `empty-db` role): a fresh database opens
+/// under the watchdog with zero rows and answers queries.
+async fn empty_db_leg() -> Result<(), String> {
+    let cluster = Cluster::new(ClusterOptions {
+        name: "open-progress-empty".into(),
+        num_nodes: 1,
+        key: KEY,
+        ..Default::default()
+    })
+    .await
+    .map_err(|e| format!("empty-db cluster setup: {e}"))?;
+    let result = async {
+        cluster
+            .ensure_migrated(0, "CREATE TABLE probe(id INTEGER PRIMARY KEY)")
+            .await
+            .map_err(|e| format!("empty-db migrate: {e}"))?;
+        let rows = cluster
+            .node(0)
+            .simple("SELECT COUNT(*) FROM probe")
+            .await
+            .map_err(|e| format!("empty-db count: {e}"))?;
+        let count = rows.first().and_then(|r| r.first().cloned()).unwrap_or_default();
+        if count != "0" {
+            return Err(format!("empty-db: fresh table holds {count} rows, want 0"));
+        }
+        eprintln!("PASS empty-db: fresh database opened under watchdog with zero rows");
+        Ok::<(), String>(())
+    }
+    .await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
+    }
+    if failed {
+        cluster.dump_forensics("open-progress-empty").await;
+    }
+    cluster.finish(failed).await;
+    result
+}
 
-    // Extra flow (Go: TestEmbeddedOpenProgressLiveExtra subtests).
-    let extra = runtime.join("extra");
-    table_tracking_leg(&extra.join("table-tracking").join("data"), live);
-    heartbeat_leg(&extra.join("heartbeat").join("data"), live);
-    empty_db_leg(&extra.join("empty").join("data"));
-    phase_elapsed_leg(&extra.join("phase-elapsed").join("data"), live);
-    status_snapshot_leg(&extra.join("status-snapshot").join("data"), live);
+async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
+    // Main flow (Go: populate, reload, open-failure, reload). The cancel
+    // role has no counterpart: opens over the wire cannot be cancelled.
+    migrate(cluster).await?;
+    populate(cluster).await?;
+    verify_contents(cluster, "populate").await?;
+    reload_and_verify(cluster, "reload-1").await?;
+    open_failure_legs(cluster).await?;
+    watchdog_leg(cluster).await?;
+    reload_and_verify(cluster, "reload-2-recovery").await?;
+
+    // Fresh empty database opens under the watchdog.
+    empty_db_leg().await?;
 
     eprintln!("PASS open-progress: all legs green");
+    Ok(())
 }
 
-#[test]
-fn open_progress() {
-    let runtime_dir =
-        artifacts::prepare_runtime_dir("open-progress").expect("prepare runtime dir");
-    let live: Arc<Mutex<Option<Database>>> = Arc::new(Mutex::new(None));
-    let body_live = Arc::clone(&live);
-    let body_dir = runtime_dir.clone();
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_all_legs(&body_dir, &body_live);
-    }))
-    .is_err();
-    if failed {
-        let snapshot = live.try_lock().ok().and_then(|g| g.clone());
-        forensics::dump_node_forensics(
-            "open-progress",
-            &runtime_dir,
-            snapshot.as_ref(),
-            "open-progress-failed",
-        );
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn open_progress() {
+    let mut cluster = Cluster::new(ClusterOptions {
+        name: "open-progress".into(),
+        num_nodes: 1,
+        key: KEY,
+        ..Default::default()
+    })
+    .await
+    .expect("cluster setup");
+    assert_eq!(cluster.len(), 1, "this scenario is written for 1 node");
+    let result = run_body(&mut cluster).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    artifacts::finish("open-progress", &runtime_dir, failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
-    );
+    if failed {
+        cluster.dump_forensics("open-progress-failed").await;
+    }
+    cluster.finish(failed).await;
+    assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }

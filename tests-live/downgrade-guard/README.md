@@ -62,11 +62,9 @@ reopens with an identical digest and identity).
   never names the product's private `FORMAT` constant — it reads the
   current store's own marker — so the port stays green across
   product format bumps.
-- Refusal is `Err(Error::Corrupt)` from `Database::open`, the
-  in-process analog of the Go nonzero exit + `unsupported format
-  version` log line; the mode is `OpenMode::Existing` with no
-  replication config, since the format check runs before any
-  networking.
+- Refusal is reported during `MURMUR UNLOCK` over PostgreSQL wire from
+  `murmur-server`: opening the storage returns `Error::Corrupt("unsupported database format")`,
+  the connection fails with SQLSTATE error, and the server refuses to serve queries.
 - Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`,
   `ORDER BY id`) instead of the managed typed-records HTTP API
   (`TypedContentionInsert`, `TypedContentionRows`); the node-id leg

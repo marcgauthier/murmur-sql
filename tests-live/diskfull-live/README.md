@@ -30,19 +30,28 @@ space plus a restart must recover to exact convergence.
 
 ## Deviations from the Go original
 
-- In-process two-`Database` cluster instead of daemon processes; plain
-  SQL replaces the typed-records HTTP API
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS
+  (per design); plain SQL replaces the typed-records HTTP API
   (`live_typed_records(name, value)`).
-- Go's daemon-log panic scan has no target: an in-process panic fails
-  the test by construction.
+- The table is explicitly flagged `MURMUR SET TABLE ... REPLICATED true`
+  on each node (row convergence needs the per-node flag); the Go
+  fixture tables replicate by default.
+- Go's daemon-log panic scan maps to wire behavior: a server panic
+  fails the test via the wire error instead, and the server logs are
+  kept as failure artifacts.
+- On restarts (tmpfs move and post-recovery), table replication is
+  explicitly re-enabled via `MURMUR SET TABLE live_typed_records REPLICATED true`
+  and mesh anti-entropy is re-synced.
 - Free space via libc `statvfs` (new scenario-only dep `libc`, same
   version as the harness); mount/copy/unmount via `mount`/`cp`/`umount`.
 - On failure the tmpfs content is copied aside before the unmount so the
   `finish` snapshot still captures it.
 
-## Compile check (only gate; never run here)
+## Verification
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/diskfull-live/Cargo.toml
+MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server \
+  CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target \
+  cargo test --manifest-path tests-live/diskfull-live/Cargo.toml -- --nocapture
 ```

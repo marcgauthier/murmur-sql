@@ -5,15 +5,14 @@
 //! convergence of a three-node all-Plumtree mesh; `mixed_mode_refuses_gossip_peer`
 //! requires a gossip-mode node meshed with Plumtree peers to stay isolated in
 //! both directions while handshake refusals are recorded and the Plumtree pair
-//! converges. Plain SQL replaces the Go typed-records HTTP API (see the
+//! converges. Plain SQL replaces the Go typed-records HTTP API, and nodes are
+//! `murmur-server` child processes driven over the PostgreSQL wire (see the
 //! scenario README.md for the deviations).
 
 use std::collections::HashMap;
 use std::time::Duration;
 
-use murmur_live_harness::murmur_replication::Dissemination;
-use murmur_live_harness::sqlite_session::{Database, Migration};
-use murmur_live_harness::{wait_until, Cluster, ClusterOptions, ReplicationOptions};
+use murmur_live_harness::{wait_until_async, Cluster, ClusterOptions, Dissemination, ReplicationOptions};
 
 /// Rows inserted by the origin node (Go: 10 per test).
 const ROWS: usize = 10;
@@ -27,57 +26,174 @@ const POLL_INTERVAL: Duration = Duration::from_millis(200);
 const LEAK_WINDOW: Duration = Duration::from_secs(5);
 
 /// Canonical ordered names on one node (Go: `Cluster.TypedNames`).
-fn names(db: &Database) -> murmur_live_harness::sqlite_session::Result<Vec<String>> {
-    db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT name FROM records ORDER BY name")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for name in rows {
-            out.push(name?);
-        }
-        Ok(out)
-    })
+async fn names(cluster: &Cluster, idx: usize) -> Result<Vec<String>, String> {
+    let rows = cluster
+        .node(idx)
+        .query("SELECT name FROM records ORDER BY name", &[])
+        .await
+        .map_err(|e| format!("node{} SELECT names: {e}", idx + 1))?;
+    rows.iter()
+        .map(|row| {
+            row.try_get::<_, String>(0)
+                .map_err(|e| format!("node{} decode name: {e}", idx + 1))
+        })
+        .collect()
 }
 
-/// Same `records` table on every node (Go: TypedRecords fixture tables).
-fn migrate_all(cluster: &Cluster) {
+/// Same `records` table on every node (Go: TypedRecords fixture tables),
+/// flagged replicated on each node (row convergence needs the per-node flag).
+async fn migrate_all(cluster: &Cluster) -> Result<(), String> {
+    for i in 0..cluster.len() {
+        cluster
+            .ensure_migrated(i, "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .map_err(|e| format!("migrate node{}: {e}", i + 1))?;
+    }
     for i in 0..cluster.len() {
         cluster
             .node(i)
-            .migrate(Migration::new(
-                "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-            ))
-            .unwrap_or_else(|e| panic!("node {i} migrate records table: {e}"));
+            .simple("MURMUR SET TABLE records REPLICATED true")
+            .await
+            .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
             .flush()
-            .unwrap_or_else(|e| panic!("node {i} flush schema: {e}"));
+            .await
+            .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
+    Ok(())
 }
 
-fn insert_names(cluster: &Cluster, idx: usize, prefix: &str, count: usize) {
+async fn insert_names(cluster: &Cluster, idx: usize, prefix: &str, count: usize) -> Result<(), String> {
     for row in 0..count {
         let name = format!("{prefix}-{row}");
         let id = row as i64;
         cluster
             .node(idx)
-            .transaction(move |sql| {
-                sql.execute(
-                    "INSERT INTO records(id, name) VALUES(?, ?)",
-                    (id, name),
-                )?;
-                Ok(())
-            })
-            .unwrap_or_else(|e| panic!("node {idx} insert failed: {e}"));
+            .execute("INSERT INTO records(id, name) VALUES($1, $2)", &[&id, &name])
+            .await
+            .map_err(|e| format!("node{} insert '{name}': {e}", idx + 1))?;
     }
     cluster
         .node(idx)
         .flush()
-        .unwrap_or_else(|e| panic!("node {idx} flush after inserts: {e}"));
+        .await
+        .map_err(|e| format!("node{} flush after inserts: {e}", idx + 1))?;
+    Ok(())
 }
 
-#[test]
-fn plumtree_mesh_converges() {
+/// One `MURMUR SHOW REPLICATION` row: (peers, last_error).
+async fn replication_summary(cluster: &Cluster, idx: usize) -> Result<(u64, String), String> {
+    let rows = cluster
+        .node(idx)
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .map_err(|e| format!("node{} SHOW REPLICATION: {e}", idx + 1))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("node{} SHOW REPLICATION returned no rows", idx + 1))?;
+    if row.len() < 7 {
+        return Err(format!("node{} SHOW REPLICATION has {} columns, want >= 7", idx + 1, row.len()));
+    }
+    let peers = row[2]
+        .parse::<u64>()
+        .map_err(|e| format!("node{} peers {:?}: {e}", idx + 1, row[2]))?;
+    Ok((peers, row[6].clone()))
+}
+
+async fn run_converges(cluster: &Cluster) -> Result<(), String> {
+    migrate_all(cluster).await?;
+    insert_names(cluster, 0, "plum", ROWS).await?;
+
+    let mut want = Vec::with_capacity(ROWS);
+    for row in 0..ROWS {
+        want.push(format!("plum-{row}"));
+    }
+    let converged = wait_until_async(CONVERGE_TIMEOUT, POLL_INTERVAL, || async {
+        for i in 0..cluster.len() {
+            match names(cluster, i).await {
+                Ok(got) if got == want => {}
+                _ => return false,
+            }
+        }
+        true
+    })
+    .await;
+    if !converged {
+        return Err(format!(
+            "three Plumtree nodes did not converge on {ROWS} rows within {CONVERGE_TIMEOUT:?}"
+        ));
+    }
+    eprintln!("Three Plumtree nodes converged on {ROWS} rows");
+    Ok(())
+}
+
+async fn run_mixed(cluster: &Cluster) -> Result<(), String> {
+    migrate_all(cluster).await?;
+    insert_names(cluster, 0, "mixed-plum", ROWS).await?;
+    insert_names(cluster, 2, "gossip-only", 1).await?;
+
+    // The Plumtree pair converges; the gossip node stays isolated.
+    let pair_converged = wait_until_async(MIXED_TIMEOUT, POLL_INTERVAL, || async {
+        let n0 = names(cluster, 0).await.map(|n| n.len()).unwrap_or(usize::MAX);
+        let n1 = names(cluster, 1).await.map(|n| n.len()).unwrap_or(usize::MAX);
+        n0 == ROWS && n1 == ROWS
+    })
+    .await;
+    if !pair_converged {
+        return Err(format!(
+            "Plumtree pair did not converge on {ROWS} rows within {MIXED_TIMEOUT:?}"
+        ));
+    }
+    tokio::time::sleep(LEAK_WINDOW).await; // let any leak arrive
+    for (i, want) in [ROWS, ROWS, 1].into_iter().enumerate() {
+        let got = names(cluster, i).await?;
+        if got.len() != want {
+            return Err(format!(
+                "node{} count = {}, want {want} (mode isolation broken?)",
+                i + 1,
+                got.len()
+            ));
+        }
+    }
+
+    // Refusal evidence (Go: `spedsql_repl_handshake_capability_refusals_total >= 1`).
+    // The engine fails closed with `incompatible hello/welcome`, latched in the
+    // `last_error` column of `MURMUR SHOW REPLICATION` on both dial and accept sides.
+    let mut refusals = 0;
+    for i in 0..cluster.len() {
+        let (peers, last_error) = replication_summary(cluster, i).await?;
+        if last_error.contains("incompatible") {
+            refusals += 1;
+        }
+        eprintln!("node{}: peers={peers} last_error={last_error:?}", i + 1);
+    }
+    if refusals < 1 {
+        return Err("no handshake incompatibility refusals recorded (negotiation silent?)".into());
+    }
+    eprintln!("mode refusals recorded on {refusals} node(s)");
+
+    // Session-level isolation: the gossip node never holds a session,
+    // while the converged Plumtree pair holds exactly each other.
+    let (gossip_peers, _) = replication_summary(cluster, 2).await?;
+    if gossip_peers != 0 {
+        return Err(format!(
+            "gossip node holds {gossip_peers} sessions, want 0 (mode isolation broken?)"
+        ));
+    }
+    for i in 0..2 {
+        let (peers, _) = replication_summary(cluster, i).await?;
+        if peers != 1 {
+            return Err(format!(
+                "plumtree node{i} holds {peers} sessions, want 1 (peer of the gossip node?)"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn plumtree_mesh_converges() {
     let cluster = Cluster::new(ClusterOptions {
         name: "plumtree-live".into(),
         num_nodes: 3,
@@ -87,43 +203,23 @@ fn plumtree_mesh_converges() {
         }),
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        migrate_all(&cluster);
-        insert_names(&cluster, 0, "plum", ROWS);
-
-        let mut want = Vec::with_capacity(ROWS);
-        for row in 0..ROWS {
-            want.push(format!("plum-{row}"));
-        }
-        let converged = wait_until(CONVERGE_TIMEOUT, POLL_INTERVAL, || {
-            for i in 0..cluster.len() {
-                match names(cluster.node(i)) {
-                    Ok(got) if got == want => {}
-                    _ => return false,
-                }
-            }
-            true
-        });
-        assert!(
-            converged,
-            "three Plumtree nodes did not converge on {ROWS} rows within {CONVERGE_TIMEOUT:?}"
-        );
-        eprintln!("Three Plumtree nodes converged on {ROWS} rows");
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("no-convergence");
+    assert_eq!(cluster.len(), 3, "this scenario is written for 3 nodes");
+    let result = run_converges(&cluster).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
-    );
+    if failed {
+        cluster.dump_forensics("no-convergence").await;
+    }
+    cluster.finish(failed).await;
+    assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }
 
-#[test]
-fn mixed_mode_refuses_gossip_peer() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_mode_refuses_gossip_peer() {
     let mut dissemination_by_node = HashMap::new();
     dissemination_by_node.insert(2, Dissemination::Gossip);
     let cluster = Cluster::new(ClusterOptions {
@@ -136,94 +232,17 @@ fn mixed_mode_refuses_gossip_peer() {
         dissemination_by_node,
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        migrate_all(&cluster);
-        insert_names(&cluster, 0, "mixed-plum", ROWS);
-        insert_names(&cluster, 2, "gossip-only", 1);
-
-        // The Plumtree pair converges; the gossip node stays isolated.
-        let pair_converged = wait_until(MIXED_TIMEOUT, POLL_INTERVAL, || {
-            let n0 = names(cluster.node(0)).map(|n| n.len()).unwrap_or(usize::MAX);
-            let n1 = names(cluster.node(1)).map(|n| n.len()).unwrap_or(usize::MAX);
-            n0 == ROWS && n1 == ROWS
-        });
-        assert!(
-            pair_converged,
-            "Plumtree pair did not converge on {ROWS} rows within {MIXED_TIMEOUT:?}"
-        );
-        std::thread::sleep(LEAK_WINDOW); // let any leak arrive
-        for (i, want) in [ROWS, ROWS, 1].into_iter().enumerate() {
-            let got = names(cluster.node(i))
-                .unwrap_or_else(|e| panic!("node {i} read names: {e}"));
-            assert_eq!(
-                got.len(),
-                want,
-                "node {i} count = {}, want {want} (mode isolation broken?)",
-                got.len()
-            );
-        }
-
-        // Refusal evidence (Go: `spedsql_repl_handshake_capability_refusals_total >= 1`).
-        // The Rust engine fails closed with `auth: incompatible hello/welcome`
-        // recorded in `status().last_error` on both dial and accept sides.
-        let mut refusals = 0;
-        for i in 0..cluster.len() {
-            let status = cluster
-                .node(i)
-                .replication()
-                .unwrap_or_else(|| panic!("node {i} has no replication"))
-                .status();
-            if status
-                .last_error
-                .as_deref()
-                .is_some_and(|e| e.contains("incompatible"))
-            {
-                refusals += 1;
-            }
-            eprintln!(
-                "node{i}: peers={} last_error={:?}",
-                status.peers, status.last_error
-            );
-        }
-        assert!(
-            refusals >= 1,
-            "no handshake incompatibility refusals recorded (negotiation silent?)"
-        );
-        eprintln!("mode refusals recorded on {refusals} node(s)");
-
-        // Session-level isolation: the gossip node never holds a session,
-        // while the converged Plumtree pair holds exactly each other.
-        let gossip_peers = cluster
-            .node(2)
-            .replication()
-            .expect("node 2 replication")
-            .status()
-            .peers;
-        assert_eq!(
-            gossip_peers, 0,
-            "gossip node holds {gossip_peers} sessions, want 0 (mode isolation broken?)"
-        );
-        for i in 0..2 {
-            let peers = cluster
-                .node(i)
-                .replication()
-                .unwrap_or_else(|| panic!("node {i} has no replication"))
-                .status()
-                .peers;
-            assert_eq!(
-                peers, 1,
-                "plumtree node {i} holds {peers} sessions, want 1 (peer of the gossip node?)"
-            );
-        }
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("mode-isolation");
+    assert_eq!(cluster.len(), 3, "this scenario is written for 3 nodes");
+    let result = run_mixed(&cluster).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
-    );
+    if failed {
+        cluster.dump_forensics("mode-isolation").await;
+    }
+    cluster.finish(failed).await;
+    assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }

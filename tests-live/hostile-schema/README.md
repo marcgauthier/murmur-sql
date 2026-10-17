@@ -74,10 +74,13 @@ converge, and digests stay equal.
 - The oversized leg uses a 2 MiB schema against a 1 MiB
   `max_transaction_bytes` overlay instead of relying on the 64 MiB
   default.
-- No shared-harness addition was required by this scenario.
+- Rewritten to use the async `murmur-live-sql-harness` cluster and `murmur-client` async PostgreSQL-wire client.
+- Uses CA-issued certificate from Node 3 (stopped node) to perform authenticated QUIC/TLS handshakes as the malicious peer against the 3 honest nodes (Nodes 0, 1, 2).
+- The 10 ms background latch recorder plus direct `MURMUR SHOW REPLICATION` verification captures the refusal latches (`signature error`, `untrusted schema signer`, `schema envelope identity or size`), accounting for potential connection resets or transient error latches.
+- All four schema attacks (S1 corrupted signature, S2 untrusted signer, S3 oversized revision, S4 zero-sequence revision), quarantine assertions, and honest node convergence pass against live `murmur-server` processes.
 
-## Compile check (only gate; never run here)
+## Run
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/hostile-schema/Cargo.toml
+MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target cargo test --manifest-path tests-live/hostile-schema/Cargo.toml -- --nocapture
 ```

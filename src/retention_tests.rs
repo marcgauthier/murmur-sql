@@ -69,6 +69,7 @@ fn create(path: &std::path::Path) -> Database {
         "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER)",
     ))
     .unwrap();
+    db.set_replication("items", true).unwrap();
     db.transaction(|s| {
         s.execute("INSERT INTO items VALUES(1,1)", [])?;
         Ok(())

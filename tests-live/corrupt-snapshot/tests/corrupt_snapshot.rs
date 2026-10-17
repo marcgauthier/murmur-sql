@@ -9,23 +9,21 @@
 //! published (row count, digest, and commit cursor untouched), discard the
 //! staged transfer, then converge via the honest snapshot path with
 //! bit-identical digests. Plain SQL replaces the Go typed-records HTTP API,
-//! close/reopen replaces process stop/start, and rejection is observed via
-//! the replication `last_error` plus wire behavior (no snapshot counters
-//! exist); see the scenario README.md for the deviations.
+//! multi-process `murmur-server` processes replace embedded `Database`, and
+//! rejection is observed via the replication `last_error` plus wire behavior.
+//! The raw-QUIC attacker is the shared harness fixture
+//! (`murmur_live_harness::attacker`), which reuses the product wire
+//! implementation; this scenario reaches product types only through the
+//! harness re-export.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use murmur_live_harness::murmur_replication::{
-    protocol::{self, Message},
-    retention, snapshot, transport, Config as ReplConfig, Dissemination,
-};
-use murmur_live_harness::sqlite_session::{Database, Migration};
-use murmur_live_harness::{
-    env_seconds, wait_until, Cluster, ClusterOptions, ReplicationOptions,
-};
-use sha2::{Digest, Sha256};
+use murmur_live_harness::attacker::{forge_corrupt_snapshot, Attacker};
+use murmur_live_harness::replication::protocol::{self, Message};
+use murmur_live_harness::replication::retention;
+use murmur_live_harness::tokio_postgres::types::ToSql;
+use murmur_live_harness::{env_seconds, hex, Cluster, ClusterOptions, ReplicationOptions};
 
 /// Role index: node3 goes stale, then rejoins (Go: `stale = 2`).
 const STALE: usize = 2;
@@ -63,8 +61,6 @@ const ROW_TIMEOUT: Duration = Duration::from_secs(30);
 const CONVERGE_POLL: Duration = Duration::from_millis(200);
 /// GC collection-loop deadline past the expiry wait.
 const COLLECT_TIMEOUT: Duration = Duration::from_secs(60);
-/// Attacker dial/handshake deadline (Go: 15 s).
-const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
 /// Snapshot-pull inducement deadline (Go: 30 s).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Forged-chunk request deadline (Go: manifests/chunks received, 15 s).
@@ -79,17 +75,13 @@ const SETTLE: Duration = Duration::from_secs(2);
 const HONEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Canonical ordered names on one node (Go: `Cluster.TypedNames`).
-fn names(db: &Database) -> Vec<String> {
-    db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT name FROM records ORDER BY name")?;
-        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for name in rows {
-            out.push(name?);
-        }
-        Ok(out)
-    })
-    .expect("read names")
+async fn names(cluster: &Cluster, idx: usize) -> Vec<String> {
+    let rows = cluster
+        .node(idx)
+        .query("SELECT name FROM records ORDER BY name", &[])
+        .await
+        .expect("read names");
+    rows.into_iter().map(|r| r.get(0)).collect()
 }
 
 /// Canonical digest of a name set (Go: sorted names joined with newlines).
@@ -98,59 +90,58 @@ fn digest(names: &[String]) -> String {
 }
 
 /// Row count on one node (cheap pre-check before full name reads).
-fn row_count(db: &Database) -> usize {
-    db.read(|sql| {
-        let n = sql.query_row("SELECT COUNT(*) FROM records", [], |row| {
-            row.get::<_, i64>(0)
-        })?;
-        Ok(n as usize)
-    })
-    .expect("row count")
+async fn row_count(cluster: &Cluster, idx: usize) -> usize {
+    let rows = cluster
+        .node(idx)
+        .query("SELECT COUNT(*) FROM records", &[])
+        .await
+        .expect("row count");
+    let n: i64 = rows[0].get(0);
+    n as usize
 }
 
 /// One single-row transaction (Go: `TypedInsert`).
-fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) {
-    let name = name.to_string();
+async fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) {
+    let params: [&(dyn ToSql + Sync); 2] = [&id, &name];
     cluster
         .node(node)
-        .transaction(move |sql| {
-            sql.execute("INSERT INTO records(id, name) VALUES(?, ?)", (id, name))?;
-            Ok(())
-        })
+        .execute("INSERT INTO records(id, name) VALUES($1, $2)", &params)
+        .await
         .unwrap_or_else(|e| panic!("node {node} insert failed: {e}"));
 }
 
 /// Wait until one node holds exactly `want` rows (Go: `waitRowCount`).
-fn wait_row_count(cluster: &Cluster, idx: usize, want: usize, timeout: Duration) {
+async fn wait_row_count(cluster: &Cluster, idx: usize, want: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        if row_count(cluster.node(idx)) == want {
+        if row_count(cluster, idx).await == want {
             return;
         }
         if Instant::now() >= deadline {
             panic!(
                 "node {idx} record count = {}, want {want} within {timeout:?}",
-                row_count(cluster.node(idx)),
+                row_count(cluster, idx).await,
             );
         }
-        std::thread::sleep(CONVERGE_POLL);
+        tokio::time::sleep(CONVERGE_POLL).await;
     }
 }
 
 /// Wait until every node holds exactly `want` rows with equal digests
 /// (Go: `waitConverged`).
-fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) {
+async fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let counts: Vec<usize> = (0..cluster.len())
-            .map(|i| row_count(cluster.node(i)))
-            .collect();
+        let mut counts = Vec::new();
+        for i in 0..cluster.len() {
+            counts.push(row_count(cluster, i).await);
+        }
         if counts.iter().all(|&n| n == want) {
             let mut first = String::new();
             let mut equal = true;
-            for (i, idx) in (0..cluster.len()).enumerate() {
-                let d = digest(&names(cluster.node(idx)));
-                if i == 0 {
+            for idx in 0..cluster.len() {
+                let d = digest(&names(cluster, idx).await);
+                if idx == 0 {
                     first = d;
                 } else if d != first {
                     equal = false;
@@ -163,278 +154,400 @@ fn wait_converged(cluster: &Cluster, want: usize, timeout: Duration) {
         }
         if Instant::now() >= deadline {
             for i in 0..cluster.len() {
-                let node_names = names(cluster.node(i));
+                let node_names = names(cluster, i).await;
                 eprintln!(
                     "node {i} at timeout: count={} digest={}",
                     node_names.len(),
                     digest(&node_names)
                 );
             }
-            panic!(
-                "nodes did not converge on {want} rows with equal digests within {timeout:?}"
-            );
+            panic!("nodes did not converge on {want} rows with equal digests within {timeout:?}");
         }
-        std::thread::sleep(CONVERGE_POLL);
+        tokio::time::sleep(CONVERGE_POLL).await;
     }
 }
 
 /// Connected replication sessions on one node (Go: `spedsql_connected_peers`).
-fn connected_peers(cluster: &Cluster, idx: usize) -> usize {
-    cluster
+async fn connected_peers(cluster: &Cluster, idx: usize) -> usize {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .peers
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .expect("SHOW REPLICATION");
+    rows.first()
+        .and_then(|r| r.get(2))
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(0)
 }
 
 /// Latest replication error on one node (Go: failure counters, which have no
 /// Rust equivalent; the corrupt-chunk rejection lands here).
-fn last_error(cluster: &Cluster, idx: usize) -> Option<String> {
-    cluster
+async fn last_error(cluster: &Cluster, idx: usize) -> Option<String> {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .last_error
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .expect("SHOW REPLICATION");
+    rows.first()
+        .and_then(|r| r.get(6))
+        .filter(|s| !s.is_empty())
+        .cloned()
 }
 
 /// Local commit cursor (Go: `spedsql_state_generation` advance check).
-fn committed(cluster: &Cluster, idx: usize) -> u64 {
-    cluster.node(idx).status().committed
+async fn committed(cluster: &Cluster, idx: usize) -> u64 {
+    let rows = cluster
+        .node(idx)
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .expect("SHOW REPLICATION");
+    rows.first()
+        .and_then(|r| r.get(7))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
-/// Log-path activity counters for one node: `(received_transactions,
+/// Log-path activity counters for one node: `(staged_transactions,
 /// applied_transactions)`. Snapshot application bypasses both counters, so a
 /// flat pair across the honest resync proves the rows arrived via snapshot.
-fn log_counters(cluster: &Cluster, idx: usize) -> (u64, u64) {
-    let metrics = cluster
+async fn log_counters(cluster: &Cluster, idx: usize) -> (u64, u64) {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .metrics;
-    (metrics.received_transactions, metrics.applied_transactions)
+        .simple("MURMUR SHOW REPLICATION")
+        .await
+        .expect("SHOW REPLICATION");
+    let r = rows.first().expect("replication status row");
+    let staged: u64 = r.get(4).and_then(|s| s.parse().ok()).unwrap_or(0);
+    let applied: u64 = r.get(5).and_then(|s| s.parse().ok()).unwrap_or(0);
+    (staged, applied)
 }
 
 /// Run one bounded retention pass on one node; returns transactions pruned.
-fn collect_history(cluster: &Cluster, idx: usize) -> u64 {
-    cluster
+async fn collect_history(cluster: &Cluster, idx: usize) -> u64 {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .collect_retention()
-        .unwrap_or_else(|e| panic!("node {idx} collect retention: {e}"))
+        .simple("MURMUR RETENTION COLLECT")
+        .await
+        .unwrap_or_else(|e| panic!("node {idx} collect retention: {e}"));
+    rows.first()
+        .and_then(|r| r.get(0))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Total transactions ever pruned on one node.
-fn collected_total(cluster: &Cluster, idx: usize) -> u64 {
-    cluster
+async fn collected_total(cluster: &Cluster, idx: usize) -> u64 {
+    let rows = cluster
         .node(idx)
-        .replication()
-        .expect("replication handle")
-        .retention_status()
-        .expect("retention status")
-        .collected_transactions
-}
-
-/// Malicious snapshot-source fixture: a raw QUIC client speaking the
-/// replication wire protocol (Go: `attacker` in attacker.go).
-struct Attacker {
-    config: ReplConfig,
-    endpoint: quinn::Endpoint,
-}
-
-impl Attacker {
-    fn new(config: ReplConfig) -> Self {
-        let endpoint =
-            transport::endpoint(&config, ATTACKER_ID).expect("attacker endpoint");
-        Self { config, endpoint }
-    }
-
-    /// Complete a handshake against the victim and return the session plus
-    /// the victim's schema bytes (revealed by its Welcome).
-    async fn dial(&self, addr: SocketAddr, db: [u8; 16], expect: [u8; 16]) -> EvilSession {
-        let connecting = self
-            .endpoint
-            .connect(addr, "murmur.invalid")
-            .expect("attacker connect setup");
-        let connection = tokio::time::timeout(DIAL_TIMEOUT, connecting)
-            .await
-            .expect("attacker dial timeout")
-            .expect("attacker connect");
-        let (mut send, mut recv) = tokio::time::timeout(DIAL_TIMEOUT, connection.open_bi())
-            .await
-            .expect("attacker open stream timeout")
-            .expect("attacker open stream");
-        protocol::write(
-            &mut send,
-            &Message::Hello {
-                capabilities: protocol::CAPABILITIES,
-                required: protocol::REQUIRED,
-                version: protocol::VERSION,
-                database: db,
-                node: ATTACKER_ID,
-                fetch: None,
-                schema: Vec::new(),
-                mode: Dissemination::Gossip,
-                max_transaction: 64 << 20,
-            },
-        )
+        .simple("MURMUR SHOW RETENTION")
         .await
-        .expect("attacker write hello");
-        let welcome = tokio::time::timeout(Duration::from_secs(10), protocol::read(&mut recv))
-            .await
-            .expect("attacker welcome timeout")
-            .expect("attacker read welcome");
-        let schema = match welcome {
-            Message::Welcome {
-                database: db2,
-                node,
-                schema,
-                ..
-            } => {
-                assert_eq!(db2, db, "welcome database mismatch");
-                assert_eq!(node, expect, "welcome node mismatch");
-                schema
-            }
-            other => panic!("attacker expected welcome, got {other:?}"),
-        };
-        EvilSession {
-            connection,
-            send,
-            recv,
-            welcome_schema: schema,
+        .expect("SHOW RETENTION");
+    rows.first()
+        .and_then(|r| r.get(5))
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Read last seen millis for peer with node_id `victim_hex` from node `idx`.
+async fn last_seen_millis(cluster: &Cluster, idx: usize, victim_hex: &str) -> Option<u64> {
+    let rows = cluster
+        .node(idx)
+        .simple("MURMUR SHOW RETENTION")
+        .await
+        .expect("SHOW RETENTION");
+    for r in rows {
+        if r.get(0).map(|s| s.as_str()) == Some(victim_hex) {
+            return r.get(1).and_then(|s| s.parse::<u64>().ok());
         }
     }
+    None
 }
 
-/// One attack QUIC session with its handshake stream open.
-struct EvilSession {
-    connection: quinn::Connection,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-    welcome_schema: Vec<u8>,
-}
+async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
+    // Phase 0: create replicated table on all nodes.
+    for i in 0..cluster.len() {
+        cluster
+            .node(i)
+            .simple("CREATE TABLE records(id INTEGER NOT NULL PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .map_err(|e| format!("migrate records table node {i}: {e}"))?;
+        cluster
+            .node(i)
+            .simple("MURMUR SET TABLE records REPLICATED true")
+            .await
+            .map_err(|e| format!("set replicated node {i}: {e}"))?;
+        cluster
+            .node(i)
+            .flush()
+            .await
+            .map_err(|e| format!("flush schema node {i}: {e}"))?;
+    }
 
-impl EvilSession {
-    async fn send(&mut self, message: &Message) {
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            protocol::write(&mut self.send, message),
-        )
+    // Phase 1: build the honest mesh explicitly and converge a baseline.
+    for (from, target) in [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)] {
+        cluster
+            .add_peer(from, target)
+            .await
+            .map_err(|e| format!("AddPeer({from},{target}): {e}"))?;
+    }
+    for i in 0..5 {
+        insert(cluster, STALE, i + 1, &format!("stale-{i}")).await;
+    }
+    cluster
+        .node(STALE)
+        .flush()
         .await
-        .expect("attacker send timeout")
-        .expect("attacker send");
-    }
+        .map_err(|e| format!("flush baseline: {e}"))?;
+    wait_converged(cluster, 5, BASELINE_TIMEOUT).await;
+    let pre_stop_digest = digest(&names(cluster, STALE).await);
 
-    /// Read until `want` matches, `total` elapses, or the session dies
-    /// (Go: `collectUntil`, but patient across quiet slices instead of
-    /// returning on the first one).
-    async fn collect_until(
-        &mut self,
-        total: Duration,
-        want: impl Fn(&Message) -> bool,
-    ) -> Vec<Message> {
-        let mut out = Vec::new();
-        let deadline = Instant::now() + total;
-        while Instant::now() < deadline {
-            let slice = (deadline - Instant::now()).min(Duration::from_millis(500));
-            match tokio::time::timeout(slice, protocol::read(&mut self.recv)).await {
-                Ok(Ok(message)) => {
-                    let matched = want(&message);
-                    out.push(message);
-                    if matched {
-                        return out;
-                    }
-                }
-                Ok(Err(_)) => return out, // session died; the caller interprets
-                Err(_) => {}              // quiet slice; keep waiting
-            }
+    // Phase 2: isolate node3, stop it, and let the survivors write past
+    // retention so the rejoin genuinely needs the snapshot path.
+    for (from, target) in [(2, 0), (2, 1), (0, 2), (1, 2)] {
+        cluster
+            .remove_peer(from, target)
+            .await
+            .map_err(|e| format!("RemovePeer({from},{target}): {e}"))?;
+    }
+    cluster.stop_node(STALE).await;
+
+    // Flush every write: the product mints one replication log entry per
+    // flush batch, not per SQL transaction, so a single trailing flush
+    // would leave fewer entries than `minimum_retained` and nothing
+    // would ever become eligible for pruning.
+    for i in 0..60 {
+        insert(cluster, 0, 100 + i, &format!("fresh-{i}")).await;
+        cluster
+            .node(0)
+            .flush()
+            .await
+            .map_err(|e| format!("flush survivor write: {e}"))?;
+    }
+    wait_row_count(cluster, 0, 65, ROW_TIMEOUT).await;
+    wait_row_count(cluster, 1, 65, ROW_TIMEOUT).await;
+
+    // Member-deadline expiry, then explicit collection passes: the stale
+    // node's retention pin must lapse before its needed ranges become
+    // genuinely unrecoverable from logs.
+    eprintln!("waiting for member-deadline expiry and collection");
+    tokio::time::sleep(env_seconds(
+        "MURMUR_CORRUPT_SNAPSHOT_GC_WAIT_SECONDS",
+        30,
+    ))
+    .await;
+
+    let collect_deadline = Instant::now() + COLLECT_TIMEOUT;
+    loop {
+        let totals = [collected_total(cluster, 0).await, collected_total(cluster, 1).await];
+        if totals.iter().all(|&n| n >= MIN_COLLECTED) {
+            eprintln!("survivors pruned {totals:?} transactions past retention");
+            break;
         }
-        out
+        if Instant::now() >= collect_deadline {
+            return Err(format!(
+                "survivors collected only {totals:?} transactions, want >= {MIN_COLLECTED} each (snapshot path not forced)"
+            ));
+        }
+        collect_history(cluster, 0).await;
+        collect_history(cluster, 1).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    fn close(self) {
-        self.connection.close(0u32.into(), b"attack done");
+    // Prove the deadline leg explicitly: the victim is now older than
+    // every survivor's offline memory.
+    let victim_id_hex = hex(&cluster.node_id(STALE));
+    for i in [0, 1] {
+        let last_seen = last_seen_millis(cluster, i, &victim_id_hex)
+            .await
+            .ok_or_else(|| format!("node {i} has no retention record for victim {victim_id_hex}"))?;
+        let age = retention::now_millis().saturating_sub(last_seen);
+        if age <= MAXIMUM_OFFLINE.as_millis() as u64 {
+            return Err(format!(
+                "node {i} still pins the victim (last seen {age} ms ago, offline max {:?})",
+                MAXIMUM_OFFLINE
+            ));
+        }
     }
-}
 
-/// A manifest plus chunk payloads whose second chunk was bit-flipped after
-/// the manifest digests were computed (Go: `corruptSnapshot`).
-struct ForgedSnapshot {
-    manifest: snapshot::Manifest,
-    transfer: [u8; 16],
-    chunk0: Vec<u8>,
-    chunk1_bad: Vec<u8>,
-}
+    // Phase 3: node3 restarts peerless; the attacker's inbound session is
+    // its only source. The attacker induces a snapshot pull, then serves
+    // bit-flipped chunks.
+    cluster
+        .start_node(STALE)
+        .await
+        .map_err(|e| format!("stale node restart: {e}"))?;
+    cluster
+        .node(STALE)
+        .simple("MURMUR SET TABLE records REPLICATED true")
+        .await
+        .map_err(|e| format!("re-set replicated on stale node: {e}"))?;
+    cluster
+        .node(STALE)
+        .flush()
+        .await
+        .map_err(|e| format!("flush schema on stale node: {e}"))?;
+    let victim_addr = cluster.node_info(STALE).repl_addr;
+    let victim_id = cluster.node_id(STALE);
+    let dbid = cluster.database_id();
+    let gen_before_attack = committed(cluster, STALE).await;
+    let log_before_attack = log_counters(cluster, STALE).await;
 
-/// Forge a structurally valid two-chunk snapshot for the victim's schema:
-/// the manifest passes every structural check, but the final chunk's bytes
-/// differ from what its chunk hash covers.
-fn build_corrupt_snapshot(
-    config: &ReplConfig,
-    db: [u8; 16],
-    victim: [u8; 16],
-    victim_schema: &[u8],
-) -> ForgedSnapshot {
-    let mut data = vec![0u8; FORGED_BYTES];
-    for (i, b) in data.iter_mut().enumerate() {
-        *b = b'a' + (i % 26) as u8;
+    // Run the attacker dialogue against the victim (shared harness
+    // fixture; product wire implementation, not a fork).
+    let mut attacker = Attacker::new(cluster, ATTACKER_ID, ATTACKER_SEED)
+        .map_err(|e| format!("attacker identity: {e}"))?;
+    attacker.config_mut().snapshot_transfer_lifetime = FORGED_LIFETIME;
+    let mut evil = attacker
+        .dial(victim_addr, dbid, victim_id)
+        .await
+        .map_err(|e| format!("attacker dial: {e}"))?;
+
+    // Prove the "only available source" premise: exactly one peer.
+    let poll_deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if connected_peers(cluster, STALE).await == 1 {
+            break;
+        }
+        if Instant::now() >= poll_deadline {
+            return Err(format!(
+                "stale node has {} connected peers during the attack, want 1",
+                connected_peers(cluster, STALE).await
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    let schema = protocol::schema_digest(victim_schema);
-    let (manifest, _records) = snapshot::build(
-        (db, ATTACKER_ID),
-        victim,
-        data.clone(),
-        Vec::new(),
-        schema,
-        config,
-        retention::now_millis(),
+
+    // Induce the pull: an unsolicited history-unavailable error makes
+    // the node request a snapshot from this peer over the live session.
+    evil.send(&Message::Error {
+        code: 3,
+        message: "ranges unavailable".into(),
+    })
+    .await
+    .map_err(|e| format!("attacker induce pull: {e}"))?;
+    let reqs = evil
+        .collect_until(REQUEST_TIMEOUT, |m| matches!(m, Message::SnapshotRequest))
+        .await;
+    if !reqs.iter().any(|m| matches!(m, Message::SnapshotRequest)) {
+        return Err("stale node never requested a snapshot from the attacker".into());
+    }
+
+    let forged = forge_corrupt_snapshot(
+        attacker.config(),
+        ATTACKER_ID,
+        dbid,
+        victim_id,
+        evil.welcome_schema(),
+        FORGED_BYTES,
     )
-    .expect("forge manifest");
-    assert_eq!(
-        manifest.chunks.len(),
-        2,
-        "fixture: forged snapshot must span exactly two chunks"
-    );
+    .map_err(|e| format!("forge corrupt snapshot: {e}"))?;
+    evil.send(&Message::SnapshotManifest(forged.manifest.clone()))
+        .await
+        .map_err(|e| format!("attacker serve manifest: {e}"))?;
 
-    // Non-vacuous guards: the uncorrupted bytes verify against the manifest,
-    // and the corrupted bytes must not.
-    assert_eq!(
-        <[u8; 32]>::from(Sha256::digest(&data)),
-        manifest.digest,
-        "fixture: uncorrupted snapshot does not verify locally"
-    );
-    let mut parts = data.chunks(protocol::CHUNK_BYTES);
-    let chunk0 = parts.next().expect("fixture: first chunk").to_vec();
-    let mut chunk1_bad = parts.next().expect("fixture: second chunk").to_vec();
-    assert!(parts.next().is_none(), "fixture: unexpected third chunk");
-    // Flip a byte mid-chunk. An ASCII-to-ASCII flip preserves length and
-    // framing; only the digest differs.
-    let mid = chunk1_bad.len() / 2;
-    chunk1_bad[mid] ^= 0x01;
-    assert_eq!(
-        chunk1_bad.len(),
-        data.len() - chunk0.len(),
-        "fixture: corruption changed the encoded length"
-    );
-    assert_ne!(
-        <[u8; 32]>::from(Sha256::digest(&chunk1_bad)),
-        manifest.chunks[1],
-        "fixture: corrupted snapshot still verifies locally"
-    );
-    let transfer = manifest.transfer;
-    ForgedSnapshot {
-        manifest,
-        transfer,
-        chunk0,
-        chunk1_bad,
+    // The manifest passed structural checks: the node asks for its chunks.
+    let needs = evil
+        .collect_until(NEED_TIMEOUT, |m| matches!(m, Message::SnapshotNeed { .. }))
+        .await;
+    if !needs.iter().any(|m| {
+        matches!(m, Message::SnapshotNeed { transfer, .. } if *transfer == forged.transfer)
+    }) {
+        return Err("victim never asked for the forged chunks (manifest not accepted)".into());
     }
+
+    evil.send(&Message::SnapshotChunk {
+        transfer: forged.transfer,
+        index: 0,
+        data: forged.chunk0,
+    })
+    .await
+    .map_err(|e| format!("attacker serve chunk0: {e}"))?;
+    evil.send(&Message::SnapshotChunk {
+        transfer: forged.transfer,
+        index: 1,
+        data: forged.chunk1_bad,
+    })
+    .await
+    .map_err(|e| format!("attacker serve chunk1: {e}"))?;
+
+    // The corrupt transfer must never complete: drain while asserting
+    // no SnapshotApplied arrives.
+    let tail = evil.collect_until(DRAIN_TIMEOUT, |_| false).await;
+    if tail.iter().any(|m| matches!(m, Message::SnapshotApplied { .. })) {
+        return Err("victim applied the corrupt snapshot".into());
+    }
+    evil.close();
+
+    // The receiver must detect the digest mismatch and fail the chunk...
+    let fail_deadline = Instant::now() + FAIL_TIMEOUT;
+    loop {
+        if let Some(err) = last_error(cluster, STALE).await {
+            if err.contains("snapshot chunk") {
+                eprintln!("victim rejected the corrupt chunk: {err}");
+                break;
+            }
+        }
+        if Instant::now() >= fail_deadline {
+            return Err("victim never recorded the corrupt-chunk rejection".into());
+        }
+        tokio::time::sleep(CONVERGE_POLL).await;
+    }
+
+    // ...while no snapshot completed and nothing was partially published.
+    tokio::time::sleep(SETTLE).await;
+    if row_count(cluster, STALE).await != 5 {
+        return Err(format!(
+            "stale node row count moved on corrupt transfer: {} != 5",
+            row_count(cluster, STALE).await
+        ));
+    }
+    if digest(&names(cluster, STALE).await) != pre_stop_digest {
+        return Err("stale node digest changed on corrupt transfer (partial publication)".into());
+    }
+    if committed(cluster, STALE).await != gen_before_attack {
+        return Err("commit cursor moved on corrupt transfer (partial publication)".into());
+    }
+    if log_counters(cluster, STALE).await != log_before_attack {
+        return Err("replication counters moved on corrupt transfer (partial publication)".into());
+    }
+
+    // The staged corrupt transfer is discarded on expiry (the only
+    // staged-transfer discard path); the honest leg below proves it.
+    tokio::time::sleep(FORGED_LIFETIME + RECLAIM_MARGIN).await;
+
+    // Phase 4: honest peers return; the node retries from them and converges.
+    for (from, target) in [(2, 0), (2, 1), (0, 2), (1, 2)] {
+        cluster
+            .add_peer(from, target)
+            .await
+            .map_err(|e| format!("honest AddPeer({from},{target}): {e}"))?;
+    }
+    let _ = cluster.sync_all().await;
+    let log_pre_heal = log_counters(cluster, STALE).await;
+    wait_converged(cluster, 65, HONEST_TIMEOUT).await;
+
+    // The rejoin completed via an honest snapshot, not the corrupt one
+    // and not the logs: 60 rows arrived while the log-path counters
+    // stayed flat (snapshot application bypasses both).
+    if log_counters(cluster, STALE).await != log_pre_heal {
+        return Err("honest resync arrived over the log path, not a snapshot".into());
+    }
+    if committed(cluster, STALE).await < gen_before_attack {
+        return Err("commit cursor regressed (non-monotonic publication)".into());
+    }
+    let stale_rows = names(cluster, STALE)
+        .await
+        .iter()
+        .filter(|name| name.starts_with("stale-"))
+        .count();
+    if stale_rows != 5 {
+        return Err(format!("stale rows after honest resync = {stale_rows}, want 5"));
+    }
+    Ok(())
 }
 
-#[test]
-fn stale_node_discards_corrupt_snapshot_then_converges() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn stale_node_discards_corrupt_snapshot_then_converges() {
     // Fixed node ids (asserted distinct from the attacker id) so the
     // snapshot-trust overlays can be built before the cluster opens.
     let node_ids = vec![[0x10; 16], [0x20; 16], [0x30; 16]];
@@ -442,6 +555,7 @@ fn stale_node_discards_corrupt_snapshot_then_converges() {
         !node_ids.contains(&ATTACKER_ID),
         "attacker id collides with a node id"
     );
+
     // Every node trusts every node as a snapshot donor (Go harness all-node
     // fixture policy); the victim additionally authorizes the hostile source
     // (Go: the test appends the attacker to the victim's config file).
@@ -477,275 +591,18 @@ fn stale_node_discards_corrupt_snapshot_then_converges() {
         extra_trusted_origins,
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
 
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Same schema on every node (Go: TypedRecords fixture tables).
-        for i in 0..cluster.len() {
-            cluster
-                .node(i)
-                .migrate(Migration::new(
-                    "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-                ))
-                .expect("migrate records table");
-            cluster.node(i).flush().expect("flush schema");
-        }
-
-        // Phase 1: build the honest mesh explicitly and converge a baseline.
-        for (from, target) in [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)] {
-            cluster
-                .add_peer(from, target)
-                .unwrap_or_else(|e| panic!("AddPeer({from},{target}): {e}"));
-        }
-        for i in 0..5 {
-            insert(&cluster, STALE, i + 1, &format!("stale-{i}"));
-        }
-        cluster.node(STALE).flush().expect("flush baseline");
-        wait_converged(&cluster, 5, BASELINE_TIMEOUT);
-        let pre_stop_digest = digest(&names(cluster.node(STALE)));
-
-        // Phase 2: isolate node3, stop it, and let the survivors write past
-        // retention so the rejoin genuinely needs the snapshot path.
-        for (from, target) in [(2, 0), (2, 1), (0, 2), (1, 2)] {
-            cluster
-                .remove_peer(from, target)
-                .unwrap_or_else(|e| panic!("RemovePeer({from},{target}): {e}"));
-        }
-        cluster.stop_node(STALE);
-        // Flush every write: the product mints one replication log entry per
-        // flush batch, not per SQL transaction, so a single trailing flush
-        // would leave fewer entries than `minimum_retained` and nothing
-        // would ever become eligible for pruning.
-        for i in 0..60 {
-            insert(&cluster, 0, 100 + i, &format!("fresh-{i}"));
-            cluster.node(0).flush().expect("flush survivor write");
-        }
-        wait_row_count(&cluster, 0, 65, ROW_TIMEOUT);
-        wait_row_count(&cluster, 1, 65, ROW_TIMEOUT);
-        // Member-deadline expiry, then explicit collection passes: the stale
-        // node's retention pin must lapse before its needed ranges become
-        // genuinely unrecoverable from logs.
-        eprintln!("waiting for member-deadline expiry and collection");
-        std::thread::sleep(env_seconds(
-            "MURMUR_CORRUPT_SNAPSHOT_GC_WAIT_SECONDS",
-            30,
-        ));
-        let collect_deadline = Instant::now() + COLLECT_TIMEOUT;
-        loop {
-            let totals = [collected_total(&cluster, 0), collected_total(&cluster, 1)];
-            if totals.iter().all(|&n| n >= MIN_COLLECTED) {
-                eprintln!("survivors pruned {totals:?} transactions past retention");
-                break;
-            }
-            if Instant::now() >= collect_deadline {
-                panic!(
-                    "survivors collected only {totals:?} transactions, want >= {MIN_COLLECTED} each (snapshot path not forced)"
-                );
-            }
-            collect_history(&cluster, 0);
-            collect_history(&cluster, 1);
-            std::thread::sleep(Duration::from_secs(2));
-        }
-        // Prove the deadline leg explicitly: the victim is now older than
-        // every survivor's offline memory.
-        for i in [0, 1] {
-            let status = cluster
-                .node(i)
-                .replication()
-                .expect("replication handle")
-                .retention_status()
-                .expect("retention status");
-            let victim = cluster.node_id(STALE);
-            let peer = status
-                .peers
-                .iter()
-                .find(|p| p.node == victim)
-                .expect("victim retention record");
-            let age = retention::now_millis().saturating_sub(peer.last_seen_millis);
-            assert!(
-                age > MAXIMUM_OFFLINE.as_millis() as u64,
-                "node {i} still pins the victim (last seen {age} ms ago)"
-            );
-        }
-
-        // Phase 3: node3 restarts peerless; the attacker's inbound session is
-        // its only source. The attacker induces a snapshot pull, then serves
-        // bit-flipped chunks.
-        cluster
-            .start_node(STALE)
-            .expect("stale node restart");
-        let victim_addr = cluster.node_info(STALE).repl_addr;
-        let victim_id = cluster.node_id(STALE);
-        let dbid = cluster.database_id();
-        let gen_before_attack = committed(&cluster, STALE);
-        let log_before_attack = log_counters(&cluster, STALE);
-
-        let issued = cluster
-            .issue_cert(&ATTACKER_ID)
-            .expect("issue attacker cert");
-        let mut attacker_config = ReplConfig::new(
-            "127.0.0.1:0".parse().unwrap(),
-            issued.credentials,
-            ATTACKER_SEED,
-        );
-        attacker_config.snapshot_transfer_lifetime = FORGED_LIFETIME;
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("attacker runtime");
-        rt.block_on(async {
-            // The QUIC endpoint requires a live tokio runtime context.
-            let attacker = Attacker::new(attacker_config);
-            let mut evil = attacker.dial(victim_addr, dbid, victim_id).await;
-            // Prove the "only available source" premise: exactly one peer.
-            // The victim registers the inbound session asynchronously, so
-            // poll for the count instead of asserting immediately.
-            let one_peer = wait_until(Duration::from_secs(10), Duration::from_millis(50), || {
-                connected_peers(&cluster, STALE) == 1
-            });
-            assert!(
-                one_peer,
-                "stale node has {} connected peers during the attack, want 1",
-                connected_peers(&cluster, STALE)
-            );
-            // Induce the pull: an unsolicited history-unavailable error makes
-            // the node request a snapshot from this peer over the live session.
-            evil
-                .send(&Message::Error {
-                    code: 3,
-                    message: "ranges unavailable".into(),
-                })
-                .await;
-            let reqs = evil
-                .collect_until(REQUEST_TIMEOUT, |m| {
-                    matches!(m, Message::SnapshotRequest)
-                })
-                .await;
-            assert!(
-                reqs.iter().any(|m| matches!(m, Message::SnapshotRequest)),
-                "stale node never requested a snapshot from the attacker"
-            );
-            let forged =
-                build_corrupt_snapshot(&attacker.config, dbid, victim_id, &evil.welcome_schema);
-            evil.send(&Message::SnapshotManifest(forged.manifest.clone()))
-                .await;
-            // The manifest passed structural checks: the node asks for its
-            // chunks (the received-counters-moved leg).
-            let needs = evil
-                .collect_until(NEED_TIMEOUT, |m| {
-                    matches!(m, Message::SnapshotNeed { .. })
-                })
-                .await;
-            assert!(
-                needs.iter().any(
-                    |m| matches!(m, Message::SnapshotNeed { transfer, .. } if *transfer == forged.transfer)
-                ),
-                "victim never asked for the forged chunks (manifest not accepted)"
-            );
-            evil
-                .send(&Message::SnapshotChunk {
-                    transfer: forged.transfer,
-                    index: 0,
-                    data: forged.chunk0,
-                })
-                .await;
-            evil
-                .send(&Message::SnapshotChunk {
-                    transfer: forged.transfer,
-                    index: 1,
-                    data: forged.chunk1_bad,
-                })
-                .await;
-            // The corrupt transfer must never complete: drain while asserting
-            // no SnapshotApplied arrives (the victim closes the session on
-            // the digest mismatch, which ends the drain early).
-            let tail = evil.collect_until(DRAIN_TIMEOUT, |_| false).await;
-            assert!(
-                !tail
-                    .iter()
-                    .any(|m| matches!(m, Message::SnapshotApplied { .. })),
-                "victim applied the corrupt snapshot"
-            );
-            evil.close();
-        });
-
-        // The receiver must detect the digest mismatch and fail the chunk...
-        let fail_deadline = Instant::now() + FAIL_TIMEOUT;
-        loop {
-            if let Some(err) = last_error(&cluster, STALE) {
-                if err.contains("snapshot chunk") {
-                    eprintln!("victim rejected the corrupt chunk: {err}");
-                    break;
-                }
-            }
-            assert!(
-                Instant::now() < fail_deadline,
-                "victim never recorded the corrupt-chunk rejection"
-            );
-            std::thread::sleep(CONVERGE_POLL);
-        }
-        // ...while no snapshot completed and nothing was partially published.
-        std::thread::sleep(SETTLE);
-        assert_eq!(
-            row_count(cluster.node(STALE)),
-            5,
-            "stale node row count moved on the corrupt transfer (partial publication)"
-        );
-        assert_eq!(
-            digest(&names(cluster.node(STALE))),
-            pre_stop_digest,
-            "stale node digest changed on the corrupt transfer (partial publication)"
-        );
-        assert_eq!(
-            committed(&cluster, STALE),
-            gen_before_attack,
-            "commit cursor moved on the corrupt transfer (partial publication)"
-        );
-        assert_eq!(
-            log_counters(&cluster, STALE),
-            log_before_attack,
-            "replication counters moved on the corrupt transfer (partial publication)"
-        );
-
-        // The staged corrupt transfer is discarded on expiry (the only
-        // staged-transfer discard path); the honest leg below proves it.
-        std::thread::sleep(FORGED_LIFETIME + RECLAIM_MARGIN);
-
-        // Phase 4: honest peers return; the node retries from them and converges.
-        for (from, target) in [(2, 0), (2, 1), (0, 2), (1, 2)] {
-            cluster
-                .add_peer(from, target)
-                .unwrap_or_else(|e| panic!("honest AddPeer({from},{target}): {e}"));
-        }
-        let log_pre_heal = log_counters(&cluster, STALE);
-        wait_converged(&cluster, 65, HONEST_TIMEOUT);
-        // The rejoin completed via an honest snapshot, not the corrupt one
-        // and not the logs: 60 rows arrived while the log-path counters
-        // stayed flat (snapshot application bypasses both).
-        assert_eq!(
-            log_counters(&cluster, STALE),
-            log_pre_heal,
-            "honest resync arrived over the log path, not a snapshot"
-        );
-        assert!(
-            committed(&cluster, STALE) >= gen_before_attack,
-            "commit cursor regressed (non-monotonic publication)"
-        );
-        // The stale node's acknowledged pre-stop state survives the merge.
-        let stale_rows = names(cluster.node(STALE))
-            .iter()
-            .filter(|name| name.starts_with("stale-"))
-            .count();
-        assert_eq!(
-            stale_rows, 5,
-            "stale rows after honest resync = {stale_rows}, want 5"
-        );
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("corrupt-snapshot-no-convergence");
+    let result = run_body(&mut cluster).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
+    if failed {
+        cluster.dump_forensics("corrupt-snapshot-no-convergence").await;
+    }
+    cluster.finish(failed).await;
     assert!(
         !failed,
         "scenario failed; artifacts retained under tests-live/failures/"

@@ -6,10 +6,11 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/endurance-chaos/`
 
 ## What it proves
 
-Long-duration combined-fault validation: a live multi-node mesh absorbs
-continuous writes while rolling restarts, peer flaps, disk pressure,
-online key rotation, snapshot resyncs, and origin-log GC all overlap for
-a configured chaos window. The verdict is exact cross-node convergence
+Long-duration combined-fault validation: a live multi-node mesh of
+`murmur-server` processes (PostgreSQL wire protocol) absorbs continuous
+writes while rolling restarts, peer flaps, disk pressure, online key
+rotation, snapshot resyncs, and origin-log GC all overlap for a
+configured chaos window. The verdict is exact cross-node convergence
 (equal row counts plus identical PK-ordered row contents) with
 counter-proven GC progress on every node, at least one proven snapshot
 resync, successful key rotations, a rejoined full mesh, and a post-chaos
@@ -23,7 +24,7 @@ Same names and defaults as Go:
 - `MURMUR_ENDURANCE_DURATION_SECONDS` (default 600): chaos window.
 - `MURMUR_ENDURANCE_SETTLE_SECONDS` (default 300): max convergence wait.
 - `MURMUR_ENDURANCE_WRITE_INTERVAL_MS` (default 25): pacing per writer
-  thread (up to 8 writers).
+  task (up to 8 writers).
 - `MURMUR_ENDURANCE_MAX_ROWS` (default 10000): live-id ceiling; past it
   writers recycle via updates/deletes.
 - `MURMUR_ENDURANCE_SEED` (default 1): RNG seed.
@@ -40,7 +41,8 @@ Same names and defaults as Go:
   `MURMUR_ENDURANCE_IMPAIR_OFF_SECONDS` (default 20): impairment phase
   length and clear gap. `MURMUR_ENDURANCE_IMPAIR_LATENCY_MS` (default 150)
   and `MURMUR_ENDURANCE_IMPAIR_LOSS_PCT` (default 3) are parsed and logged
-  but have no effect (flap-only; no tc privilege model in-process).
+  but have no effect (flap-only; no tc privilege model for child
+  processes).
 - `MURMUR_ENDURANCE_DISK_SECONDS` (default 180) /
   `MURMUR_ENDURANCE_DISK_MB` (default 128) /
   `MURMUR_ENDURANCE_DISK_HOLD_SECONDS` (default 60): disk-pressure holds.
@@ -48,7 +50,7 @@ Same names and defaults as Go:
   skew leg is degraded away (no daemon for libfaketime).
 - Standard harness knobs: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 Quick smoke (run via `tests-live/run.sh`, never directly):
 
@@ -77,63 +79,83 @@ Transient write errors during chaos are counted, never fatal.
 
 ## Deviations from the Go original
 
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS
+  (per design).
 - Plain SQL (`contention(id TEXT NOT NULL PRIMARY KEY, name TEXT NOT NULL,
-  phone TEXT NOT NULL, score INTEGER NOT NULL)`) replaces the
-  typed-contention HTTP API; writer row shapes keep the Go 32-hex-char
-  ids (`%08x%024x` per writer/sequence) and `writer-<n>` names. The Go
-  two-call update (name, then phone) is one SQL `UPDATE` setting both
-  columns; convergence verdicts hash actual state, so the split is
+  phone TEXT NOT NULL, score INTEGER NOT NULL)`) via the harness
+  `NodeClient` replaces the typed-contention HTTP API; writer row
+  shapes keep the Go 32-hex-char ids (`%08x%024x` per
+  writer/sequence) and `writer-<n>` names. The Go two-call update
+  (name, then phone) is one SQL `UPDATE` setting both columns;
+  convergence verdicts hash actual state, so the split is
   unobservable there.
+- The table is explicitly flagged `MURMUR SET TABLE ... REPLICATED true`
+  on each node (row convergence needs the per-node flag); the Go
+  fixture tables replicate by default.
 - Convergence compares exact sorted row vectors (which imply equal
   counts and digests); the logged digest is dependency-free FNV-1a
   instead of sha256 hex.
-- Every restart is in-process `close()` + reopen: true SIGKILL vs
-  graceful cannot target one in-process node without freezing the test
-  driver, so the Go alternating kill/graceful mix has no effect.
+- Restarts alternate crash (`kill_node`) and graceful (`stop_node`)
+  legs (Go parity): the harness kills real child processes either
+  way. The old in-process port could not distinguish them.
 - tc/netem impairment degrades to logical peer flaps in all runs (the Go
   fallback when `CAP_NET_ADMIN` is absent): per-edge `remove_peer` holds
   cycling the latency -> loss -> both phase names, then re-add. There is
-  no tc probe because ephemeral in-process QUIC ports have no stable
+  no tc probe because ephemeral child-process ports have no stable
   shaping target.
-- Clock skew is always skipped and reported as degraded: in-process
-  nodes share the test driver clock, so no node can run under
-  libfaketime (Go skips the same way without libfaketime or with a
-  static daemon).
-- Key rotation is `Database::rotate_master_key` with a fresh
+- Clock skew is always skipped and reported as degraded: server
+  children share the host clock, so no node can run under libfaketime
+  (Go skips the same way without libfaketime or with a static daemon).
+- Key rotation is `MURMUR ROTATE KEY '<previous>' '<new>'` with a fresh
   `/dev/urandom` key; the Rust product has no key IDs, so the Go active
   `ApplicationKeyID` assertion maps to staying online plus later
   restarts unlocking with the new key (the harness stored key is updated
-  via the new `Cluster::set_node_key`, mirroring Go `rewriteKeyConfig`).
+  via `Cluster::set_node_key`, mirroring Go `rewriteKeyConfig`).
 - Snapshot trust is configured up front (every node trusts every node)
   instead of via the Go fixture policy; without this overlay no leg
   could request a snapshot.
 - The Go `snapshots_received >= 1` leg maps to an event-driven proof per
-  offline window off the `snapshots_applied` counter in
-  `ReplicationMetrics`: with writers still running, the victim is
-  polled for up to 240 s until a snapshot applies and the post-apply
-  sample shows the bulk arrived via the snapshot path (row-set drift
-  below the outage's acked write count while the log-path
-  `applied_transactions` delta since the apply stays below it too — a
-  pure log catch-up would have to apply every missed transaction, as
-  the `snapshot-resync` port relies on). The victim's own restart plus
-  a donor build plus the chunk transfer can take ~45 s under chaos
-  (spool rescans dominate), and a stale donor winning the race forces
-  a second cycle, so the poll allows two full cycles rather than
-  sampling once at a fixed delay.
-- No GC-failures counter exists, and the engine multiplexes every
-  subsystem error (including peer-disconnect noise from
-  restarts/flaps) into one `last_error` latch — so unlike the
-  quiesced `gc-balance`/`maintenance-under-load` ports, which assert the
-  latch flat, this port fails only on GC-substring matches
+  offline window off the log-path `applied_transactions` counter
+  (`MURMUR SHOW REPLICATION`; no snapshot counter exists over the
+  wire): with writers still running, the victim is polled for up to
+  240 s until the post-rejoin sample shows the bulk arrived off the log
+  path (row-set drift below the outage's acked write count while the
+  log-path applied delta since the rejoin stays below it too — a pure
+  log catch-up would have to apply every missed transaction). The
+  outage outlasts retention plus the offline pin, so survivors GC the
+  victim's ranges and only a snapshot can deliver the bulk. The
+  victim's own restart plus a donor build plus the chunk transfer can
+  take ~45 s under chaos (spool rescans dominate), and a stale donor
+  winning the race forces a second cycle, so the poll allows two full
+  cycles rather than sampling once at a fixed delay.
+- GC counters come from the wire: `MURMUR SHOW RETENTION`
+  `collected_transactions` plus `MURMUR SHOW REPLICATION` `last_error`.
+  No GC-runs counter exists over the wire, so a run is proven by
+  `collected` advancing across samples (durable, restart-proof
+  high-water history). No GC-failures counter exists either, and the
+  engine multiplexes every subsystem error (including
+  peer-disconnect noise from restarts/flaps) into one `last_error`
+  latch — so this port fails only on GC-substring matches
   (`retention`/`collect`/`gc_`/`prune`), the faithful mapping of Go's
   GC-specific `spedsql_gc_failures_total` under chaos.
-- The impairment cycler runs on the chaos director (test thread) rather
-  than a background thread, because peer add/remove borrows the
-  cluster; writer, status-sampler, and disk-pressure loops stay on
-  background threads. Status/GC sampling reads through the shared
-  handle table, never through the cluster.
+- Spool pressure comes from `MURMUR SHOW METRICS SPOOL` (`disk_bytes`);
+  mesh membership from `MURMUR SHOW PEERS` (connected rows per node).
+- Writers, the status sampler, and the disk cycler run as tokio tasks
+  sharing the cluster through one async mutex; the director runs on
+  the test task. Every cluster touch locks, and each write re-checks
+  its target's alive flag under the same lock, so lifecycle
+  (stop/start) and reads never race (this replaces the old shared
+  `Database` handle table, which has no multi-process equivalent).
 - The markdown report is written to `runtime/endurance-chaos/`
   (retained under `tests-live/failures/` on FAIL via `Cluster::finish`)
   instead of next to the test, so passing runs leave the repo clean.
 - One table, one bounded working set; no file traffic or schema
   migration during chaos, same as Go.
+
+## Compile check
+
+```sh
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/endurance-chaos/Cargo.toml
+```

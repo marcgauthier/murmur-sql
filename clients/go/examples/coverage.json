@@ -1,74 +1,63 @@
 {
-  "Lifecycle, recovery, durability": [
+  "Connect and unlock": [
+    "basic"
+  ],
+  "CRUD with parameters": [
     "basic",
-    "recovery"
+    "concurrency"
   ],
-  "Migrations and offline exchange": [
-    "migrations",
-    "offline"
+  "DDL migrations": [
+    "migrations"
   ],
-  "FTS5 and vector indexes": [
-    "search",
-    "replication"
+  "Automatic replication keys": [
+    "tables"
   ],
-  "Table replication": [
-    "migrations",
-    "replication"
+  "Replication flags": [
+    "tables"
   ],
-  "Subscriptions": [
-    "subscriptions"
+  "Durability flush": [
+    "tables"
   ],
-  "Counters, sets, min/max": [
-    "policies",
-    "retention"
+  "Verified TLS": [
+    "tls"
   ],
-  "Network replication": [
+  "Concurrent use": [
+    "concurrency"
+  ],
+  "Remote backup and restore": [
+    "backup"
+  ],
+  "Backup file transfer": [
+    "backup"
+  ],
+  "Engine metrics": [
+    "metrics"
+  ],
+  "Encrypted file transfer and cursors": [
+    "files"
+  ],
+  "Column full-text search": [
+    "search"
+  ],
+  "Column vector search": [
+    "vectors"
+  ],
+  "SQLite JSON queries": [
+    "json"
+  ],
+  "Replication peer management": [
     "replication"
   ],
   "Replication retention": [
-    "retention",
-    "snapshots"
-  ],
-  "Files": [
-    "files",
-    "bridge"
-  ],
-  "Backup and key management": [
-    "backup",
-    "keys"
-  ],
-  "Scheduling and metrics": [
-    "scheduler"
-  ],
-  "Standalone backend": [
-    "backend",
-    "files"
-  ],
-  "High/Low bridge": [
-    "bridge",
-    "bridge-transports"
-  ],
-  "Snapshot protocol": [
-    "snapshots",
-    "retention"
-  ],
-  "Transport, crypto and wire format": [
-    "protocol",
-    "bridge-transports"
-  ],
-  "Unmanaged SQLite sessions": [
-    "sessions"
-  ],
-  "Continuous replication and bounded batches": [
     "replication"
   ],
-  "Streamed snapshot installation": [
-    "snapshots"
+  "CRDT policy operations": [
+    "replication"
   ],
-  "Batched backend reads": [
-    "backend"
+  "Bridge ownership release": [
+    "bridge"
   ],
-  "Blocking scheduler utility": [
-    "backend"
+  "Key rotation": [
+    "keys"
   ]
 }

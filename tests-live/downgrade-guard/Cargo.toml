@@ -4,13 +4,13 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-murmur-live-harness = { path = "../harness" }
-# Newer-store fixture only: re-encodes the spool `00/identity` record with a
-# bumped format (`postcard` + `serde`, same versions as the product), reads
-# back blocks the product wrote with its zstd block codec (`zstd`, same
-# version as the product), and digests rows/files (`sha2`, same version as
-# the product).
+murmur-live-harness = { package = "murmur-live-sql-harness", path = "../sql-harness" }
+murmur-client = { path = "../../clients/rust" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+spool = { package = "murmur-spool", path = "../../spool" }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"
 zstd = "0.13"
+toml_edit = "0.22"
+blake3 = "1"

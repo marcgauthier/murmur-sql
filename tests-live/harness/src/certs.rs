@@ -1,11 +1,12 @@
 //! Test CA + per-node QUIC/TLS credential provisioning (rcgen).
 //!
-//! Mirrors the `tests/replication.rs` `configs()` pattern: one self-signed CA
-//! per cluster, one leaf per node with SAN URI `replicateddb://node/<hex>`
-//! (the identity [`murmur_replication::transport::node_id`] parses) and
-//! server+client EKU. `tls/` files are kept per node for forensics parity.
+//! One self-signed CA per cluster, one leaf per node with SAN URI
+//! `replicateddb://node/<hex>` (the identity the replication transport
+//! parses) and server+client EKU. Material is written as PEM under each
+//! node's `tls/` dir for the server's `replication.*_file` settings and kept
+//! for forensics parity.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Cluster test certificate authority.
@@ -14,11 +15,21 @@ pub struct Ca {
     key: rcgen::KeyPair,
 }
 
-/// Issued leaf material for one node.
+/// Issued leaf material for one node (PEM, plus DER for in-process QUIC
+/// endpoints: the attacker fixture builds product `Credentials` from the
+/// DER without PEM re-parsing).
 pub struct Issued {
-    pub credentials: murmur_replication::Credentials,
+    pub cert_pem: String,
+    pub key_pem: String,
     pub cert_der: Vec<u8>,
     pub key_der: Vec<u8>,
+}
+
+/// PEM files under a node's `tls/` dir.
+pub struct TlsPaths {
+    pub ca: PathBuf,
+    pub chain: PathBuf,
+    pub key: PathBuf,
 }
 
 impl Ca {
@@ -28,6 +39,10 @@ impl Ca {
         let key = rcgen::KeyPair::generate()?;
         let cert = params.self_signed(&key)?;
         Ok(Self { cert, key })
+    }
+
+    pub fn ca_pem(&self) -> String {
+        self.cert.pem()
     }
 
     pub fn ca_der(&self) -> Vec<u8> {
@@ -44,7 +59,7 @@ impl Ca {
         let key = rcgen::KeyPair::generate()?;
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new())?;
         params.subject_alt_names = vec![rcgen::SanType::URI(
-            format!("replicateddb://node/{}", murmur_replication::hex(node_id)).try_into()?,
+            format!("replicateddb://node/{}", crate::hex(node_id)).try_into()?,
         )];
         params.extended_key_usages = vec![
             rcgen::ExtendedKeyUsagePurpose::ServerAuth,
@@ -57,36 +72,35 @@ impl Ca {
                 now + time::Duration::try_from(ttl).unwrap_or(time::Duration::MAX);
         }
         let cert = params.signed_by(&key, &self.cert, &self.key)?;
-        let cert_der = cert.der().to_vec();
-        let key_der = key.serialize_der();
         Ok(Issued {
-            credentials: murmur_replication::Credentials {
-                chain: vec![cert_der.clone()],
-                private_key: key_der.clone().into(),
-                roots: vec![self.ca_der()],
-            },
-            cert_der,
-            key_der,
+            cert_pem: cert.pem(),
+            key_pem: key.serialize_pem(),
+            cert_der: cert.der().to_vec(),
+            key_der: key.serialize_der(),
         })
     }
 
-    /// Write `tls/ca.der`, `tls/node.der`, `tls/node.key` under `node_dir`.
+    /// Write `tls/ca.pem`, `tls/node.pem`, `tls/node-key.pem` under `node_dir`.
     pub fn write_tls_dir(
         &self,
         issued: &Issued,
         node_dir: &Path,
-    ) -> std::io::Result<()> {
+    ) -> std::io::Result<TlsPaths> {
         let tls = node_dir.join("tls");
         std::fs::create_dir_all(&tls)?;
-        std::fs::write(tls.join("ca.der"), self.ca_der())?;
-        std::fs::write(tls.join("node.der"), &issued.cert_der)?;
-        let key_path = tls.join("node.key");
-        std::fs::write(&key_path, &issued.key_der)?;
+        let paths = TlsPaths {
+            ca: tls.join("ca.pem"),
+            chain: tls.join("node.pem"),
+            key: tls.join("node-key.pem"),
+        };
+        std::fs::write(&paths.ca, self.ca_pem())?;
+        std::fs::write(&paths.chain, &issued.cert_pem)?;
+        std::fs::write(&paths.key, &issued.key_pem)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+            std::fs::set_permissions(&paths.key, std::fs::Permissions::from_mode(0o600))?;
         }
-        Ok(())
+        Ok(paths)
     }
 }

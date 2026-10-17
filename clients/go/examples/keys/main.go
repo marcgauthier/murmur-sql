@@ -1,67 +1,53 @@
+// Example keys rotates the encryption key and reconnects with data intact.
 package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
+
 	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/demo"
+	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
 )
 
-func run(ctx context.Context, e *demo.Env) error {
-	db, err := e.Open("db", demo.Options())
-	if err != nil {
-		return err
-	}
-	if err = db.Migrate(murmur.NewMigration("CREATE TABLE docs(id INTEGER PRIMARY KEY)")); err != nil {
-		return err
-	}
-	if _, err = db.Exec("INSERT INTO docs VALUES(1)"); err != nil {
-		return err
-	}
-	if err = db.Flush(); err != nil {
-		return err
-	}
-	before, err := db.KeyInventory()
-	if err != nil {
-		return err
-	}
-	if err = db.RotateDataKey(); err != nil {
-		return err
-	}
-	after, err := db.KeyInventory()
-	if err != nil {
-		return err
-	}
-	if err = demo.Require(before.ActiveDataKeyID != after.ActiveDataKeyID, "data key did not rotate"); err != nil {
-		return err
-	}
-	replacement, err := demo.Key()
-	if err != nil {
-		return err
-	}
-	if err = db.RotateMasterKey(replacement); err != nil {
-		return err
-	}
-	if err = db.Close(); err != nil {
-		return err
-	}
-	old, err := murmur.Open(e.Path("db"), e.Key[:], murmur.DefaultOptions())
-	if old != nil {
-		old.Close()
-	}
-	if !errors.Is(err, murmur.ErrWrongKey) {
-		return demo.Require(false, "old wrapping key accepted: %v", err)
-	}
-	reopened, err := murmur.Open(e.Path("db"), replacement[:], murmur.DefaultOptions())
-	if err != nil {
-		return err
-	}
-	e.Defer(reopened.Close)
-	count, err := demo.Int(reopened, "SELECT count(*) FROM docs")
-	if err != nil {
-		return err
-	}
-	e.Print("Data key %d -> %d; new master key opens preserved rows, old key rejected", before.ActiveDataKeyID, after.ActiveDataKeyID)
-	return demo.Require(count == 1, "rotation lost data")
+func main() {
+	run.Main(func(t servertest.TB, dir string) {
+		ctx := context.Background()
+		server := servertest.Start(t, dir, servertest.Options{})
+		cfg := murmur.Config{Host: "127.0.0.1", Port: server.Port, User: "admin", Password: "test-password", Key: "old-key"}
+		db, err := murmur.Open(ctx, cfg)
+		if err != nil {
+			t.Fatalf("open: %v", err)
+		}
+		defer db.Close()
+		if _, err := db.ExecContext(ctx, "CREATE TABLE records(id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+			t.Fatalf("create: %v", err)
+		}
+		if _, err := db.ExecContext(ctx, "INSERT INTO records VALUES($1,$2)", 1, "kept"); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		if err := db.RotateKey(ctx, cfg.Key, "new-key"); err != nil {
+			t.Fatalf("rotate: %v", err)
+		}
+		db.Close()
+		stale, err := murmur.Open(ctx, cfg)
+		if err == nil {
+			stale.Close()
+			t.Fatalf("old key still works")
+		}
+		if murmur.CodeOf(err) != "28000" {
+			t.Fatalf("old key: %v", err)
+		}
+		cfg.Key = "new-key"
+		fresh, err := murmur.Open(ctx, cfg)
+		if err != nil {
+			t.Fatalf("reconnect: %v", err)
+		}
+		defer fresh.Close()
+		var value string
+		if err := fresh.QueryRowContext(ctx, "SELECT value FROM records WHERE id=$1", 1).Scan(&value); err != nil || value != "kept" {
+			t.Fatalf("read after rotation: %q, %v", value, err)
+		}
+		fmt.Println("keys: verified rotation, old-key rejection and preserved data")
+	})
 }
-func main() { demo.Main("keys", run) }

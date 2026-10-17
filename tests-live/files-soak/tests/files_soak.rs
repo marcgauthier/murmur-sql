@@ -10,16 +10,15 @@
 //! and metadata-to-verified-fetch p95 under 20 s, and the fetch gate must
 //! show every file completed with zero failures.
 //!
-//! There is no HTTP server in the Rust product, so uploads, downloads,
-//! metadata, and search use the direct `Database` file API
-//! (`upload_file`/`get_file`/`file_metadata`/`search_files`); peer fetch is
-//! automatic on the configured `fetch_interval` (no explicit fetch call
-//! exists). See the scenario README.md.
+//! Two `murmur-server` processes are driven over the PostgreSQL wire
+//! protocol; uploads, downloads, metadata, and search use `MURMUR FILE ...`
+//! commands. Peer fetch is automatic on the configured `fetch_interval`
+//! (no explicit fetch call exists). See the scenario README.md.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use murmur_live_harness::{env_seconds, wait_until, Cluster, ClusterOptions, FilesOptions};
+use murmur_live_harness::{env_seconds, Cluster, ClusterOptions, FilesOptions};
 
 /// File object key (Go: `soakObjectKey` 0x51..).
 const OBJECT_KEY: [u8; 32] = [0x51; 32];
@@ -27,6 +26,10 @@ const OBJECT_KEY: [u8; 32] = [0x51; 32];
 const FILE_BYTES: usize = 64 << 10;
 /// File cap (Go: `MaxFileBytes: 4 << 20`).
 const MAX_FILE_BYTES: u64 = 4 << 20;
+/// Upload wire chunk size (server cap: 1 MiB per append).
+const APPEND_CHUNK: usize = 256 << 10;
+/// Download wire chunk size (server cap: 1 MiB per page).
+const DOWNLOAD_CHUNK: usize = 256 << 10;
 /// Per-round metadata/fetch wait bound (Go: 20 s `WaitFileAvailable`).
 const WAIT: Duration = Duration::from_secs(20);
 /// Convergence poll interval.
@@ -35,6 +38,15 @@ const POLL: Duration = Duration::from_millis(50);
 const UPLOAD_P95_SLO: Duration = Duration::from_secs(5);
 /// Metadata-to-verified-fetch p95 SLO (Go: 20 s).
 const TRANSFER_P95_SLO: Duration = Duration::from_secs(20);
+
+/// One file-metadata row (`MURMUR FILE NEXT` columns: name, size,
+/// modified_ms, sha256, local).
+struct FileMeta {
+    name: String,
+    size: u64,
+    digest_hex: String,
+    local: bool,
+}
 
 /// Deterministic payload (Go: `data[i] = byte((round*31 + i*17) % 251)`).
 fn payload(round: usize) -> Vec<u8> {
@@ -49,8 +61,286 @@ fn p95(sorted: &[Duration]) -> Duration {
     sorted[(n - 1).min((95 * n + 99) / 100 - 1)]
 }
 
-#[test]
-fn encrypted_file_fetch_soak() {
+fn sql_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.to_ascii_lowercase().as_str() {
+        "t" | "true" | "1" => Ok(true),
+        "f" | "false" | "0" => Ok(false),
+        other => Err(format!("bad boolean {other:?}")),
+    }
+}
+
+/// Upload `data` under `name` on node `idx`: BEGIN, chunked APPEND
+/// (extended protocol, raw BYTEA), FINISH. Returns the published metadata.
+async fn file_upload(
+    cluster: &Cluster,
+    idx: usize,
+    name: &str,
+    data: &[u8],
+) -> Result<FileMeta, String> {
+    let node = cluster.node(idx);
+    let rows = node
+        .simple(&format!("MURMUR FILE UPLOAD BEGIN {}", sql_quote(name)))
+        .await
+        .map_err(|e| format!("node{} UPLOAD BEGIN {name:?}: {e}", idx + 1))?;
+    let upload = rows
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .ok_or_else(|| format!("node{} UPLOAD BEGIN {name:?}: no handle", idx + 1))?;
+    for chunk in data.chunks(APPEND_CHUNK.max(1)) {
+        node.execute("MURMUR FILE UPLOAD APPEND $1 $2", &[&upload, &chunk])
+            .await
+            .map_err(|e| format!("node{} UPLOAD APPEND {name:?}: {e}", idx + 1))?;
+    }
+    let rows = node
+        .simple(&format!("MURMUR FILE UPLOAD FINISH {}", sql_quote(&upload)))
+        .await
+        .map_err(|e| format!("node{} UPLOAD FINISH {name:?}: {e}", idx + 1))?;
+    let row = rows
+        .first()
+        .ok_or_else(|| format!("node{} UPLOAD FINISH {name:?}: no metadata", idx + 1))?;
+    parse_meta(row, idx)
+}
+
+/// Download the full verified bytes of `name` from node `idx`.
+async fn file_download(cluster: &Cluster, idx: usize, name: &str) -> Result<Vec<u8>, String> {
+    let node = cluster.node(idx);
+    let rows = node
+        .simple(&format!("MURMUR FILE DOWNLOAD {}", sql_quote(name)))
+        .await
+        .map_err(|e| format!("node{} DOWNLOAD {name:?}: {e}", idx + 1))?;
+    let handle = rows
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .ok_or_else(|| format!("node{} DOWNLOAD {name:?}: no handle", idx + 1))?;
+    let mut out = Vec::new();
+    loop {
+        let page = node
+            .query(
+                &format!("MURMUR FILE DOWNLOAD NEXT $1 LIMIT {DOWNLOAD_CHUNK}"),
+                &[&handle],
+            )
+            .await
+            .map_err(|e| format!("node{} DOWNLOAD NEXT {name:?}: {e}", idx + 1))?;
+        let row = page
+            .first()
+            .ok_or_else(|| format!("node{} DOWNLOAD NEXT {name:?}: empty page", idx + 1))?;
+        let chunk: Vec<u8> = row
+            .try_get(2)
+            .map_err(|e| format!("node{} DOWNLOAD NEXT {name:?}: bad chunk: {e}", idx + 1))?;
+        let eof: bool = row
+            .try_get(3)
+            .map_err(|e| format!("node{} DOWNLOAD NEXT {name:?}: bad eof: {e}", idx + 1))?;
+        out.extend_from_slice(&chunk);
+        if eof {
+            break;
+        }
+    }
+    node.simple(&format!("MURMUR FILE CLOSE {}", sql_quote(&handle)))
+        .await
+        .map_err(|e| format!("node{} CLOSE download {name:?}: {e}", idx + 1))?;
+    Ok(out)
+}
+
+/// List metadata on node `idx`, optionally restricted by a LIKE pattern
+/// (`MURMUR FILE SEARCH`); `None` lists everything.
+async fn file_list(
+    cluster: &Cluster,
+    idx: usize,
+    like: Option<&str>,
+) -> Result<Vec<FileMeta>, String> {
+    let node = cluster.node(idx);
+    let open = match like {
+        Some(pattern) => format!("MURMUR FILE SEARCH {}", sql_quote(pattern)),
+        None => "MURMUR FILE LIST".to_string(),
+    };
+    let rows = node
+        .simple(&open)
+        .await
+        .map_err(|e| format!("node{} {open}: {e}", idx + 1))?;
+    let cursor = rows
+        .first()
+        .and_then(|r| r.first())
+        .cloned()
+        .ok_or_else(|| format!("node{} {open}: no cursor", idx + 1))?;
+    let mut out = Vec::new();
+    loop {
+        let page = node
+            .simple(&format!("MURMUR FILE NEXT {} LIMIT 256", sql_quote(&cursor)))
+            .await
+            .map_err(|e| format!("node{} FILE NEXT: {e}", idx + 1))?;
+        if page.is_empty() {
+            break;
+        }
+        for row in &page {
+            out.push(parse_meta(row, idx)?);
+        }
+    }
+    node.simple(&format!("MURMUR FILE CLOSE {}", sql_quote(&cursor)))
+        .await
+        .map_err(|e| format!("node{} CLOSE cursor: {e}", idx + 1))?;
+    Ok(out)
+}
+
+fn parse_meta(row: &[String], idx: usize) -> Result<FileMeta, String> {
+    if row.len() != 5 {
+        return Err(format!("node{}: metadata row has {} columns, want 5", idx + 1, row.len()));
+    }
+    Ok(FileMeta {
+        name: row[0].clone(),
+        size: row[1]
+            .parse::<u64>()
+            .map_err(|e| format!("node{}: bad size {:?}: {e}", idx + 1, row[1]))?,
+        digest_hex: row[3].clone(),
+        local: parse_bool(&row[4]).map_err(|e| format!("node{}: {e}", idx + 1))?,
+    })
+}
+
+/// Metadata for exactly `name` on node `idx` (`None` when unlisted).
+async fn file_metadata(
+    cluster: &Cluster,
+    idx: usize,
+    name: &str,
+) -> Result<Option<FileMeta>, String> {
+    Ok(file_list(cluster, idx, None)
+        .await?
+        .into_iter()
+        .find(|m| m.name == name))
+}
+
+async fn run_body(cluster: &Cluster, duration: Duration, interval: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + duration;
+    let mut upload_latencies = Vec::new();
+    let mut end_to_end_latencies = Vec::new();
+    let mut expected: HashMap<String, String> = HashMap::new();
+    let mut round = 0usize;
+    while Instant::now() < deadline {
+        let name = format!("soak/file-{round:04}.bin");
+        let data = payload(round);
+
+        let start = Instant::now();
+        let uploaded = file_upload(cluster, 0, &name, &data)
+            .await
+            .map_err(|e| format!("upload round {round}: {e}"))?;
+        if uploaded.size != data.len() as u64 {
+            return Err(format!(
+                "round {round}: upload byte count {}, want {}",
+                uploaded.size,
+                data.len()
+            ));
+        }
+        upload_latencies.push(start.elapsed());
+        expected.insert(name.clone(), uploaded.digest_hex.clone());
+
+        let end_to_end_start = Instant::now();
+        // Metadata leg (Go: `WaitFileAvailable` metadata wait).
+        let meta_deadline = Instant::now() + WAIT;
+        loop {
+            let arrived = file_metadata(cluster, 1, &name)
+                .await?
+                .is_some_and(|m| m.digest_hex == uploaded.digest_hex);
+            if arrived {
+                break;
+            }
+            if Instant::now() >= meta_deadline {
+                return Err(format!("round {round}: metadata never arrived"));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        // Fetch leg (Go: explicit `FetchFile`; the Rust product fetches
+        // automatically on `fetch_interval`, so this is an availability wait
+        // on the `local` flag).
+        let fetch_deadline = Instant::now() + WAIT;
+        loop {
+            let fetched = file_metadata(cluster, 1, &name)
+                .await?
+                .is_some_and(|m| m.local);
+            if fetched {
+                break;
+            }
+            if Instant::now() >= fetch_deadline {
+                return Err(format!("round {round}: object never fetched"));
+            }
+            tokio::time::sleep(POLL).await;
+        }
+        let got = file_download(cluster, 1, &name)
+            .await
+            .map_err(|e| format!("round {round}: download failed: {e}"))?;
+        if got.as_slice() != data.as_slice() {
+            return Err(format!("round {round}: downloaded bytes differ"));
+        }
+        end_to_end_latencies.push(end_to_end_start.elapsed());
+
+        // Search across the replicated metadata (LIKE `%file-%`: the wire
+        // SEARCH matches whole names, unlike the old literal-substring API).
+        let found = file_list(cluster, 1, Some("%file-%")).await?;
+        if found.len() != round + 1 {
+            return Err(format!(
+                "round {round}: search returned {} files, want {}",
+                found.len(),
+                round + 1
+            ));
+        }
+
+        round += 1;
+        if Instant::now() < deadline {
+            tokio::time::sleep(interval).await;
+        }
+    }
+    if upload_latencies.is_empty() {
+        return Err("soak completed no uploads".into());
+    }
+
+    // Fetch gate (Go: `FetchStats` shows every file completed with zero
+    // failures; the Rust product exposes no fetch counters over the wire):
+    // every uploaded file must be locally available with its upload digest
+    // on the peer.
+    for (name, digest) in &expected {
+        let meta = file_metadata(cluster, 1, name)
+            .await?
+            .ok_or_else(|| format!("file {name}: metadata missing after the soak"))?;
+        if !meta.local {
+            return Err(format!("file {name} not available on the peer after the soak"));
+        }
+        if meta.digest_hex != *digest {
+            return Err(format!("file {name}: peer digest differs from the upload digest"));
+        }
+    }
+
+    // First-file status (Go: `StatFile` exists + available).
+    let first = file_metadata(cluster, 1, "soak/file-0000.bin").await?;
+    let Some(first) = first else {
+        return Err("first file metadata missing".into());
+    };
+    if !first.local {
+        return Err("first file not available".into());
+    }
+
+    upload_latencies.sort();
+    end_to_end_latencies.sort();
+    let upload_p95 = p95(&upload_latencies);
+    let transfer_p95 = p95(&end_to_end_latencies);
+    eprintln!(
+        "file soak duration={duration:?} rounds={} upload_p95={upload_p95:?} \
+         metadata_fetch_verify_p95={transfer_p95:?}",
+        expected.len(),
+    );
+    if upload_p95 > UPLOAD_P95_SLO {
+        return Err(format!("upload p95 {upload_p95:?} exceeded 5s SLO"));
+    }
+    if transfer_p95 > TRANSFER_P95_SLO {
+        return Err(format!("end-to-end p95 {transfer_p95:?} exceeded 20s SLO"));
+    }
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn encrypted_file_fetch_soak() {
     let duration = env_seconds("MURMUR_FILES_SOAK_DURATION_SECONDS", 5);
     let interval = env_seconds("MURMUR_FILES_SOAK_INTERVAL_SECONDS", 1);
     let cluster = Cluster::new(ClusterOptions {
@@ -63,146 +353,16 @@ fn encrypted_file_fetch_soak() {
         }),
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
-
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let deadline = Instant::now() + duration;
-        let mut upload_latencies = Vec::new();
-        let mut end_to_end_latencies = Vec::new();
-        let mut expected: HashMap<String, [u8; 32]> = HashMap::new();
-        let mut round = 0usize;
-        while Instant::now() < deadline {
-            let name = format!("soak/file-{round:04}.bin");
-            let data = payload(round);
-
-            let start = Instant::now();
-            let uploaded = cluster
-                .node(0)
-                .upload_file(&name, data.as_slice())
-                .unwrap_or_else(|e| panic!("upload round {round}: {e}"));
-            assert_eq!(
-                uploaded.bytes,
-                data.len() as u64,
-                "round {round}: upload byte count"
-            );
-            upload_latencies.push(start.elapsed());
-            expected.insert(name.clone(), uploaded.digest);
-
-            let end_to_end_start = Instant::now();
-            // Metadata leg (Go: `WaitFileAvailable` metadata wait).
-            let metadata_arrived = wait_until(WAIT, POLL, || {
-                cluster
-                    .node(1)
-                    .file_metadata(&name)
-                    .unwrap_or(None)
-                    .is_some_and(|m| m.digest == uploaded.digest)
-            });
-            assert!(metadata_arrived, "round {round}: metadata never arrived");
-            // Fetch leg (Go: explicit `FetchFile`; the Rust product fetches
-            // automatically on `fetch_interval`, so this is an availability wait).
-            let fetched = wait_until(WAIT, POLL, || {
-                cluster.node(1).file_available(&name).unwrap_or(false)
-            });
-            assert!(fetched, "round {round}: object never fetched");
-            let mut got = Vec::new();
-            let downloaded = cluster
-                .node(1)
-                .get_file(&name, &mut got)
-                .unwrap_or_else(|e| panic!("round {round}: download failed: {e}"));
-            assert_eq!(
-                got.as_slice(),
-                data.as_slice(),
-                "round {round}: downloaded bytes differ"
-            );
-            assert_eq!(
-                downloaded.digest, uploaded.digest,
-                "round {round}: digest mismatch"
-            );
-            end_to_end_latencies.push(end_to_end_start.elapsed());
-
-            let found = cluster
-                .node(1)
-                .search_files("file-")
-                .unwrap_or_else(|e| panic!("round {round}: search failed: {e}"));
-            assert_eq!(
-                found.len(),
-                round + 1,
-                "round {round}: search returned {} files, want {}",
-                found.len(),
-                round + 1
-            );
-
-            round += 1;
-            if Instant::now() < deadline {
-                std::thread::sleep(interval);
-            }
-        }
-        assert!(!upload_latencies.is_empty(), "soak completed no uploads");
-
-        // Fetch gate (Go: `FetchStats` shows every file completed with zero
-        // failures; the Rust product exposes no fetch counters): every
-        // uploaded file must be locally available with its upload digest on
-        // the peer, and the fetcher must have recorded no error.
-        for (name, digest) in &expected {
-            assert!(
-                cluster.node(1).file_available(name).unwrap_or(false),
-                "file {name} not available on the peer after the soak"
-            );
-            let meta = cluster
-                .node(1)
-                .file_metadata(name)
-                .unwrap_or_else(|e| panic!("file {name}: metadata lookup failed: {e}"))
-                .unwrap_or_else(|| panic!("file {name}: metadata missing after the soak"));
-            assert_eq!(
-                meta.digest, *digest,
-                "file {name}: peer digest differs from the upload digest"
-            );
-        }
-        let fetch_error = cluster
-            .node(1)
-            .replication()
-            .expect("replication handle")
-            .files()
-            .expect("file store")
-            .last_fetch_error();
-        assert!(fetch_error.is_none(), "fetch errors: {fetch_error:?}");
-
-        // First-file status (Go: `StatFile` exists + available).
-        let first = cluster
-            .node(1)
-            .file_metadata("soak/file-0000.bin")
-            .expect("first file status");
-        assert!(first.is_some(), "first file metadata missing");
-        assert!(
-            cluster
-                .node(1)
-                .file_available("soak/file-0000.bin")
-                .unwrap_or(false),
-            "first file not available"
-        );
-
-        upload_latencies.sort();
-        end_to_end_latencies.sort();
-        let upload_p95 = p95(&upload_latencies);
-        let transfer_p95 = p95(&end_to_end_latencies);
-        eprintln!(
-            "file soak duration={duration:?} rounds={} upload_p95={upload_p95:?} \
-             metadata_fetch_verify_p95={transfer_p95:?}",
-            expected.len(),
-        );
-        assert!(
-            upload_p95 <= UPLOAD_P95_SLO,
-            "upload p95 {upload_p95:?} exceeded 5s SLO"
-        );
-        assert!(
-            transfer_p95 <= TRANSFER_P95_SLO,
-            "end-to-end p95 {transfer_p95:?} exceeded 20s SLO"
-        );
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("files-soak");
+    let result = run_body(&cluster, duration, interval).await;
+    let failed = result.is_err();
+    if let Err(e) = &result {
+        eprintln!("scenario failed: {e}");
     }
-    cluster.finish(failed);
+    if failed {
+        cluster.dump_forensics("files-soak").await;
+    }
+    cluster.finish(failed).await;
     assert!(!failed, "scenario failed; artifacts retained under tests-live/failures/");
 }

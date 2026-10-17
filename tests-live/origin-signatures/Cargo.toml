@@ -5,9 +5,6 @@ edition = "2021"
 
 [dependencies]
 murmur-live-harness = { path = "../harness" }
-# Raw-protocol relay fixture only: drives QUIC (`quinn`, same version as
-# the product), async IO timeouts (`tokio`), and the fixture's local
-# non-vacuity digest guards (`sha2`, same version as the product).
-tokio = { version = "1", features = ["rt", "time", "net"] }
-quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
-sha2 = "0.10"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }

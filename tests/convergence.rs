@@ -11,6 +11,7 @@ fn create(path: &std::path::Path, node: u8) -> Result<Database> {
         },
     )?;
     db.migrate(Migration::new("CREATE TABLE devices(id TEXT PRIMARY KEY NOT NULL, hostname TEXT NOT NULL, status TEXT NOT NULL)"))?;
+    db.set_replication("devices", true)?;
     Ok(db)
 }
 #[test]

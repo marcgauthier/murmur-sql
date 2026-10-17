@@ -369,3 +369,50 @@ pub(crate) fn affected_state(store:&Store, schema:Schema, database_id:[u8;16], c
     }
     Ok(ReplicaState{database_id,schema,clock,rows,tombstones})
 }
+
+/// Switch physical key domains without mixing local application-key tombstones
+/// with UUID tombstones. Archived records are authoritative Spool records, never
+/// a second SQLite database or an in-memory metadata mirror.
+pub(crate) fn transition(store:&Store, table:&str, enabled:bool, before:&[RowState], after:&[RowState], version:Version)->Result<Vec<Mutation>> {
+    let mut changes=Vec::new();
+    let domain=if enabled {"local"}else{"replicated"};
+    let archive=format!("12/key-transition/{table}/{domain}/");
+    for prefix in [format!("04/meta/row/{table}/"), format!("05/meta/tomb/{table}/"), format!("05/meta/deleted/{table}/"), format!("10/policy/state/{table}/"), format!("09/bridge/owner/{table}/")] {
+        for key in store.keys_with_prefix(prefix.as_bytes()) {
+            if !key.starts_with(b"04/meta/row/") && !key.starts_with(b"05/meta/deleted/") {
+                let value=store.get(&key)?.ok_or_else(||Error::Corrupt("transition record missing".into()))?;
+                // A reversible path encoding preserves every historical tombstone.
+                let name=key.iter().map(|b|format!("{b:02x}")).collect::<String>();
+                changes.push(Mutation::put(format!("{archive}{name}").into_bytes(),value));
+            }
+            changes.push(Mutation::delete(key));
+        }
+    }
+    if !enabled {
+        // Fence all published incarnations. These fences stay out of outgoing
+        // batches until re-enabling publishes a new snapshot of the table.
+        for row in before {
+            let key=encode(&row.key)?;
+            let old=read(store,table,&key)?.ok_or_else(||Error::Corrupt("transition row missing".into()))?;
+            let record=tomb(table,key,old.generation,version)?;
+            let name=record.key.iter().map(|b|format!("{b:02x}")).collect::<String>();
+            changes.push(Mutation::put(format!("{archive}{name}").into_bytes(),record.value));
+        }
+    } else {
+        for key in store.keys_with_prefix(format!("12/key-transition/{table}/replicated/").as_bytes()) {
+            let value=store.get(&key)?.ok_or_else(||Error::Corrupt("transition archive missing".into()))?;
+            // Only deletion records are restored. Causal policy state starts a
+            // fresh incarnation from the current application values.
+            let name=std::str::from_utf8(&key).map_err(|_|Error::Corrupt("archive key".into()))?.rsplit('/').next().unwrap();
+            if name.starts_with("30352f6d6574612f746f6d622f") {
+                let mut deletion:Tombstone=decode(&value)?;
+                deletion.version=version;
+                changes.push(Mutation::put(tomb_key(&deletion)?,encode(&deletion)?));
+            }
+        }
+    }
+    for row in after {
+        changes.push(put(table,&RowMeta{key:encode(&row.key)?,generation:version,cells:row.cells.iter().map(|cell|Cell{column:cell.column.clone(),value:cell.value.clone(),version}).collect()})?);
+    }
+    Ok(changes)
+}

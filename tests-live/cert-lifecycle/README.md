@@ -18,14 +18,15 @@ to a fresh cert and show full reconvergence plus a bidirectional write.
 
 - Phase 0: `marker-init` converges on both nodes; A holds a session to B
   and `peers(A) == 1`.
-- Phase 1: after rotating B to a TTL cert, the served leaf's remaining
-  lifetime fits the minted TTL (stale-cert guard), A connects to B, and
+- Phase 1: after rotating B to a TTL cert, the served leaf is fresh
+  rotation-time material (stale-cert guard), A connects to B, and
   `marker-pre-expiry` converges before NotAfter minus 5 s.
 - Phase 2: past NotAfter + 2 s, with B restarted on the same expired
-  cert: A reports B not connected, `peers(A) == 0`, B's own view agrees,
-  the served leaf parses with NotAfter in the past, and during the
-  isolation window `marker-post-expiry` never reaches B while A keeps
-  serving all 3 markers with `peers(A) == 0` throughout.
+  leaf: A reports B not connected, `peers(A) == 0`, B's own view agrees,
+  the served leaf is byte-identical to the minted short leaf whose TTL
+  has fully elapsed, and during the isolation window `marker-post-expiry`
+  never reaches B while A keeps serving all 3 markers with `peers(A) == 0`
+  throughout.
 - Phase 3: after rotating B to a fresh 24 h cert, the mesh reconnects,
   all 3 markers converge, a B-side `marker-rotated` converges back, and
   both nodes hold equal ordered names.
@@ -38,38 +39,45 @@ to a fresh cert and show full reconvergence plus a bidirectional write.
   window.
 - Harness knobs apply: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`records(name TEXT NOT NULL PRIMARY KEY)`) instead of the managed
-  typed-records HTTP API (`/v1/typed/insert`, `/v1/typed/names`).
-- Session state comes from `Handle::status()` (`peers`,
-  `peers_diagnostics`) instead of `debug/peers` (`Connected`) and
-  `/v1/status` (`connected_peers`). Peers whose handshakes fail never
-  enter the session table, so absence reads as not connected (same
-  helper shape as the `churn-retirement` port).
-- No HTTPS server exists, so there is no dial-the-API served-cert fetch
-  and no insecure client: the served leaf is read from the node's
-  `tls/node.der`, which the harness rewrites from the same material
-  passed to `Database::open`, so file NotAfter always equals served
-  NotAfter. Expiry is enforced by the standard rustls/webpki verifiers
-  on both handshake directions (`NodeVerifier` client-side,
-  `WebPkiClientVerifier` server-side); opening with an expired cert
-  succeeds (open checks the SAN identity, not validity), matching Go.
+- Multi-process `murmur-server` children over the PG wire (per design)
+  instead of `testnode` daemon processes over HTTPS+mTLS.
+- Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)
+  instead of the managed typed-records HTTP API.
+- Session state comes from `MURMUR SHOW PEERS` and `MURMUR SHOW
+  REPLICATION` (`peers`) instead of `debug/peers` (`Connected`) and
+  `/v1/status` (`connected_peers`).
+- No TLS-served-cert fetch: the PG port carries no TLS identity in test
+  mode, so expiry is proven against the minted TTL clock (rotation
+  instant + TTL) instead of parsing the served leaf's NotAfter. The
+  stale-cert and non-vacuity legs read the node's `tls/node.pem`, which
+  the harness rewrites from the same material the restarted server
+  loads: phase 1 asserts the bytes change at rotation time with a fresh
+  mtime, and phase 2 asserts the served bytes are still that same short
+  leaf while its TTL has fully elapsed. The rejection assertions
+  themselves fail closed: a silently un-swapped cert would stay
+  connected and time out the rejection waits.
 - Rotation goes through the harness `Cluster::rotate_node_cert` helper
   (stop, issue a fresh leaf for the same NodeID, rewrite `tls/`,
-  reopen) instead of rewriting `tls/node.crt` + `tls/node.key` on disk;
-  credentials are in-memory (`ReplConfig::credentials`), so a file swap
-  alone would not take effect.
+  restart under the unlock watchdog) instead of rewriting `tls/node.crt`
+  + `tls/node.key` on disk; every restart is followed by an explicit
+  re-mesh (fresh ephemeral ports).
+- Phase 1 crashes B (`kill_node`, no graceful QUIC close) instead of
+  stopping it, and node ids are pinned with the survivor sorting first.
+  Both choices are adversarial on purpose: the survivor keeps a zombie
+  session in its tie-break-preferred direction, so the rotation leg
+  deterministically exercises zombie replacement instead of flaking on
+  close delivery and random id order.
 - The isolation-window argument is unchanged: `mesh()` redials
-  immediately and the engine's 5 s bootstrap retick keeps dialing, so a
-  steady zero across the window proves rejection rather than idleness.
+  immediately and the engine keeps dialing, so a steady zero across the
+  window proves rejection rather than idleness.
 
 ## Compile check (only gate; never run here)
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/cert-lifecycle/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/cert-lifecycle/Cargo.toml
 ```

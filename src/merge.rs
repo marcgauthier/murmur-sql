@@ -30,6 +30,7 @@ fn merge_row(
             return Err(Error::Corrupt("remote key mismatch".into()));
         }
     }
+    crate::primary_key::validate_row(table, row)?;
     let key = (row.table.clone(), encode(&row.key)?);
     if let Some(old) = rows.get_mut(&key) {
         if row.generation > old.generation {
@@ -344,11 +345,12 @@ mod batch_tests {
     fn fixture(count: usize, policy: MergePolicy) -> ReplicaState {
         let schema = Schema {
             tables: vec![Table {
+                application_key: None,
                 id: "items".into(),
                 name: "items".into(),
                 sql: "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER,payload BLOB)".into(),
                 columns: vec![
-                    Column {
+                    Column { vector: None, fts: false,
                         id: "id".into(),
                         name: "id".into(),
                         primary_key: 1,
@@ -356,7 +358,7 @@ mod batch_tests {
                         not_null: true,
                         policy: MergePolicy::Lww,
                     },
-                    Column {
+                    Column { vector: None, fts: false,
                         id: "n".into(),
                         name: "n".into(),
                         primary_key: 0,
@@ -364,7 +366,7 @@ mod batch_tests {
                         not_null: false,
                         policy,
                     },
-                    Column {
+                    Column { vector: None, fts: false,
                         id: "payload".into(),
                         name: "payload".into(),
                         primary_key: 0,

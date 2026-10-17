@@ -1,180 +1,147 @@
-//! Rust port of the Go `addrpolicy` live scenario.
-//!
-//! Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/addrpolicy/`
-//! (`addrpolicy_test.go`: `TestAddressPolicyAcrossProcesses`). Node1 admits
-//! loopback peers (`127.0.0.0/8`); node2's TEST-NET policy
-//! (`198.51.100.0/24`) excludes every actual loopback socket address; node3
-//! is unrestricted. The admitted pair must replicate while the denied node
-//! keeps its write local. Plain SQL replaces the Go typed-records HTTP API,
-//! and QUIC session state replaces `connected_peers` (see the scenario
-//! README.md for the deviations).
+//! Live SQL test: Replication address policy (allowed_networks CIDR) enforcement across processes.
+//! Node 1 admits loopback peers (127.0.0.0/8); Node 2's TEST-NET policy (198.51.100.0/24) excludes
+//! all actual loopback socket addresses; Node 3 is unrestricted.
+//! The admitted pair (Node 1 and Node 3) replicates, while the denied Node 2 keeps its write local.
 
-use std::collections::HashMap;
+use murmur_live_harness::{assert_rows, Cluster, ClusterOptions};
 use std::time::Duration;
 
-use murmur_live_harness::sqlite_session::{Database, Migration};
-use murmur_live_harness::{wait_until, Cluster, ClusterOptions};
-
-/// Peer-topology deadline (Go: 20 s).
-const PEER_TIMEOUT: Duration = Duration::from_secs(20);
-/// Per-node row-count deadline (Go: 20 s).
-const COUNT_TIMEOUT: Duration = Duration::from_secs(20);
-/// Convergence poll interval (Go: 50 ms).
-const POLL: Duration = Duration::from_millis(50);
-/// Post-convergence settle window: several dial/accept retries must not move
-/// the denied node's state (Go: 750 ms sleep).
-const DENY_SETTLE: Duration = Duration::from_millis(750);
-
-/// Live session count (Go: `connectedPeers` from `/v1/status`).
-fn peer_count(cluster: &Cluster, node: usize) -> usize {
-    cluster
-        .node(node)
-        .replication()
-        .expect("replication handle")
-        .status()
-        .peers
-}
-
-/// Wait until every node's live session count matches `want`
-/// (Go: `waitForPeers`, 50 ms poll).
-fn wait_for_peers(cluster: &Cluster, want: [usize; 3]) {
-    let ok = wait_until(PEER_TIMEOUT, POLL, || {
-        (0..cluster.len()).all(|i| peer_count(cluster, i) == want[i])
-    });
-    if !ok {
-        let actual: Vec<usize> = (0..cluster.len()).map(|i| peer_count(cluster, i)).collect();
-        panic!("peer topology {actual:?} != want {want:?} within {PEER_TIMEOUT:?}");
-    }
-}
-
-/// One replicated row (Go: `Cluster.TypedInsert` + flush).
-fn insert(db: &Database, id: i64, name: String) {
-    db.transaction(move |sql| {
-        sql.execute(
-            "INSERT INTO records(id, name) VALUES(?, ?)",
-            (id, name),
-        )?;
-        Ok(())
-    })
-    .expect("insert record row");
-    db.flush().expect("flush insert");
-}
-
-/// Canonical ordered names on one node (Go: `Cluster.TypedNames`).
-fn names(db: &Database) -> Vec<String> {
-    db.read(|sql| {
-        let mut stmt = sql.prepare("SELECT name FROM records ORDER BY name")?;
-        let mapped = stmt.query_map([], |row| row.get::<_, String>(0))?;
-        let mut out = Vec::new();
-        for name in mapped {
-            out.push(name?);
-        }
-        Ok(out)
-    })
-    .expect("read record names")
-}
-
-/// Wait until `node` holds `want` rows (Go: `waitForCount`, 50 ms poll).
-fn wait_for_count(cluster: &Cluster, node: usize, want: usize) {
-    let ok = wait_until(COUNT_TIMEOUT, POLL, || {
-        names(cluster.node(node)).len() == want
-    });
-    if !ok {
-        let got = names(cluster.node(node));
-        panic!(
-            "{} record names={got:?}, want {want}",
-            cluster.node_info(node).label,
-        );
-    }
-}
-
-#[test]
-fn address_policy_across_processes() {
-    // Node1 admits loopback peers; node2's TEST-NET policy excludes every
-    // actual loopback socket address. Node3 is unrestricted and provides
-    // the allowed path with node1.
-    let allowed_networks: HashMap<usize, Vec<ipnet::IpNet>> = HashMap::from([
-        (
-            0,
-            vec!["127.0.0.0/8".parse::<ipnet::IpNet>().expect("loopback CIDR")],
-        ),
-        (
-            1,
-            vec!["198.51.100.0/24"
-                .parse::<ipnet::IpNet>()
-                .expect("TEST-NET CIDR")],
-        ),
-    ]);
-    let cluster = Cluster::new(ClusterOptions {
+#[tokio::test(flavor = "multi_thread")]
+async fn address_policy_across_processes() {
+    let mut cluster = Cluster::new(ClusterOptions {
         name: "addrpolicy".into(),
         num_nodes: 3,
-        allowed_networks,
         ..Default::default()
     })
+    .await
     .expect("cluster setup");
+
+    // Stop all nodes to configure address policies cleanly without stale QUIC sessions
+    cluster.stop_node(0);
+    cluster.stop_node(1);
+    cluster.stop_node(2);
+
+    // Node 0 admits loopback peers
+    cluster
+        .edit_config(0, |doc| {
+            let mut arr = toml_edit::Array::new();
+            arr.push("127.0.0.0/8");
+            doc["replication"]["allowed_networks"] = toml_edit::value(arr);
+        })
+        .unwrap();
+
+    // Node 1 admits only TEST-NET peers (denies all loopback addresses)
+    cluster
+        .edit_config(1, |doc| {
+            let mut arr = toml_edit::Array::new();
+            arr.push("198.51.100.0/24");
+            doc["replication"]["allowed_networks"] = toml_edit::value(arr);
+        })
+        .unwrap();
+
+    // Node 2 has unrestricted allowed_networks (default empty allows all)
+
+    // Restart all nodes
+    cluster.start_node(0).await.expect("restart node 0");
+    cluster.start_node(1).await.expect("restart node 1");
+    cluster.start_node(2).await.expect("restart node 2");
+
+    // Initialize replicated table on all 3 nodes
     for i in 0..cluster.len() {
-        let info = cluster.node_info(i);
-        eprintln!(
-            "Node {} running in directory {} (repl={})",
-            info.label,
-            info.dir.display(),
-            info.repl_addr,
-        );
+        let client = cluster.node(i);
+        client
+            .simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
+            .await
+            .unwrap();
+        client.set_table_replicated("records", true).await.unwrap();
+        client.flush().await.unwrap();
     }
-    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        // Same schema on every node (Go: TypedRecords fixture tables).
-        // Row ids are node-disjoint by construction; names keep the Go
-        // TypedInsert values.
-        for i in 0..cluster.len() {
-            cluster
-                .node(i)
-                .migrate(Migration::new(
-                    "CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)",
-                ))
-                .expect("migrate records table");
-            cluster.node(i).flush().expect("flush schema");
-        }
 
-        // Let QUIC dial retries settle, then confirm the allowed pair
-        // formed a session while the denied node has no admitted path to
-        // either peer (Go: `waitForPeers` `[1, 0, 1]`).
-        wait_for_peers(&cluster, [1, 0, 1]);
+    // Insert rows: Node 0, Node 1, Node 2
+    cluster
+        .node(0)
+        .execute(
+            "INSERT INTO records(id, name) VALUES($1, $2)",
+            &[&1i64, &"allowed-loopback"],
+        )
+        .await
+        .unwrap();
+    cluster.node(0).flush().await.unwrap();
 
-        insert(cluster.node(0), (1 << 32) | 1, "allowed-loopback".into());
-        insert(cluster.node(1), (2 << 32) | 1, "denied-testnet".into());
-        insert(cluster.node(2), (3 << 32) | 1, "unrestricted-loopback".into());
+    cluster
+        .node(1)
+        .execute(
+            "INSERT INTO records(id, name) VALUES($1, $2)",
+            &[&2i64, &"denied-testnet"],
+        )
+        .await
+        .unwrap();
+    cluster.node(1).flush().await.unwrap();
 
-        wait_for_count(&cluster, 0, 2);
-        wait_for_count(&cluster, 2, 2);
-        std::thread::sleep(DENY_SETTLE); // several dial/accept retries
-        let denied = names(cluster.node(1));
-        assert_eq!(
-            denied,
-            vec!["denied-testnet".to_string()],
-            "denied node state changed across network: want only its local row"
-        );
-        let admitted = names(cluster.node(0));
-        assert_eq!(
-            admitted.len(),
-            2,
-            "admitted node did not receive both its local and node3-origin row: names={admitted:?}"
-        );
+    cluster
+        .node(2)
+        .execute(
+            "INSERT INTO records(id, name) VALUES($1, $2)",
+            &[&3i64, &"unrestricted-loopback"],
+        )
+        .await
+        .unwrap();
+    cluster.node(2).flush().await.unwrap();
 
-        for i in 0..cluster.len() {
-            assert!(
-                !cluster.node_info(i).dir.as_os_str().is_empty(),
-                "node{} has no isolated directory",
-                i + 1
-            );
-        }
-    }))
-    .is_err();
-    if failed {
-        cluster.dump_forensics("address-policy-or-convergence");
-    }
-    cluster.finish(failed);
-    assert!(
-        !failed,
-        "scenario failed; artifacts retained under tests-live/failures/"
+    // Admitted pair (Node 0 and Node 2) must converge on both rows
+    let expected_admitted = vec![
+        vec!["allowed-loopback".to_string()],
+        vec!["unrestricted-loopback".to_string()],
+    ];
+    assert_rows(
+        &cluster,
+        &[0, 2],
+        "SELECT name FROM records ORDER BY name",
+        &expected_admitted,
+    )
+    .await;
+
+    // Settle window: several dial/accept retries must not move the denied node's state
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+
+    // Node 1 must retain ONLY its local write
+    let n1_rows = cluster
+        .node(1)
+        .simple("SELECT name FROM records ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        n1_rows,
+        vec![vec!["denied-testnet".to_string()]],
+        "denied node state changed across network: want only its local row"
     );
+
+    // Node 0 must retain exactly the 2 admitted rows
+    let n0_rows = cluster
+        .node(0)
+        .simple("SELECT name FROM records ORDER BY name")
+        .await
+        .unwrap();
+    assert_eq!(
+        n0_rows, expected_admitted,
+        "admitted node received unexpected extra rows"
+    );
+
+    // Verify peer topology via MURMUR SHOW PEERS
+    let n1_peers = cluster.node(1).simple("MURMUR SHOW PEERS").await.unwrap();
+    for row in &n1_peers {
+        // row[2] is connected
+        assert_ne!(
+            row[2], "true",
+            "denied Node 1 unexpectedly formed a connected session with {}",
+            row[0]
+        );
+    }
+
+    for i in 0..cluster.len() {
+        assert!(
+            cluster.node_info(i).dir.exists(),
+            "node {i} directory does not exist"
+        );
+    }
 }

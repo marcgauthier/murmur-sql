@@ -25,17 +25,19 @@ converges with every node at the new epoch.
 
 ## Deviations from the Go original
 
-- In-process multi-`Database` cluster instead of daemon processes; restart is
-  `close()` + reopen of the same directory with the same key (staying
-  isolated, then explicit rejoin via `add_peer`).
+- Multi-process `murmur-server` children over the PostgreSQL wire protocol
+  instead of `testnode` daemon processes over HTTPS+mTLS (per design);
+  restart is child stop + respawn of the same directory with the same key
+  (staying isolated, then explicit rejoin via `add_peer` + `sync_all`).
 - Plain SQL replaces the typed-records HTTP API: table
   `live_typed_records(name TEXT NOT NULL PRIMARY KEY, counter INTEGER NOT NULL)` plus
-  `ALTER TABLE ... ADD COLUMN note TEXT`.
-- Epoch assertions are `PRAGMA table_info` column-presence checks (the
-  established `typed-records` port pattern).
-- **No mid-migration process exit and no exit codes 85/86**: Rust
-  `Database::migrate` is a synchronous call with no crash-hook boundary, so
-  the two cases close/reopen on either side of the synchronous store. The
+  `ALTER TABLE ... ADD COLUMN note TEXT`. The table is explicitly flagged
+  replicated on each node; the Go fixture tables replicate by default.
+- Epoch assertions are `PRAGMA table_info` column-presence checks over the
+  wire (the server allowlists side-effect-free inspection pragmas).
+- **No mid-migration process exit and no exit codes 85/86**: the wire DDL
+  is a synchronous call with no crash-hook boundary, so the two cases
+  stop/restart on either side of the synchronous store. The
   peer-isolation, recovery-epoch, retry, rejoin, adoption, rebind, and
   migrated-write assertions are otherwise identical to Go.
 - Go `MigrateTypedRecords` is an idempotent manifest bind/rebind; Rust DDL

@@ -55,6 +55,7 @@ fn create(path: &std::path::Path, node: u8) -> Database {
         "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER,payload BLOB)",
     ))
     .unwrap();
+    db.set_replication("items", true).unwrap();
     db.transaction(|s| {
         s.execute("INSERT INTO items VALUES(1,10,zeroblob(180000))", [])?;
         s.execute("INSERT INTO items VALUES(2,20,x'')", [])?;
@@ -103,6 +104,7 @@ fn snapshot_application_refreshes_managed_search_indexes() {
             search_indexes: indexes(), ..Options::default()
         }).unwrap();
         db.migrate(Migration::new("CREATE TABLE docs(id INTEGER PRIMARY KEY,title TEXT,embedding BLOB)")).unwrap();
+    db.set_replication("docs", true).unwrap();
         db.flush().unwrap();
         databases.push(db);
     }
@@ -113,6 +115,13 @@ fn snapshot_application_refreshes_managed_search_indexes() {
         sql.execute("INSERT INTO docs VALUES(1,'snapshot',?)", [embedding])?;
         Ok(())
     }).unwrap();
+    #[cfg(feature = "vector")]
+    {
+        a.set_column_vector("docs", "embedding", Some(crate::VectorColumnConfig {dimensions: 2, distance: crate::DistanceMetric::Cosine})).unwrap();
+        a.flush().unwrap();
+        assert!(bb.accept_schema(aa.schema().unwrap()).unwrap());
+        b.flush().unwrap();
+    }
     a.flush().unwrap();
     let m = aa.create_snapshot([2; 16], &c).unwrap();
     stage(&aa, &bb, &c, &m, None);
@@ -121,6 +130,14 @@ fn snapshot_application_refreshes_managed_search_indexes() {
     assert_eq!(b.read(|sql| Ok(sql.query_row("SELECT rowid FROM docs_fts WHERE docs_fts MATCH 'snapshot'", [], |r| r.get::<_, i64>(0))?)).unwrap(), 1);
     #[cfg(feature = "vector")]
     assert_eq!(b.read(|sql| Ok(sql.query_row("SELECT rowid FROM docs_vec WHERE embedding MATCH '[1,0]' AND k=1", [], |r| r.get::<_, i64>(0))?)).unwrap(), 1);
+    #[cfg(feature = "vector")]
+    {
+        let schema = b.schema().unwrap(); let table = &schema.tables[0];
+        let column = table.columns.iter().find(|c| c.name == "embedding").unwrap();
+        assert_eq!(column.vector.as_ref().unwrap().distance, crate::DistanceMetric::Cosine);
+        let name = crate::search::vector_index_name(table,column);
+        assert_eq!(b.read(move |sql| Ok(sql.query_row(&format!("SELECT rowid FROM temp.\"{name}\" WHERE embedding MATCH '[1,0]' AND k=1"), [], |r| r.get::<_,i64>(0))?)).unwrap(),1);
+    }
     assert_eq!(a.export_state().unwrap().rows, b.export_state().unwrap().rows);
     a.close().unwrap(); b.close().unwrap();
 }
@@ -136,6 +153,7 @@ fn sender_and_receiver_reopen_resumes_only_missing_chunks_and_receipt_is_durable
         "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER,payload BLOB)",
     ))
     .unwrap();
+    b.set_replication("items", true).unwrap();
     b.flush().unwrap();
     let aa = adapter(&a, &c);
     let bb = adapter(&b, &c);
@@ -292,6 +310,7 @@ fn snapshot_waits_for_local_capture_preserves_local_only_tables_and_concurrent_w
         "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER,payload BLOB)",
     ))
     .unwrap();
+    b.set_replication("items", true).unwrap();
     b.merge_state(a.export_state().unwrap()).unwrap();
     b.flush().unwrap();
     let aa = adapter(&a, &c);
@@ -386,6 +405,7 @@ fn capture_failure_never_publishes_partial_manifest_or_pin() {
             "CREATE TABLE items(id INTEGER PRIMARY KEY,payload BLOB)",
         ))
         .unwrap();
+    db.set_replication("items", true).unwrap();
         db.transaction(|s| {
             s.execute("INSERT INTO items VALUES(1,zeroblob(180000))", [])?;
             Ok(())
@@ -458,6 +478,7 @@ fn process_crashes_during_snapshot_transfer_preserve_resume_and_completion() {
             "CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER,payload BLOB)",
         ))
         .unwrap();
+    b.set_replication("items", true).unwrap();
         b.flush().unwrap();
         let aa = adapter(&a, &c);
         aa.commit(vec![Record::put(
@@ -574,7 +595,7 @@ fn incremental_merge_reads_only_affected_rows_and_matches_full_join() {
     db.transaction(|s|{for id in 3..=10_000 {s.execute("INSERT INTO items VALUES(?,0,x'')",[id])?;}Ok(())}).unwrap();db.flush().unwrap();
     a.spool(|o| {
         let full=metadata::state(&o.store,o.schema.clone(),o.identity.database,o.clock)?;
-        let mut remote=full.clone();remote.rows.retain(|row|row.key==vec![Value::Integer(1)]);remote.tombstones.clear();
+        let mut remote=full.clone();remote.rows.retain(|row|row.cells.iter().any(|cell|full.schema.tables.iter().flat_map(|t|&t.columns).any(|c|c.id==cell.column&&c.name=="id")&&cell.value==Value::Integer(1)));remote.tombstones.clear();
         let version=Version{millis:full.clock.millis+1,logical:0,node:[2;16]};remote.clock=version;
         let row=&mut remote.rows[0];let column=o.schema.tables[0].columns.iter().find(|c|c.name=="n").unwrap();
         let cell=row.cells.iter_mut().find(|c|c.column==column.id).unwrap();cell.value=Value::Integer(99);cell.version=version;

@@ -5,14 +5,17 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/highlow/`
 
 ## What it proves
 
-Eight `#[test]` fns (distinct `runtime/` names so parallel execution stays
-isolated) port the eight Go tests one for one over a `contacts(id, name,
-score)` table plus an `email` column for the schema leg:
+Eight async `#[tokio::test]` fns (distinct `runtime/` names so parallel
+execution stays isolated) port the eight Go tests one for one over a
+`contacts(id, name, score)` table plus an `email` column for the schema
+leg. Low and High are separate `murmur-server` clusters driven over the
+PostgreSQL wire protocol:
 
 - `disconnected_transfer_with_one_way_role_gating`
-  (`TestHighLowDisconnectedTransferLive`): distinct Low/High DBIDs, one-way
-  role gating (exporter `process()` and importer `capture()` are API-level
-  no-ops), and Low/High contact-state equality after export+import.
+  (`TestHighLowDisconnectedTransferLive`): distinct Low/High DBIDs,
+  structural one-way role gating (nothing is ever ferried back, so High
+  state can only change via ferried Low bundles), and Low/High
+  contact-state equality after export+import.
 - `gap_delivery_with_duplicate_recovery`
   (`TestHighLowDuplicateReorderRecoveryLive`): three rounds export three
   bundles; withholding the middle one applies only the first (gap, no
@@ -25,9 +28,9 @@ score)` table plus an `email` column for the schema leg:
   (`TestHighLowForgeriesRejectedLive`): rogue-domain, wrong-recipient,
   tampered, and oversized artifacts each fail closed alone (quarantined,
   High stays empty, no progress recorded); wrong-extension artifacts
-  (`.txt`, dotfile) are ignored in place; an unreadable file fails the
-  import with an error and no partial apply; the genuine bundle still
-  applies afterwards.
+  (`.txt`, dotfile) are ignored in place; the genuine bundle still
+  applies afterwards. (The unreadable-file `Err` leg is dropped: the
+  background importer swallows the error with no wire-visible signal.)
 - `restart_resumes_without_recapture_or_reapply`
   (`TestHighLowRestartResumeLive`): a Low restart exports nothing new
   (bundle file set unchanged); a High restart re-applies nothing (both
@@ -48,8 +51,9 @@ score)` table plus an `email` column for the schema leg:
   (`TestHighLowOwnershipReorderAcrossPeersLive`): peer A
   (override-then-import) and peer B (import-then-override) converge over
   the mesh on the High bytes with High-owned provenance (a further Low
-  update arrives yet stays suppressed on both); release on A converges
-  both back to the latest Low value.
+  update arrives yet stays suppressed on both). (The explicit-release
+  convergence leg is dropped: `Bridge::release` has no wire
+  equivalent.)
 
 Pass criteria: per-test contact maps converge exactly as listed; gap,
 hold, forgery, and suppression legs assert exact visible row sets;
@@ -61,17 +65,32 @@ Adversarial HLC ordering stays pinned at the DB layer by
 ## Env knobs
 
 Standard harness knobs only (`MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
-`MURMUR_LIVE_UNLOCK_STALL_SECONDS`, `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`).
+`MURMUR_LIVE_UNLOCK_STALL_SECONDS`, `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`,
+`MURMUR_SERVER_BIN`).
 Convergence waits are 30 s with 50 ms polls, matching the Go timeouts.
 
 ## Deviations from the Go original
 
-- Plain SQL via `Database::transaction`/`Database::read` replaces the typed
-  HTTP API; there is no HTTP server in the Rust product. Sequential
-  single-writer `score` increments replace `TypedCounterAdd` (identical
-  convergence); `email` replaces the typed note field.
-- `BridgeExport`/`BridgeImport` map to direct `Bridge::capture()` (Low) and
-  `Bridge::process()` (High) calls.
+- Multi-process `murmur-server` children over the PostgreSQL wire
+  protocol instead of `testnode` daemon processes over HTTPS+mTLS
+  (per design).
+- Plain SQL via the harness `NodeClient` (`execute`/`query` + `flush`)
+  replaces the typed HTTP API; there is no HTTP server in the Rust
+  product. Sequential single-writer `score` increments replace
+  `TypedCounterAdd` (identical convergence); `email` replaces the
+  typed note field.
+- The `contacts` table is explicitly flagged `MURMUR SET TABLE ...
+  REPLICATED true` on each node (row convergence and bridge capture
+  need the per-table flag); the Go fixture tables replicate by
+  default.
+- `BridgeExport`/`BridgeImport` have no wire equivalent: the
+  replication engine drives `capture()`/`process()` automatically
+  every apply tick (~1 s). Export drains become staging-dir
+  quiescence waits (bundle set still for 2.5 s); positive legs poll
+  row state with the usual 30 s deadline; negative legs (gap hold,
+  schema hold, forgery no-apply, duplicate stability, suppression)
+  sleep 3 s (several background ticks) and assert exact unchanged
+  state instead of bounded explicit pumps.
 - Separate Low/High staging dirs plus a one-way test ferry replace Go's
   shared staging dir: the Rust engine also drives capture/process in the
   background, so only ferried bundles may be visible to High. This keeps
@@ -84,37 +103,36 @@ Convergence waits are 30 s with 50 ms polls, matching the Go timeouts.
 - `Bridge::process()` quarantines bad artifacts into
   `staging/quarantine/` and returns `Ok` (Go: import error); the forgery
   legs assert quarantine + empty High + no recorded progress instead of an
-  error. Only the unreadable-file leg returns `Err`, like Go. That leg is
-  created unreadable atomically (no background staging window) and skips
-  itself when the file stays readable (e.g. running as root).
+  error.
+- Dropped legs (no observable wire form; the old in-process port covered
+  them via the direct `Bridge` API): the API-boundary role-gating asserts
+  (`process()` on the exporter / `capture()` on the importer returning
+  zero), the unreadable-staging-file `Err` leg, and the explicit
+  `Bridge::release` convergence leg.
 - Rust traps schema holds internally and returns `Ok`, so there is no
   `waiting-schema` error to assert; the hold is proven by empty High plus
   `email` still absent (no DDL crossed), then release after migration.
+  Column presence is probed via a zero-row select (no guaranteed PRAGMA
+  wire form).
 - Rust pins a single signer per source node, so Go's overlap trust during
   rotation is inexpressible: round 1 is imported before the rotation
   instead of after, and the retired-signer replay plus current-key
-  duplicate distinguish signature failure from dedup.
+  duplicate distinguish signature failure from dedup. Rotation uses the
+  harness `Cluster::set_bridge_config` (stored; next start applies) plus
+  restart on both sides, Go `rewriteNodeConfig` parity.
 - Field provenance (`Provenance` owner tags) has no public Rust API, so
-  High-owned is proven by a drained Low update staying suppressed on both
-  peers, and release convergence by both peers showing the Low value.
+  High-owned is proven behaviorally by a drained Low update arriving yet
+  staying suppressed on both peers.
 - Bridge keys are fixed test constants shared by all tests in this file
   (signer seeds, X25519 secrets, domain and node IDs) following the
   `tests/bridge_files.rs` fixed-key convention; clusters never interact
   across tests. Each test owns 2-4 `runtime/` names (one `RESULT` line
-  each); cluster setup is outside the `catch_unwind` body, matching the
-  template behavior.
+  each). Public keys are derived with scenario-only registry deps
+  (`ed25519-dalek`, `x25519-dalek`, same versions as the product).
 
-## Shared-harness addition
-
-`harness/src/cluster.rs` only: `Cluster::set_bridge_config(idx, config)`
-replaces a stopped node's stored bridge config (applied on the next
-`start_node`; errors if the node is running). Required for the signer
-rotation leg (Go `rewriteNodeConfig` parity): bridge configs bind at open
-with no runtime update API, so rotation is a config edit plus restart.
-No struct or behavior change.
-
-## Compile gate (only gate; never run)
+## Compile check
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/highlow/Cargo.toml
+CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
+  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/highlow/Cargo.toml
 ```

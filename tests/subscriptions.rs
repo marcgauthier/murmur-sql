@@ -427,3 +427,18 @@ fn subscription_database_close_clean_shutdown() -> Result<()> {
     sub.close();
     Ok(())
 }
+
+#[test]
+fn replication_mode_conversion_resets_subscriptions() -> Result<()> {
+    let temp=tempfile::tempdir()?;
+    let db=create_db(&temp.path().join("db"))?;
+    let sub=db.subscribe(
+        |sql|Ok(vec![sql.query_row("SELECT count(*) FROM items",[],|r|r.get::<_,i64>(0))?]),
+        |count|count.to_be_bytes().to_vec(),
+        SubscriptionOptions::default(),
+    )?;
+    assert!(matches!(sub.recv_timeout(Duration::from_secs(2))?,SubscriptionEvent::Initial{..}));
+    db.set_replication("items",true)?;
+    assert!(matches!(sub.recv_timeout(Duration::from_secs(2))?,SubscriptionEvent::Reset{..}));
+    db.close()
+}

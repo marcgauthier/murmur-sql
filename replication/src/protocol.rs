@@ -2,7 +2,7 @@
 use crate::*;
 use ed25519_dalek::{Signer, Signature, SigningKey, VerifyingKey};
 use sha2::{Sha256,Digest};
-pub const VERSION:u16=10;
+pub const VERSION:u16=13;
 pub const ALPN:&[u8]=b"murmur-sqlite/1";
 pub const FRAME_BYTES:usize=8<<20;
 pub const CHUNK_BYTES:usize=64<<10;

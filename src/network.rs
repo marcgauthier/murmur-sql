@@ -333,8 +333,10 @@ impl Backend for Adapter {
             let baseline=metadata::affected_state(&o.store,o.schema.clone(),o.identity.database,o.clock,&keys)?;
             for incoming in &mut incoming_states {
 
-                for table in &incoming.schema.tables {let local=baseline.schema.tables.iter().find(|t|t.id==table.id).ok_or(Error::SchemaMismatch)?;if local.name!=table.name || table.columns.iter().any(|c|!local.columns.contains(c)) {return Err(Error::SchemaMismatch);}}
-                for row in &mut incoming.rows {let table=baseline.schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;for column in &table.columns {if !row.cells.iter().any(|c|c.column==column.id) {if column.not_null || column.primary_key>0 {return Err(Error::SchemaMismatch);}row.cells.push(Cell{column:column.id.clone(),value:Value::Null,version:Version::default()});}}}
+                for table in &incoming.schema.tables {if !crate::table_replication::enabled(&baseline.schema,&table.id){continue;}let local=baseline.schema.tables.iter().find(|t|t.id==table.id).ok_or(Error::SchemaMismatch)?;if local.name!=table.name || table.columns.iter().any(|c|!local.columns.iter().any(|l| {
+                    let mut historical=c.clone();historical.fts=l.fts;historical.vector=l.vector.clone();*l==historical
+                })) {return Err(Error::SchemaMismatch);}}
+                for row in &mut incoming.rows {if !crate::table_replication::enabled(&baseline.schema,&row.table){continue;}let table=baseline.schema.tables.iter().find(|t|t.id==row.table).ok_or(Error::SchemaMismatch)?;for column in &table.columns {if !row.cells.iter().any(|c|c.column==column.id) {if column.not_null || column.primary_key>0 {return Err(Error::SchemaMismatch);}row.cells.push(Cell{column:column.id.clone(),value:Value::Null,version:Version::default()});}}}
                 crate::table_replication::filter(incoming, &baseline.schema);
                 incoming.schema=baseline.schema.clone();
             }
@@ -349,6 +351,7 @@ impl Backend for Adapter {
         if ticket.is_none(){ticket=Some(match database.inner.scheduler.admit_timeout(crate::scheduler::WriterClass::Remote,std::time::Duration::from_millis(100)){Ok(ticket)=>ticket,Err(Error::Busy)=>return Ok(false),Err(e)=>return Err(error(e))});}
         let t_admit2=t_apply.elapsed();
 
+        let snapshot_complete=records.iter().any(|record|record.value.is_some() && record.key.starts_with(net::snapshot::RECEIPTS));
         let mut records=records;records.extend(auxiliary);
         let published=self.call(move|c|{let mut patch=patch;if disjoint && !c.advance_disjoint_patch(&mut patch,&keys)?{return Ok(false);}c.publish_network(patch,records,false)}).map_err(error)?;
         if !published{self.merge_deferrals.fetch_add(1,std::sync::atomic::Ordering::Relaxed);return Ok(false);}
@@ -364,7 +367,7 @@ impl Backend for Adapter {
         let t_publish=t_apply.elapsed();
         let now_ms=net::retention::now_millis();
         let last=self.last_apply_barrier_ms.load(std::sync::atomic::Ordering::Relaxed);
-        if now_ms.saturating_sub(last)>=1000 && self.last_apply_barrier_ms.compare_exchange_weak(last,now_ms,std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed).is_ok() {
+        if snapshot_complete || (now_ms.saturating_sub(last)>=1000 && self.last_apply_barrier_ms.compare_exchange_weak(last,now_ms,std::sync::atomic::Ordering::Relaxed,std::sync::atomic::Ordering::Relaxed).is_ok()) {
             let (tx, rx) = mpsc::channel();
             self.worker.send(Work::Barrier(tx)).map_err(|_| net::Error::Unavailable("storage worker stopped".into()))?;
             rx.recv().map_err(|_|net::Error::Unavailable("durability reply lost".into()))?.map_err(error)?;
@@ -536,13 +539,22 @@ fn column_definition(column:&Column)->Result<String> {
 }
 fn table_definition(table:&Table)->Result<String> {
     if table.name.is_empty() || table.columns.is_empty() || table.columns.len()>2000 {return Err(Error::SchemaMismatch);}
-    let mut definitions=table.columns.iter().map(column_definition).collect::<Result<Vec<_>>>()?;
+    crate::primary_key::validate_table(table)?;
+    let source=crate::primary_key::column_definitions(&table.sql)?;
+    let mut definitions=table.columns.iter().map(|column| {
+        let _=column_definition(column)?;
+        source.get(&column.name).cloned().ok_or(Error::SchemaMismatch)
+    }).collect::<Result<Vec<_>>>()?;
     let keys=schema::pk_columns(table);if keys.is_empty(){return Err(Error::SchemaMismatch);}
     definitions.push(format!("PRIMARY KEY ({})",keys.iter().map(|c|quote(&c.name)).collect::<Vec<_>>().join(",")));
-    Ok(format!("CREATE TABLE {} ({})",quote(&table.name),definitions.join(",")))
+    if let Some(key)=&table.application_key {
+        definitions.push(format!("UNIQUE ({}){}",key.columns.iter().enumerate().map(|(i,n)|format!("{} COLLATE {} {}",quote(n),quote(&key.collations[i]),if key.descending[i]{"DESC"}else{"ASC"})).collect::<Vec<_>>().join(","),crate::primary_key::conflict(key)));
+    }
+    Ok(format!("CREATE TABLE {} ({}){}",quote(&table.name),definitions.join(","),match table.application_key.as_ref().map(|k|(k.without_rowid,k.strict)) {Some((true,true))=>" WITHOUT ROWID, STRICT",Some((true,false))=>" WITHOUT ROWID",Some((false,true))=>" STRICT",_=>""}))
 }
 impl Core {
-    fn adopt_schema(&mut self,incoming:Schema)->Result<bool> {
+    fn adopt_schema(&mut self,mut incoming:Schema)->Result<bool> {
+        for table in &incoming.tables { if table.application_key.is_none(){ return Err(Error::SchemaMismatch); } incoming.table_replication.insert(table.id.clone(),true); }
         // Compare replicated subsets: local-only tables never force adoption.
         let local=crate::table_replication::filter_schema(&self.schema);
         let remote=crate::table_replication::filter_schema(&incoming);
@@ -554,12 +566,16 @@ impl Core {
             if self.schema.tables.iter().any(|t|t.id==incoming_table.id)
                 && !crate::table_replication::enabled(&self.schema,&incoming_table.id) { continue; }
             if let Some(local)=target.tables.iter_mut().find(|t|t.id==incoming_table.id) {
-                if local.name!=incoming_table.name {return Err(Error::SchemaMismatch);}
+                if local.name!=incoming_table.name || local.application_key!=incoming_table.application_key {return Err(Error::SchemaMismatch);}
                 for column in &incoming_table.columns {
-                    if let Some(existing)=local.columns.iter().find(|c|c.id==column.id){if existing!=column{return Err(Error::SchemaMismatch);}}
-                    else {if column.primary_key>0 || column.not_null || local.columns.iter().any(|c|c.name==column.name){return Err(Error::SchemaMismatch);}ddl.push_str(&format!("ALTER TABLE {} ADD COLUMN {};",quote(&local.name),column_definition(column)?));local.columns.push(column.clone());}
+                    if let Some(existing)=local.columns.iter_mut().find(|c|c.id==column.id){
+                        let mut expected=column.clone();expected.fts=existing.fts;expected.vector=existing.vector.clone();
+                        if *existing!=expected{return Err(Error::SchemaMismatch);}
+                        existing.fts=column.fts;existing.vector=column.vector.clone();
+                    }
+                    else {if column.primary_key>0 || column.not_null || local.columns.iter().any(|c|c.name==column.name){return Err(Error::SchemaMismatch);}let definitions=crate::primary_key::column_definitions(&incoming_table.sql)?;let definition=definitions.get(&column.name).ok_or(Error::SchemaMismatch)?;ddl.push_str(&format!("ALTER TABLE {} ADD COLUMN {};",quote(&local.name),definition));local.columns.push(column.clone());}
                 }
-            }else {if target.tables.iter().any(|t|t.name==incoming_table.name){return Err(Error::SchemaMismatch);}ddl.push_str(&table_definition(incoming_table)?);ddl.push(';');target.tables.push(incoming_table.clone());}
+            }else {if target.tables.iter().any(|t|t.name==incoming_table.name){return Err(Error::SchemaMismatch);}ddl.push_str(&table_definition(incoming_table)?);ddl.push(';');target.tables.push(incoming_table.clone());target.table_replication.insert(incoming_table.id.clone(),true);}
         }
         for index in &incoming.indexes {
             if !target.indexes.contains(index) {
@@ -577,12 +593,21 @@ impl Core {
                 ddl.push_str(index);ddl.push(';');target.indexes.push(index.clone());
             }
         }
-        if ddl.is_empty(){return Ok(true);}
-        let before: Vec<RowState> = Vec::new();let previous_search=self.search.clone();self.capture.take();self.connection.execute_batch("BEGIN IMMEDIATE")?;
-        let result=(||->Result<(Schema,Vec<RowState>)>{self.connection.execute_batch(&ddl)?;let migration=Migration::new(ddl.clone());let mut actual=schema::inspect(&self.connection,&self.schema,&migration)?;
-            for table in &mut actual.tables {let intended=target.tables.iter().find(|t|t.name==table.name).ok_or(Error::SchemaMismatch)?;table.id=intended.id.clone();for column in &mut table.columns {let definition=intended.columns.iter().find(|c|c.name==column.name).ok_or(Error::SchemaMismatch)?;column.id=definition.id.clone();column.policy=definition.policy;}}
-            actual.history=canonical_schema(&actual)?.history;self.search.sync_schema(&self.connection,&actual,true)?;self.search.refresh(&self.connection,&actual)?;let after: Vec<RowState> = Vec::new();self.connection.execute_batch("COMMIT")?;Ok((actual,after))})();
+        if ddl.is_empty() && target == self.schema {return Ok(true);}
+        let definitions = crate::search::schema_definitions(&[], &target)?;
+        crate::search::Manager::register(&self.connection, &definitions)?;
+        if target.tables.iter().any(|t| t.columns.iter().any(|c| c.fts || c.vector.is_some()))
+            && self.connection.query_row("PRAGMA temp_store", [], |r| r.get::<_, i64>(0))? != 2 {
+            self.connection.execute_batch("PRAGMA temp_store=MEMORY")?;
+        }
+        let metadata_only = ddl.is_empty();
+        let before=if metadata_only {Vec::new()} else {schema::read_rows(&self.connection,&self.schema)?};let previous_search=self.search.clone();self.capture.take();self.connection.execute_batch("BEGIN IMMEDIATE")?;
+        let result=(||->Result<(Schema,Vec<RowState>)>{self.connection.execute_batch(&ddl)?;let migration=Migration::new(ddl.clone());let mut actual=schema::inspect(&self.connection,&target,&migration)?;
+            for table in &mut actual.tables {let intended=target.tables.iter().find(|t|t.name==table.name).ok_or(Error::SchemaMismatch)?;table.id=intended.id.clone();table.application_key=intended.application_key.clone();for column in &mut table.columns {let definition=intended.columns.iter().find(|c|c.name==column.name).ok_or(Error::SchemaMismatch)?;column.id=definition.id.clone();column.policy=definition.policy;column.fts=definition.fts;column.vector=definition.vector.clone();}}
+            if let Some(path)=&self.table_config_path {crate::config::save_table_flags(path,&actual.table_replication)?;}
+            actual.history=canonical_schema(&actual)?.history;self.search.sync_schema(&self.connection,&actual,true)?;self.search.refresh(&self.connection,&actual)?;let after=if metadata_only {Vec::new()} else {schema::read_rows(&self.connection,&actual)?};self.connection.execute_batch("COMMIT")?;Ok((actual,after))})();
         let (actual,after)=match result {Ok(v)=>v,Err(e)=>{let _=self.connection.execute_batch("ROLLBACK");self.search=previous_search;self.search.publish_guard();self.capture=Some(schema::capture(&self.connection,&self.schema)?);return Err(e);}};
+        if let Some(config)=&self.table_config {config.write().unwrap().replication.tables=actual.table_replication.clone();}
         self.schema=actual.clone();crate::database::configure_authorizer(&self.connection,&self.schema,self.access.clone(),self.search.guard.clone())?;self.status.lock().unwrap().search_indexes=self.search.status();let bytes=encode(&before)?.len()+encode(&after)?.len()+ddl.len();let cursor=self.bump()?;self.capture=Some(schema::capture(&self.connection,&actual)?);
         self.send(Event::SchemaCaptured{migration:ddl,schema:actual.clone(),before,after,version:Version::default()},cursor,bytes)?;self.captured_cursor=cursor;
         Ok(true)
@@ -592,9 +617,26 @@ impl Core {
 #[cfg(test)]
 mod publication_tests {
     use super::*;
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    fn feature_disabled_adoption_preserves_the_existing_schema() -> Result<()> {
+        let directory=tempfile::tempdir()?;
+        let a=Database::open(directory.path().join("source"),[9;32],Options{mode:OpenMode::CreateNew,..Options::default()})?;
+        let b=Database::open(directory.path().join("target"),[9;32],Options{mode:OpenMode::CreateNew,..Options::default()})?;
+        a.migrate(Migration::new("CREATE TABLE docs(id INTEGER PRIMARY KEY,embedding BLOB)"))?;
+        a.set_replication("docs",true)?;
+        let mut incoming=a.schema()?;
+        incoming.tables[0].columns.iter_mut().find(|c|c.name=="embedding").unwrap().vector=Some(crate::VectorColumnConfig{dimensions:2,distance:crate::DistanceMetric::L2});
+        let before=b.schema()?;
+        let error=b.call(move|c|c.adopt_schema(incoming)).unwrap_err();
+        assert!(error.to_string().contains("vector Cargo feature"),"{error}");
+        assert_eq!(b.schema()?,before);
+        a.close()?;b.close()
+    }
+
     fn prepared(database:&Database)->Result<(merge::Patch,std::collections::BTreeSet<(String,Vec<u8>)>)> {
         let baseline=database.export_state()?;let cursor=database.status().committed;
-        let mut incoming=baseline.clone();let row=incoming.rows.iter_mut().find(|row|row.key==vec![Value::Integer(1)]).unwrap();
+        let mut incoming=baseline.clone();let row=incoming.rows.iter_mut().find(|row|row.cells.iter().any(|cell|incoming.schema.tables[0].columns.iter().any(|c|c.id==cell.column&&c.name=="id")&&cell.value==Value::Integer(1))).unwrap();
         let column=incoming.schema.tables[0].columns.iter().find(|column|column.name=="n").unwrap().id.clone();
         let version=incoming.clock.next([7;16])?;let cell=row.cells.iter_mut().find(|cell|cell.column==column).unwrap();cell.value=Value::Integer(42);cell.version=version;incoming.clock=version;
         let keys=std::collections::BTreeSet::from([(row.table.clone(),encode(&row.key)?)]);
@@ -603,7 +645,25 @@ mod publication_tests {
     fn opened(path:&std::path::Path)->Result<Database> {
         let database=Database::open(path,[9;32],Options{mode:OpenMode::CreateNew,capture_interval:std::time::Duration::from_secs(3600),..Options::default()})?;
         database.migrate(Migration::new("CREATE TABLE items(id INTEGER PRIMARY KEY,n INTEGER NOT NULL)"))?;
+        database.set_replication("items",true)?;
         database.transaction(|sql|{sql.execute("INSERT INTO items VALUES(1,0),(2,0)",[])?;Ok(())})?;database.flush()?;Ok(database)
+    }
+    #[test]
+    fn canonical_managed_schema_is_idempotent() -> Result<()> {
+        let temp=tempfile::tempdir()?;let database=opened(&temp.path().join("db"))?;
+        database.migrate(Migration::new("ALTER TABLE items ADD COLUMN note TEXT DEFAULT 'kept'"))?;
+        let first=canonical_schema(&database.schema()?)?;
+        assert_eq!(canonical_schema(&first)?,first);
+        database.close()
+    }
+    #[test]
+    fn adopt_additive_managed_schema_preserves_ids_and_values() -> Result<()> {
+        let temp=tempfile::tempdir()?;let a=opened(&temp.path().join("a"))?;let b=opened(&temp.path().join("b"))?;
+        a.migrate(Migration::new("ALTER TABLE items ADD COLUMN m INTEGER DEFAULT 5"))?;a.flush()?;
+        let incoming=canonical_schema(&crate::table_replication::filter_schema(&a.schema()?))?;
+        assert!(b.call(move |c|c.adopt_schema(incoming))?);
+        assert_eq!(b.read(|s|Ok(s.query_row("SELECT m FROM items WHERE id=1",[],|r|r.get::<_,i64>(0))?))?,5);
+        a.close()?;b.close()
     }
     fn benchmark_cpu_ns()->Option<u128> {
         #[cfg(all(target_os="linux",target_pointer_width="64"))]

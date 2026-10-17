@@ -8,7 +8,8 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-const FORMAT: u32 = 5;
+const FORMAT: u32 = 8;
+fn supported_format(format: u32) -> bool { matches!(format, 6 | 7 | FORMAT) }
 const CHUNK: usize = 64 << 10;
 const MAX_PAYLOAD: usize = 512 << 20;
 struct Zstd(i32);
@@ -53,7 +54,7 @@ pub(crate) enum Event {
     Replica(ReplicaState),
     ReplicaPatch {rows:Vec<RowState>,deleted:Vec<RowState>,tombstones:Vec<Tombstone>,clock:Version,records:Vec<(Vec<u8>,Option<Vec<u8>>)>,remint:bool},
     ReplicaRecords { state: ReplicaState, records: Vec<(Vec<u8>, Option<Vec<u8>>) > },
-    TableReplication { table: String, enabled: bool, schema: Schema },
+    TableReplication { table: String, enabled: bool, schema: Schema, before: Vec<RowState>, after: Vec<RowState>, version: Version },
     MigrationChunk {
         before: Vec<RowState>,
         after: Vec<RowState>,
@@ -190,7 +191,7 @@ struct Assembly {
 impl Assembly {
     fn start(prefix: &str, value: &[u8]) -> Result<Self> {
         let header: ChunkHeader = decode(value)?;
-        if header.format != FORMAT
+        if !supported_format(header.format)
             || header.len > MAX_PAYLOAD
             || (header.chunks != header.len.div_ceil(CHUNK).max(1)
                 && header.chunks != header.len.div_ceil(4 << 20).max(1))
@@ -227,11 +228,12 @@ impl Assembly {
         Ok(self.payload)
     }
 }
-/// Format five recovers winning logical values, rather than applying raw
+/// Format six recovers winning logical values, rather than applying raw
 /// changesets against a baseline that may have changed through replication.
 pub(crate) fn recover_current(opened: &Opened, progress: &crate::progress::OpenProgressReporter) -> Result<Connection> {
     progress.phase(OpenPhase::Rebuilding);
     let c = Connection::open_in_memory()?;
+    crate::primary_key::register(&c)?;
     c.execute_batch("BEGIN")?;
     for table in &opened.schema.tables { c.execute_batch(&table.sql)?; }
     for table in &opened.schema.tables {
@@ -300,11 +302,11 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
                     .map_err(|_| Error::Corrupt("storage key".into()))?;
                 if key == "00/identity" {
                     let i: Identity = decode(&r.value)?;
-                    if i.format != FORMAT {
+                    if !supported_format(i.format) {
                         return Err(Error::Corrupt("unsupported database format".into()));
                     }
                     identity = Some(i);
-                } else if key == "00/schema/replication" {
+                } else if key == "00/schema/replication" || key == "00/schema/table-flags-v2" || key == "00/schema/config-owned" {
                     // Loaded after replay so later schema events cannot overwrite it.
                 } else if key == "01/snapshot/head" {
                     head = Some(decode(&r.value)?);
@@ -330,7 +332,7 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
                                 return Err(Error::Corrupt("snapshot head hash".into()));
                             }
                             let snapshot: Snapshot = decode(&data)?;
-                            if snapshot.format != FORMAT
+                            if !supported_format(snapshot.format)
                                 || snapshot.sequence != h.sequence
                                 || snapshot.cursor != h.cursor
                             {
@@ -375,7 +377,7 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
                             .ok_or_else(|| Error::Corrupt("log descriptor missing".into()))?;
                         if a.push(key, &r.value)? {
                             let e: Entry = decode(&assembly.take().unwrap().finish()?)?;
-                            if e.format != FORMAT
+                            if !supported_format(e.format)
                                 || e.sequence != sequence + 1
                                 || e.sequence != log_seq
                                 || e.cursor < cursor
@@ -398,6 +400,7 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
                     || key.starts_with("09/bridge/")
                     || key.starts_with("10/policy/")
                     || key.starts_with("11/blob/")
+                    || key.starts_with("12/key-transition/")
                     || key.starts_with("05/meta/deleted/")
                 {
                     // Authoritative metadata stays in Spool; do not load its values into Rust.
@@ -414,7 +417,7 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
         let _ = store.close();
         return Err(Error::Corrupt("incomplete record".into()));
     }
-    let identity = match identity {
+    let mut identity = match identity {
         Some(i) => i,
         None if o.mode == OpenMode::CreateNew => {
             let i = Identity {
@@ -439,12 +442,18 @@ pub(crate) fn open(path: &Path, key: &[u8], o: &Options, progress: &crate::progr
         let _ = store.close();
         return Err(Error::Invalid("database/node identity mismatch".into()));
     }
+    // Mark the store before writing any extended schemas. Older binaries must
+    // reject it rather than interpreting schema extensions as application SQL.
+    if identity.format != FORMAT {
+        identity.format = FORMAT;
+        store.commit(&[Mutation::put(b"00/identity".to_vec(), encode(&identity)?)], Durability::Sync)?;
+    }
     let clock = store
         .get(b"06/clock")?
         .map(|b| decode(&b))
         .transpose()?
         .unwrap_or_default();
-    s.table_replication = store.get(crate::table_replication::SETTINGS_KEY)?
+    s.table_replication = store.get(crate::table_replication::SETTINGS_KEY)?.or(store.get(crate::table_replication::LEGACY_SETTINGS_KEY)?)
         .map(|bytes| decode(&bytes)).transpose()?.unwrap_or_default();
     Ok(Opened {
         schema_version: 0,
@@ -493,7 +502,7 @@ fn persist_checkpoint(
         if let Some(config) = &o.replication {
             let schema = match &event { Event::Schema {schema,..} => schema, _ => &opened.schema };
             let delta = if let Some(table) = &enabled_table {
-                let mut state = metadata::state(&opened.store, schema.clone(), opened.identity.database, clock)?;
+                let mut state = metadata::changed_state(&metadata_changes, schema.clone(), opened.identity.database, clock)?;
                 state.rows.retain(|r| &r.table == table);
                 state.tombstones.retain(|r| &r.table == table);
                 state
@@ -731,6 +740,13 @@ pub(crate) fn start(
                         } else {
                             crate::table_replication::filter(&mut state, &opened.schema);
                             state.schema.table_replication = baseline.schema.table_replication.clone();
+                            for local in &baseline.schema.tables {
+                                if !crate::table_replication::enabled(&baseline.schema,&local.id) {
+                                    if let Some(remote)=state.schema.tables.iter_mut().find(|t|t.id==local.id) {*remote=local.clone();}
+                                    else {state.schema.tables.push(local.clone());}
+                                }
+                            }
+                            state.schema.tables.sort_by(|a,b|a.name.cmp(&b.name));
                             merge::prepare(&baseline, &state, cursor)
                         };
                         let _ = reply.send(result);
@@ -935,8 +951,9 @@ fn materialize(o: &Opened, event: Event) -> Result<(Event, Vec<Mutation>, Versio
             let version = state.clock;
             (Event::Replica(state), changes, version)
         }
-        Event::TableReplication { schema, .. } => {
-            (Event::Schema { migration: String::new(), schema, version: o.clock }, Vec::new(), o.clock)
+        Event::TableReplication { table, enabled, schema, before, after, version } => {
+            let changes = metadata::transition(&o.store, &table, enabled, &before, &after, version)?;
+            (Event::Schema { migration: String::new(), schema, version }, changes, version)
         }
         Event::MigrationChunk {
             before,
@@ -1016,6 +1033,74 @@ fn compact_history(history: Vec<Event>) -> Result<Vec<Event>> {
 #[cfg(test)]
 mod recovery_codec_tests {
     use super::*;
+
+    #[test]
+    fn format_six_log_and_snapshot_upgrade_without_changing_schema_bytes() -> Result<()> {
+        for (legacy_format, snapshot) in [(6, false), (6, true), (7, false), (7, true)] {
+            let dir = tempfile::tempdir()?;
+            let path = dir.path().join("legacy");
+            let options = Options::default();
+            let opts = spool_options(&path, &[9; 32], &options);
+            let store = spool::open(&opts)?;
+            let c = Connection::open_in_memory()?;
+            c.execute_batch("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")?;
+            let mut schema = schema::inspect(&c, &Schema::default(), &Migration::new("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)"))?;
+            if legacy_format == 7 { schema.tables[0].columns.iter_mut().find(|c| c.name == "body").unwrap().fts = true; }
+            let event = Event::Schema { migration: String::new(), schema, version: Version::default() };
+            let (prefix, payload) = if snapshot {
+                ("02/snapshot/00000000000000000001", encode(&Snapshot { format: legacy_format, sequence: 1, cursor: 1, history: vec![event] })?)
+            } else {
+                ("03/log/00000000000000000001", encode(&Entry { format: legacy_format, sequence: 1, cursor: 1, event })?)
+            };
+            let mut records = payload_records(prefix, &payload)?;
+            let header = ChunkHeader { format: legacy_format, chunks: payload.len().div_ceil(CHUNK), len: payload.len(), hash: *blake3::hash(&payload).as_bytes() };
+            records[0] = Mutation::put(format!("{prefix}/00000000").into_bytes(), encode(&header)?);
+            records.push(Mutation::put(b"00/identity".to_vec(), encode(&Identity { database: [1;16], node: [2;16], format: legacy_format })?));
+            if snapshot {
+                records.push(Mutation::put(b"01/snapshot/head".to_vec(), encode(&Head { sequence: 1, cursor: 1, chunks: header.chunks, hash: header.hash })?));
+            }
+            store.commit(&records, Durability::Sync)?;
+            store.close()?;
+            let db = crate::Database::open(&path, [9;32], Options::default())?;
+            assert_eq!(db.schema()?.tables[0].name, "docs");
+            assert!(db.schema()?.tables[0].columns.iter().all(|c| c.vector.is_none()));
+            assert_eq!(db.schema()?.tables[0].columns.iter().any(|c| c.fts), legacy_format == 7);
+            db.set_column_fts("docs", "body", true)?;
+            db.flush()?;
+            db.close()?;
+            let db = crate::Database::open(&path, [9;32], Options::default())?;
+            assert!(db.schema()?.tables[0].columns.iter().any(|c| c.fts));
+            db.close()?;
+            let store = spool::open(&opts)?;
+            let identity: Identity = decode(&store.get(b"00/identity")?.unwrap())?;
+            assert_eq!(identity.format, FORMAT);
+            store.close()?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(feature = "vector"))]
+    #[test]
+    fn feature_disabled_open_preserves_vector_declarations() -> Result<()> {
+        let dir=tempfile::tempdir()?; let path=dir.path().join("vector-store");
+        let opts=spool_options(&path, &[9;32], &Options::default());
+        let store=spool::open(&opts)?;
+        let c=Connection::open_in_memory()?;
+        c.execute_batch("CREATE TABLE docs(id INTEGER PRIMARY KEY,embedding BLOB)")?;
+        let mut schema=schema::inspect(&c,&Schema::default(),&Migration::new(""))?;
+        schema.tables[0].columns.iter_mut().find(|c|c.name=="embedding").unwrap().vector=Some(crate::VectorColumnConfig{dimensions:2,distance:crate::DistanceMetric::L2});
+        let payload=encode(&Entry{format:FORMAT,sequence:1,cursor:1,event:Event::Schema{migration:String::new(),schema,version:Version::default()}})?;
+        let mut records=payload_records("03/log/00000000000000000001",&payload)?;
+        records.push(Mutation::put(b"00/identity".to_vec(),encode(&Identity{database:[1;16],node:[2;16],format:FORMAT})?));
+        store.commit(&records,Durability::Sync)?;store.close()?;
+        match crate::Database::open(&path,[9;32],Options::default()) {
+            Err(error)=>assert!(error.to_string().contains("vector Cargo feature"),"{error}"),
+            Ok(db)=>{db.close()?;panic!("feature-disabled open accepted vector schema");}
+        }
+        let opened=open(&path,&[9;32],&Options::default(),&crate::progress::OpenProgressReporter::new(None))?;
+        assert!(opened.schema.tables[0].columns.iter().any(|c|c.vector.is_some()));
+        Ok(())
+    }
 
     #[test]
     fn bounded_zstd_reads_preserve_existing_frames_and_reject_damage() {
