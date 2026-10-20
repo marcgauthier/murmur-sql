@@ -1,9 +1,9 @@
 name: Go client
 on:
   push:
-    paths: ['clients/go/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/go-client.yml']
+    paths: ['clients/go/**', 'src/**', 'Cargo.*', '.github/workflows/go-client.yml']
   pull_request:
-    paths: ['clients/go/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/go-client.yml']
+    paths: ['clients/go/**', 'src/**', 'Cargo.*', '.github/workflows/go-client.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -21,6 +21,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: murmur-sql
+      # Sibling checkout for the `murmur` path dependency (`../MURMUR`).
+      - uses: actions/checkout@v4
+        with:
+          repository: marcgauthier/murmur
+          path: MURMUR
       - uses: actions/setup-go@v5
         with:
           go-version: '1.24.x'
@@ -29,22 +36,24 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
       - name: Build server binary
+        working-directory: murmur-sql
         shell: bash
+        # No --locked: the sibling murmur checkout floats on its default branch.
         run: |
-          cargo build --locked --features replication --bin murmur-server --bin murmur-admin
-          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/target/debug/murmur-server${{ runner.os == 'Windows' && '.exe' || '' }}" >> $GITHUB_ENV
+          cargo build --features replication --bin murmur-server --bin murmur-admin
+          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/murmur-sql/target/debug/murmur-server${{ runner.os == 'Windows' && '.exe' || '' }}" >> $GITHUB_ENV
       - name: Go static analysis
-        working-directory: clients/go
+        working-directory: murmur-sql/clients/go
         run: go vet ./...
       - name: Go tests
-        working-directory: clients/go
+        working-directory: murmur-sql/clients/go
         run: go test -p 2 -count=1 -timeout 300s ./...
       - name: Go race detector
         if: runner.os != 'Windows'
-        working-directory: clients/go
+        working-directory: murmur-sql/clients/go
         run: go test -p 2 -race -count=1 -timeout 300s ./...
       - name: Go examples
-        working-directory: clients/go
+        working-directory: murmur-sql/clients/go
         shell: bash
         run: |
           for ex in basic migrations tables tls concurrency backup keys metrics files search vectors json replication bridge; do

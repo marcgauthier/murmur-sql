@@ -5,11 +5,12 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
 	"math"
 	"strings"
+
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -33,28 +34,42 @@ func main() {
 				t.Fatalf("insert: %v", err)
 			}
 		}
-		if err := db.SetColumnVector(ctx, "documents", "embedding", &murmur.VectorOptions{Dimensions: 2, Distance: murmur.VectorL2}); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'documents' 'embedding' VECTOR true DIMENSIONS 2 DISTANCE l2"); err != nil {
 			t.Fatalf("enable: %v", err)
 		}
-		if err := db.RefreshIndexes(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR REFRESH INDEXES"); err != nil {
 			t.Fatalf("refresh: %v", err)
 		}
-		columns, err := db.ColumnVectors(ctx)
+		rows, err := db.QueryContext(ctx, "MURMUR SHOW COLUMNS VECTOR")
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
 		var name string
-		for _, c := range columns {
-			if c.Enabled && c.IndexName != nil && c.Ready != nil && *c.Ready {
-				name = *c.IndexName
+		for rows.Next() {
+			var table, column string
+			var enabled bool
+			var indexName, indexError *string
+			var ready, rebuilding *bool
+			var pending, queued *int64
+			var dimensions *int64
+			var distance *string
+			if err := rows.Scan(&table, &column, &enabled, &dimensions, &distance, &indexName, &ready, &rebuilding, &pending, &queued, &indexError); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if enabled && indexName != nil && ready != nil && *ready {
+				name = *indexName
 			}
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		rows.Close()
 		if name == "" {
 			t.Fatalf("no ready vector index")
 		}
 		ident := `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 		query := "SELECT rowid,distance FROM temp." + ident + " WHERE embedding MATCH $1 AND k=$2 ORDER BY distance"
-		rows, err := db.QueryContext(ctx, query, "[1,0]", 2)
+		rows, err = db.QueryContext(ctx, query, "[1,0]", 2)
 		if err != nil {
 			t.Fatalf("query: %v", err)
 		}
@@ -81,19 +96,33 @@ func main() {
 		if count != 2 {
 			t.Fatalf("expected 2 neighbors, got %d", count)
 		}
-		if err := db.SetColumnVector(ctx, "documents", "embedding", nil); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'documents' 'embedding' VECTOR false"); err != nil {
 			t.Fatalf("disable: %v", err)
 		}
-		columns, err = db.ColumnVectors(ctx)
+		rows, err = db.QueryContext(ctx, "MURMUR SHOW COLUMNS VECTOR")
 		if err != nil {
 			t.Fatalf("disabled status: %v", err)
 		}
-		for _, c := range columns {
-			if c.Enabled {
+		for rows.Next() {
+			var table, column string
+			var enabled bool
+			var indexName, indexError *string
+			var ready, rebuilding *bool
+			var pending, queued *int64
+			var dimensions *int64
+			var distance *string
+			if err := rows.Scan(&table, &column, &enabled, &dimensions, &distance, &indexName, &ready, &rebuilding, &pending, &queued, &indexError); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if enabled || indexName != nil {
 				t.Fatalf("column still enabled")
 			}
 		}
-		if err := db.Flush(ctx); err != nil {
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		rows.Close()
+		if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
 		fmt.Println("vectors: verified declarations, nearest neighbors, distances and disable")

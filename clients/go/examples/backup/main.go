@@ -5,11 +5,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"fmt"
+	"strings"
+	"time"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -36,36 +39,95 @@ func main() {
 		_, err = db.ExecContext(ctx, "INSERT INTO docs VALUES (1, 'v1')")
 		must(err)
 
-		saved, err := db.BackupSave(ctx)
+		var saved string
+		var savedSize int64
+		must(db.QueryRowContext(ctx, "MURMUR BACKUP SAVE").Scan(&saved, &savedSize))
+		if savedSize <= 0 {
+			t.Fatalf("empty archive")
+		}
+		rows, err := db.QueryContext(ctx, "MURMUR BACKUP LIST")
 		must(err)
-		fmt.Printf("saved %s (%d bytes)\n", saved.Name, saved.Size)
-
-		files, err := db.BackupList(ctx)
-		must(err)
-		if len(files) != 1 || files[0].Name != saved.Name {
-			t.Fatalf("list = %+v", files)
+		count := 0
+		for rows.Next() {
+			var name, modified string
+			var size int64
+			must(rows.Scan(&name, &size, &modified))
+			if name != saved || size != savedSize {
+				t.Fatalf("backup list mismatch")
+			}
+			count++
+		}
+		must(rows.Err())
+		rows.Close()
+		if count != 1 {
+			t.Fatalf("expected one backup")
 		}
 
+		// Backup DOWNLOAD returns byte ranges; its names/offsets are SQL literals.
 		var downloaded bytes.Buffer
-		must(db.BackupDownload(ctx, saved.Name, &downloaded))
-		if int64(downloaded.Len()) != saved.Size {
-			t.Fatalf("downloaded %d bytes, want %d", downloaded.Len(), saved.Size)
+		for offset := int64(0); ; {
+			var actual, total int64
+			var chunk []byte
+			query := fmt.Sprintf("MURMUR BACKUP DOWNLOAD '%s' OFFSET %d LIMIT 1048576", strings.ReplaceAll(saved, "'", "''"), offset)
+			must(db.QueryRowContext(ctx, query).Scan(&actual, &total, &chunk))
+			if actual != offset {
+				t.Fatalf("unexpected offset")
+			}
+			downloaded.Write(chunk)
+			offset += int64(len(chunk))
+			if offset >= total {
+				break
+			}
+			if len(chunk) == 0 {
+				t.Fatalf("empty nonfinal chunk")
+			}
 		}
-		copyName := "copy-" + saved.Name
-		must(db.BackupUpload(ctx, copyName, bytes.NewReader(downloaded.Bytes())))
-		files, err = db.BackupList(ctx)
-		must(err)
-		if len(files) != 2 {
-			t.Fatalf("list after upload = %+v", files)
+		if int64(downloaded.Len()) != savedSize {
+			t.Fatalf("download size mismatch")
 		}
-
-		_, err = db.ExecContext(ctx, "INSERT INTO docs VALUES (2, 'v2')")
+		copyName := "copy-" + saved
+		quotedCopy := "'" + strings.ReplaceAll(copyName, "'", "''") + "'"
+		_, err = db.ExecContext(ctx, "MURMUR BACKUP UPLOAD BEGIN "+quotedCopy)
 		must(err)
-		must(db.Restore(ctx, saved.Name, "example-key"))
-		var count int
+		defer func() {
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancel()
+			db.ExecContext(cleanupCtx, "MURMUR BACKUP UPLOAD ABORT "+quotedCopy)
+		}()
+		payload := downloaded.Bytes()
+		for offset := 0; offset < len(payload); offset += 256 << 10 {
+			end := min(offset+(256<<10), len(payload))
+			query := "MURMUR BACKUP UPLOAD APPEND " + quotedCopy + " '" + base64.StdEncoding.EncodeToString(payload[offset:end]) + "'"
+			_, err = db.ExecContext(ctx, query)
+			must(err)
+		}
+		var uploaded string
+		var uploadedSize int64
+		must(db.QueryRowContext(ctx, "MURMUR BACKUP UPLOAD FINISH "+quotedCopy).Scan(&uploaded, &uploadedSize))
+		if uploaded != copyName || uploadedSize != savedSize {
+			t.Fatalf("uploaded archive mismatch")
+		}
+		rows, err = db.QueryContext(ctx, "MURMUR BACKUP LIST")
+		must(err)
+		count = 0
+		for rows.Next() {
+			var name, modified string
+			var size int64
+			must(rows.Scan(&name, &size, &modified))
+			count++
+		}
+		must(rows.Err())
+		rows.Close()
+		if count != 2 {
+			t.Fatalf("expected two backups")
+		}
+		_, err = db.ExecContext(ctx, "INSERT INTO docs VALUES (2,'v2')")
+		must(err)
+		_, err = db.ExecContext(ctx, "MURMUR RESTORE FROM '"+strings.ReplaceAll(saved, "'", "''")+"' KEY 'example-key'")
+		must(err)
 		must(db.QueryRowContext(ctx, "SELECT count(*) FROM docs").Scan(&count))
 		if count != 1 {
-			t.Fatalf("count after restore = %d, want 1", count)
+			t.Fatalf("count after restore=%d, want 1", count)
 		}
 		fmt.Println("backup: verified save, list, download, upload, restore")
 	})

@@ -26,7 +26,7 @@ fn free_port() -> u16 {
 }
 
 fn write_fresh_config(dir: &tempfile::TempDir, port: u16) -> std::path::PathBuf {
-    let hash = sqlite_session::server::auth::hash_password(PASSWORD).unwrap();
+    let hash = murmur_sql::server::auth::hash_password(PASSWORD).unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
@@ -46,10 +46,10 @@ fn write_fresh_config(dir: &tempfile::TempDir, port: u16) -> std::path::PathBuf 
 /// Change only the bind address, preserving server-managed sections like
 /// `[replication.tables]`.
 fn rebind(config: &std::path::Path, port: u16) {
-    let mut loaded = sqlite_session::config::Config::load(config).unwrap();
+    let mut loaded = murmur_sql::config::Config::load(config).unwrap();
     loaded.server.bind = format!("127.0.0.1:{port}");
     std::fs::write(config, toml::to_string(&loaded).unwrap()).unwrap();
-    sqlite_session::config::Config::load(config).unwrap();
+    murmur_sql::config::Config::load(config).unwrap();
 }
 
 fn spawn_server(config: &std::path::Path, port: u16) -> Server {
@@ -241,7 +241,7 @@ async fn set_and_show_table_flags_persist_to_config() {
 
     // The flag survives a restart through config.toml.
     let config_path = dir.path().join("config.toml");
-    let before = sqlite_session::config::Config::load(&config_path).unwrap();
+    let before = murmur_sql::config::Config::load(&config_path).unwrap();
     assert_eq!(before.replication.tables.values().filter(|v| !**v).count(), 1);
     drop(server);
     let port = free_port();
@@ -258,7 +258,7 @@ async fn set_and_show_table_flags_persist_to_config() {
 // after the embedded API is removed.
 #[tokio::test]
 async fn legacy_spool_flags_import_into_config_once() {
-    use sqlite_session::{Database, Migration, OpenMode, Options};
+    use murmur::{Database, Migration, OpenMode, Options};
     let dir = tempfile::tempdir().unwrap();
     let data_dir = dir.path().join("data");
     let key: [u8; 32] = *blake3::hash(KEY.as_bytes()).as_bytes();
@@ -276,7 +276,7 @@ async fn legacy_spool_flags_import_into_config_once() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, String>(0), "legacy");
     assert_eq!(rows[0].get::<_, String>(1), "false");
-    let config = sqlite_session::config::Config::load(dir.path().join("config.toml")).unwrap();
+    let config = murmur_sql::config::Config::load(dir.path().join("config.toml")).unwrap();
     assert_eq!(config.replication.tables.values().filter(|v| !**v).count(), 1);
 }
 
@@ -334,7 +334,7 @@ async fn show_metrics_wire_query() {
 
 #[tokio::test]
 async fn engine_created_tables_remain_local_on_first_unlock() {
-    use sqlite_session::{Database, Migration, OpenMode, Options};
+    use murmur::{Database, Migration, OpenMode, Options};
     // An absent flag always means local-only, including when the engine
     // created the store before its first server unlock.
     let dir = tempfile::tempdir().unwrap();
@@ -353,6 +353,6 @@ async fn engine_created_tables_remain_local_on_first_unlock() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get::<_, String>(0), "kept");
     assert_eq!(rows[0].get::<_, String>(1), "false");
-    let config = sqlite_session::config::Config::load(dir.path().join("config.toml")).unwrap();
+    let config = murmur_sql::config::Config::load(dir.path().join("config.toml")).unwrap();
     assert!(config.replication.tables.is_empty());
 }

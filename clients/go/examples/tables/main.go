@@ -5,9 +5,9 @@ import (
 	"context"
 	"fmt"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -31,21 +31,30 @@ func main() {
 			}
 		}
 		show := func() map[string]bool {
-			flags, err := db.TableReplication(ctx)
+			rows, err := db.QueryContext(ctx, "MURMUR SHOW TABLES REPLICATION")
 			if err != nil {
 				t.Fatalf("flags: %v", err)
 			}
+			defer rows.Close()
 			byName := map[string]bool{}
-			for _, f := range flags {
-				byName[f.Table] = f.Replicated
-				fmt.Printf("table %s replicated=%v\n", f.Table, f.Replicated)
+			for rows.Next() {
+				var table string
+				var replicated bool
+				if err := rows.Scan(&table, &replicated); err != nil {
+					t.Fatalf("flags scan: %v", err)
+				}
+				byName[table] = replicated
+				fmt.Printf("table %s replicated=%v\n", table, replicated)
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("flags rows: %v", err)
 			}
 			return byName
 		}
 		if got := show(); got["orders"] || got["scratch"] {
 			t.Fatalf("defaults: %v", got)
 		}
-		if err := db.SetTableReplicated(ctx, "orders", true); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR SET TABLE 'orders' REPLICATED true"); err != nil {
 			t.Fatalf("set: %v", err)
 		}
 		if got := show(); got["scratch"] || !got["orders"] {
@@ -61,10 +70,10 @@ func main() {
 			"UPDATE orders SET id_murmur_primary_key='forged' WHERE id=1"); err == nil {
 			t.Fatalf("managed column unexpectedly writable")
 		}
-		if err := db.SetTableReplicated(ctx, "orders", false); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR SET TABLE 'orders' REPLICATED false"); err != nil {
 			t.Fatalf("disable populated table: %v", err)
 		}
-		if err := db.SetTableReplicated(ctx, "orders", true); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR SET TABLE 'orders' REPLICATED true"); err != nil {
 			t.Fatalf("enable populated table: %v", err)
 		}
 		var again string
@@ -72,7 +81,7 @@ func main() {
 			"SELECT id_murmur_primary_key FROM orders WHERE id=$1", 1).Scan(&again); err != nil || first != again {
 			t.Fatalf("stable UUID: %q != %q, %v", first, again, err)
 		}
-		if err := db.Flush(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
 		fmt.Println("tables: verified flags, UUIDv5 keys, populated conversions and flush")

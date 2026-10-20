@@ -1,5 +1,5 @@
 //! VictoriaLogs sink pushes Loki-compatible batches to the configured URL.
-use sqlite_session::config::LoggingConfig;
+use murmur_sql::config::LoggingConfig;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::time::Duration;
@@ -46,7 +46,7 @@ fn pushes_loki_batch_to_configured_url() {
 
     let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
     runtime.block_on(async {
-        let (subscriber, _guard) = sqlite_session::logging::build(&logging, runtime.handle()).unwrap();
+        let (subscriber, _guard) = murmur_sql::logging::build(&logging, runtime.handle()).unwrap();
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!("hello victorialogs");
         });

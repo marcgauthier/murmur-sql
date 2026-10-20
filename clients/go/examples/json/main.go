@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"reflect"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -117,7 +117,7 @@ func main() {
 		if _, err := db.ExecContext(ctx, "CREATE INDEX json_name ON json_documents(json_extract(data,'$.name'))"); err == nil {
 			t.Fatalf("expected JSON expression index to be rejected by managed migrations")
 		}
-		if err := db.Flush(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
 		fmt.Println("json: verified extraction, updates, arrays, parameters, validation and JSONB")

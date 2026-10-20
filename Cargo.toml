@@ -1,15 +1,16 @@
 [package]
-name = "sqlite-session"
+name = "murmur-sql"
 version = "0.1.0"
 edition = "2024"
 
 [features]
 default = ["vector"]
-replication = ["dep:murmur-replication", "dep:ipnet"]
-vector = ["dep:sqlite-vec"]
+replication = ["murmur/replication"]
+vector = ["murmur/vector"]
 
 [dependencies]
-rusqlite = { version = "0.40.2", features = ["bundled", "load_extension", "session", "hooks", "column_decltype", "column_metadata", "functions"] }
+murmur = { package = "sqlite-session", path = "../MURMUR" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 toml = "1"
 toml_edit = "0.22"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "net", "io-util", "macros", "fs", "signal"] }
@@ -26,20 +27,12 @@ base64 = "0.22"
 rustls-pemfile = "2"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-ipnet = { version = "2", optional = true }
 
-murmur-spool = { path = "spool" }
 serde = { version = "1", features = ["derive"] }
-postcard = { version = "1", features = ["alloc"] }
 blake3 = "1"
-uuid = { version = "1", features = ["v5"] }
 zeroize = "1"
-zstd = "0.13"
 rand = "0.8"
-thiserror = "2"
 serde_json = "1"
-sqlite-vec = { version = "=0.1.6", optional = true }
-murmur-replication = { path = "replication", optional = true }
 
 [[bin]]
 name = "murmur-admin"

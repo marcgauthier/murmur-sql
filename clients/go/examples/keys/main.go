@@ -3,11 +3,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strings"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	"github.com/jackc/pgx/v5/pgconn"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -26,7 +29,7 @@ func main() {
 		if _, err := db.ExecContext(ctx, "INSERT INTO records VALUES($1,$2)", 1, "kept"); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
-		if err := db.RotateKey(ctx, cfg.Key, "new-key"); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR ROTATE KEY "+"'"+strings.ReplaceAll(cfg.Key, "'", "''")+"'"+" 'new-key'"); err != nil {
 			t.Fatalf("rotate: %v", err)
 		}
 		db.Close()
@@ -35,7 +38,8 @@ func main() {
 			stale.Close()
 			t.Fatalf("old key still works")
 		}
-		if murmur.CodeOf(err) != "28000" {
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "28000" {
 			t.Fatalf("old key: %v", err)
 		}
 		cfg.Key = "new-key"

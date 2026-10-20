@@ -2,7 +2,7 @@
 #[cfg(feature = "replication")]
 use super::query::ColInfo;
 use super::{commands::CommandOutput, query::user_error};
-use crate::model::Value;
+use murmur::Value;
 use pgwire::{api::Type, error::PgWireResult};
 use std::collections::VecDeque;
 
@@ -255,7 +255,7 @@ pub(crate) fn execute(
 #[cfg(feature = "replication")]
 mod enabled {
     use super::*;
-    use murmur_replication::files::{Download, Objects, Upload};
+    use murmur::replication::files::{Download, Objects, Upload};
     use std::{
         collections::HashMap,
         net::SocketAddr,
@@ -344,18 +344,18 @@ mod enabled {
             Ok(&mut e.handle)
         }
     }
-    fn storage(e: murmur_replication::Error) -> pgwire::error::PgWireError {
+    fn storage(e: murmur::replication::Error) -> pgwire::error::PgWireError {
         let code = match &e {
-            murmur_replication::Error::Unavailable(_) => "55000",
-            murmur_replication::Error::Overloaded => "53400",
-            murmur_replication::Error::Invalid(_) => "22023",
+            murmur::replication::Error::Unavailable(_) => "55000",
+            murmur::replication::Error::Overloaded => "53400",
+            murmur::replication::Error::Invalid(_) => "22023",
             _ => "58030",
         };
         user_error(code, e.to_string())
     }
     fn metadata(
         objects: &Objects,
-        m: &murmur_replication::files::Metadata,
+        m: &murmur::replication::files::Metadata,
     ) -> PgWireResult<Vec<Value>> {
         Ok(vec![
             Value::Text(m.name.clone()),
@@ -367,7 +367,7 @@ mod enabled {
                 i64::try_from(m.millis)
                     .map_err(|_| user_error("22003", "file timestamp overflow".into()))?,
             ),
-            Value::Text(murmur_replication::hex(&m.digest)),
+            Value::Text(murmur::replication::hex(&m.digest)),
             Value::Integer(objects.path(m.digest, m.generation).is_file() as i64),
         ])
     }

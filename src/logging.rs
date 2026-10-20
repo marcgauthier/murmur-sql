@@ -8,7 +8,7 @@
 //! never block the server.
 
 use crate::config::{LoggingConfig, VictoriaLogsConfig};
-use crate::{Error, Result};
+use murmur::{Error, Result};
 use std::path::Path;
 use std::time::Duration;
 use tracing_subscriber::layer::{Layer as _, SubscriberExt};

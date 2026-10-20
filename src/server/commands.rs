@@ -46,7 +46,7 @@ pub(crate) enum CommandOutput {
     Tag(&'static str),
     Rows {
         columns: Vec<crate::server::query::ColInfo>,
-        rows: Vec<Vec<crate::model::Value>>,
+        rows: Vec<Vec<murmur::Value>>,
     },
 }
 
@@ -133,7 +133,7 @@ fn unlock(
             tracing::info!(user = %user, %addr, ?outcome, "connection unlocked");
             Ok(CommandOutput::Tag("UNLOCK"))
         }
-        Err(crate::Error::WrongKey) => Err(user_error("28000", "incorrect key".to_string())),
+        Err(murmur::Error::WrongKey) => Err(user_error("28000", "incorrect key".to_string())),
         Err(e) => Err(crate::server::query::engine_error(e)),
     }
 }
@@ -166,17 +166,8 @@ fn set_table(
         _ => return Err(user_error("22023", format!("REPLICATED takes true or false, not {value:?}"))),
     };
     let db = state.require_db()?;
-    let schema = db.schema().map_err(crate::server::query::engine_error)?;
-    let id = schema
-        .tables
-        .iter()
-        .find(|t| t.name.eq_ignore_ascii_case(&name))
-        .ok_or_else(|| user_error("22023", format!("unknown table: {name}")))?
-        .id
-        .clone();
-    db.set_replication_config(&name, replicated, state.config_path())
+    db.set_replication_sink(&name, replicated, Some(state.table_flags_sink()))
         .map_err(crate::server::query::engine_error)?;
-    state.set_table_flag_snapshot(&id, replicated);
     tracing::info!(table = %name, replicated, "table replication flag updated");
     Ok(CommandOutput::Tag("SET"))
 }
@@ -206,11 +197,11 @@ fn set_column_search(state: &ServerState, mut words: std::collections::VecDeque<
             let distance = if words.len() == 4 {
                 if !words[2].eq_ignore_ascii_case("DISTANCE") { return Err(user_error("42601", usage.into())); }
                 match words[3].to_ascii_lowercase().as_str() {
-                    "l2" => crate::DistanceMetric::L2, "cosine" => crate::DistanceMetric::Cosine, "l1" => crate::DistanceMetric::L1,
+                    "l2" => murmur::DistanceMetric::L2, "cosine" => murmur::DistanceMetric::Cosine, "l1" => murmur::DistanceMetric::L1,
                     _ => return Err(user_error("22023", "vector distance must be l2, cosine, or l1".into())),
                 }
-            } else { crate::DistanceMetric::L2 };
-            Some(crate::VectorColumnConfig { dimensions, distance })
+            } else { murmur::DistanceMetric::L2 };
+            Some(murmur::VectorColumnConfig { dimensions, distance })
         } else {
             if !words.is_empty() { return Err(user_error("42601", usage.into())); }
             None
@@ -224,22 +215,22 @@ fn show_column_fts(state: &ServerState, words: std::collections::VecDeque<String
     if words.len() != 1 || !words[0].eq_ignore_ascii_case("FTS") {
         return Err(user_error("42601", "usage: MURMUR SHOW COLUMNS FTS".into()));
     }
-    use crate::model::Value;
+    use murmur::Value;
     use crate::server::query::ColInfo;
     let db = state.require_db()?;
     // Read schema and status on the writer so configuration cannot change
     // between the two observations.
-    let rows = db.call(|c| {
-        let statuses = c.search.status();
+    let (schema, statuses) = db.schema_with_search_status().map_err(crate::server::query::engine_error)?;
+    let rows = (|| -> Result<Vec<Vec<murmur::Value>>, murmur::Error> {
         let mut rows = Vec::new();
-        for table in &c.schema.tables {
-            let name = crate::search::schema_index_name(table);
+        for table in &schema.tables {
+            let name = murmur::host::schema_index_name(table);
             let status = statuses.iter().find(|s| s.name == name);
             for column in &table.columns {
-                if column.name == crate::primary_key::COLUMN { continue; }
+                if column.name == murmur::host::MANAGED_KEY_COLUMN { continue; }
                 let mut row = vec![Value::Text(table.name.clone()), Value::Text(column.name.clone()), Value::Text(column.fts.to_string())];
                 if column.fts {
-                    let status = status.ok_or(crate::Error::SchemaMismatch)?;
+                    let status = status.ok_or(murmur::Error::SchemaMismatch)?;
                     row.extend([
                         Value::Text(name.clone()), Value::Text(status.ready.to_string()), Value::Text(status.rebuilding.to_string()),
                         Value::Integer(status.pending_keys as i64), Value::Integer(status.queued_bytes as i64),
@@ -253,7 +244,7 @@ fn show_column_fts(state: &ServerState, words: std::collections::VecDeque<String
             (Value::Text(at), Value::Text(ac), Value::Text(bt), Value::Text(bc)) => (at, ac).cmp(&(bt,bc)), _ => std::cmp::Ordering::Equal,
         });
         Ok(rows)
-    }).map_err(crate::server::query::engine_error)?;
+    })().map_err(crate::server::query::engine_error)?;
     let columns = ["table", "column", "enabled", "index_name", "ready", "rebuilding", "pending_keys", "queued_bytes", "error"].into_iter().map(|name| ColInfo {
         name: name.into(), decltype: Some(if matches!(name, "pending_keys" | "queued_bytes") { "INTEGER" } else { "TEXT" }.into()),
     }).collect();
@@ -264,18 +255,18 @@ fn show_column_vectors(state: &ServerState, words: std::collections::VecDeque<St
     if words.len() != 1 || !words[0].eq_ignore_ascii_case("VECTOR") {
         return Err(user_error("42601", "usage: MURMUR SHOW COLUMNS VECTOR".into()));
     }
-    use crate::Value;
-    let rows = state.require_db()?.call(|c| {
-        let statuses = c.search.status();
+    use murmur::Value;
+    let (schema, statuses) = state.require_db()?.schema_with_search_status().map_err(crate::server::query::engine_error)?;
+    let rows = (|| -> Result<Vec<Vec<murmur::Value>>, murmur::Error> {
         let mut rows = Vec::new();
-        for table in &c.schema.tables {
+        for table in &schema.tables {
             for column in &table.columns {
-                if column.name == crate::primary_key::COLUMN { continue; }
+                if column.name == murmur::host::MANAGED_KEY_COLUMN { continue; }
                 let mut row = vec![Value::Text(table.name.clone()), Value::Text(column.name.clone()), Value::Text(column.vector.is_some().to_string())];
                 if let Some(config) = &column.vector {
-                    let name = crate::search::vector_index_name(table, column);
-                    let status = statuses.iter().find(|s| s.name == name).ok_or(crate::Error::SchemaMismatch)?;
-                    let distance = match config.distance { crate::DistanceMetric::L2 => "l2", crate::DistanceMetric::Cosine => "cosine", crate::DistanceMetric::L1 => "l1" };
+                    let name = murmur::host::vector_index_name(table, column);
+                    let status = statuses.iter().find(|s| s.name == name).ok_or(murmur::Error::SchemaMismatch)?;
+                    let distance = match config.distance { murmur::DistanceMetric::L2 => "l2", murmur::DistanceMetric::Cosine => "cosine", murmur::DistanceMetric::L1 => "l1" };
                     row.extend([Value::Integer(config.dimensions as i64), Value::Text(distance.into()), Value::Text(name),
                         Value::Text(status.ready.to_string()), Value::Text(status.rebuilding.to_string()),
                         Value::Integer(status.pending_keys as i64), Value::Integer(status.queued_bytes as i64),
@@ -288,7 +279,7 @@ fn show_column_vectors(state: &ServerState, words: std::collections::VecDeque<St
             (Value::Text(at), Value::Text(ac), Value::Text(bt), Value::Text(bc)) => (at,ac).cmp(&(bt,bc)), _ => std::cmp::Ordering::Equal,
         });
         Ok(rows)
-    }).map_err(crate::server::query::engine_error)?;
+    })().map_err(crate::server::query::engine_error)?;
     let columns = ["table", "column", "enabled", "dimensions", "distance", "index_name", "ready", "rebuilding", "pending_keys", "queued_bytes", "error"].into_iter().map(|name| crate::server::query::ColInfo {
         name: name.into(), decltype: Some(if matches!(name,"dimensions"|"pending_keys"|"queued_bytes") {"INTEGER"} else {"TEXT"}.into()),
     }).collect();
@@ -350,8 +341,8 @@ fn show_tables(
         .into_iter()
         .map(|(name, replicated)| {
             vec![
-                crate::model::Value::Text(name),
-                crate::model::Value::Text(replicated.to_string()),
+                murmur::Value::Text(name),
+                murmur::Value::Text(replicated.to_string()),
             ]
         })
         .collect();
@@ -437,11 +428,11 @@ fn show_metrics(
     })
 }
 
-fn metric_row(subsystem: &str, metric: &str, value: String) -> Vec<crate::model::Value> {
+fn metric_row(subsystem: &str, metric: &str, value: String) -> Vec<murmur::Value> {
     vec![
-        crate::model::Value::Text(subsystem.into()),
-        crate::model::Value::Text(metric.into()),
-        crate::model::Value::Text(value),
+        murmur::Value::Text(subsystem.into()),
+        murmur::Value::Text(metric.into()),
+        murmur::Value::Text(value),
     ]
 }
 
@@ -483,8 +474,8 @@ fn backup_save(
             ColInfo { name: "size".into(), decltype: Some("INTEGER".into()) },
         ],
         rows: vec![vec![
-            crate::model::Value::Text(name),
-            crate::model::Value::Integer(as_int(size)?),
+            murmur::Value::Text(name),
+            murmur::Value::Integer(as_int(size)?),
         ]],
     })
 }
@@ -504,9 +495,9 @@ fn backup_list(
     let mut rows = Vec::new();
     for entry in backup::list_entries(dir).map_err(|e| e.user_error())? {
         rows.push(vec![
-            crate::model::Value::Text(entry.name),
-            crate::model::Value::Integer(as_int(entry.size)?),
-            crate::model::Value::Text(entry.modified),
+            murmur::Value::Text(entry.name),
+            murmur::Value::Integer(as_int(entry.size)?),
+            murmur::Value::Text(entry.modified),
         ]);
     }
     use crate::server::query::ColInfo;
@@ -562,8 +553,8 @@ fn backup_upload(
                 ColInfo { name: "size".into(), decltype: Some("INTEGER".into()) },
             ],
             rows: vec![vec![
-                crate::model::Value::Text(name),
-                crate::model::Value::Integer(as_int(size)?),
+                murmur::Value::Text(name),
+                murmur::Value::Integer(as_int(size)?),
             ]],
         });
     }
@@ -618,9 +609,9 @@ fn backup_download(
             ColInfo { name: "chunk".into(), decltype: Some("BLOB".into()) },
         ],
         rows: vec![vec![
-            crate::model::Value::Integer(as_int(offset)?),
-            crate::model::Value::Integer(as_int(chunk.total)?),
-            crate::model::Value::Blob(chunk.data),
+            murmur::Value::Integer(as_int(offset)?),
+            murmur::Value::Integer(as_int(chunk.total)?),
+            murmur::Value::Blob(chunk.data),
         ]],
     })
 }
@@ -671,7 +662,7 @@ fn restore(
     let key = secret_to_key(&secret);
     if let Err(e) = state.verify_key(&key) {
         return Err(match e {
-            crate::Error::WrongKey => user_error("28000", "incorrect key".to_string()),
+            murmur::Error::WrongKey => user_error("28000", "incorrect key".to_string()),
             other => crate::server::query::engine_error(other),
         });
     }
@@ -725,8 +716,8 @@ fn rotate(
     let new_key = secret_to_key(&new);
     if let Err(e) = state.rotate_key(&previous_key, &new_key) {
         return Err(match e {
-            crate::Error::WrongKey => user_error("28000", "incorrect key".to_string()),
-            crate::Error::Invalid(message) => user_error("22023", message),
+            murmur::Error::WrongKey => user_error("28000", "incorrect key".to_string()),
+            murmur::Error::Invalid(message) => user_error("22023", message),
             other => crate::server::query::engine_error(other),
         });
     }
@@ -809,26 +800,26 @@ fn parse_node_id(word: &str) -> PgWireResult<[u8; 16]> {
 }
 
 #[cfg(feature = "replication")]
-fn replication_handle(state: &ServerState) -> PgWireResult<murmur_replication::Handle> {
+fn replication_handle(state: &ServerState) -> PgWireResult<murmur::replication::Handle> {
     let db = state.require_db()?;
     db.replication()
         .ok_or_else(|| user_error("55000", "replication is not enabled".to_string()))
 }
 
 #[cfg(feature = "replication")]
-fn replication_error(error: murmur_replication::Error) -> pgwire::error::PgWireError {
+fn replication_error(error: murmur::replication::Error) -> pgwire::error::PgWireError {
     match error {
-        murmur_replication::Error::Invalid(message) => user_error("22023", message),
-        murmur_replication::Error::Overloaded => {
+        murmur::replication::Error::Invalid(message) => user_error("22023", message),
+        murmur::replication::Error::Overloaded => {
             user_error("54000", "replication overloaded".to_string())
         }
-        murmur_replication::Error::Auth(message) => user_error("28000", message),
-        murmur_replication::Error::Unavailable(message) => user_error("08006", message),
-        murmur_replication::Error::Protocol(message) => user_error("XX001", message),
-        murmur_replication::Error::Storage(message) => {
+        murmur::replication::Error::Auth(message) => user_error("28000", message),
+        murmur::replication::Error::Unavailable(message) => user_error("08006", message),
+        murmur::replication::Error::Protocol(message) => user_error("XX001", message),
+        murmur::replication::Error::Storage(message) => {
             user_error("58000", format!("storage error: {message}"))
         }
-        murmur_replication::Error::Io(error) => {
+        murmur::replication::Error::Io(error) => {
             user_error("58000", format!("storage error: {error}"))
         }
     }
@@ -899,16 +890,16 @@ fn show_peers(
     if !words.is_empty() {
         return Err(user_error("42601", "usage: MURMUR SHOW PEERS".to_string()));
     }
-    use crate::model::Value;
+    use murmur::Value;
     use crate::server::query::ColInfo;
     let status = replication_handle(state)?.status();
     let mut peers = status.peers_diagnostics;
-    peers.sort_by_cached_key(|p| murmur_replication::hex(&p.node_id));
+    peers.sort_by_cached_key(|p| murmur::replication::hex(&p.node_id));
     let rows = peers
         .into_iter()
         .map(|peer| {
             vec![
-                Value::Text(murmur_replication::hex(&peer.node_id)),
+                Value::Text(murmur::replication::hex(&peer.node_id)),
                 peer.address.map(|a| Value::Text(a.to_string())).unwrap_or(Value::Null),
                 Value::Text(peer.connected.to_string()),
                 peer.last_seen_millis_ago.map(sat_int).map(Value::Integer).unwrap_or(Value::Null),
@@ -952,7 +943,7 @@ fn show_replication(
     if !words.is_empty() {
         return Err(user_error("42601", "usage: MURMUR SHOW REPLICATION".to_string()));
     }
-    use crate::model::Value;
+    use murmur::Value;
     use crate::server::query::ColInfo;
     let status = replication_handle(state)?.status();
     let committed = state.require_db()?.status().committed;
@@ -1006,14 +997,14 @@ fn show_retention(
     if !words.is_empty() {
         return Err(user_error("42601", "usage: MURMUR SHOW RETENTION".to_string()));
     }
-    use crate::model::Value;
+    use murmur::Value;
     use crate::server::query::ColInfo;
     let status = replication_handle(state)?.retention_status().map_err(replication_error)?;
     let mut peers = status.peers;
-    peers.sort_by_cached_key(|p| murmur_replication::hex(&p.node));
+    peers.sort_by_cached_key(|p| murmur::replication::hex(&p.node));
     let mut rows = Vec::new();
     for peer in &peers {
-        let node = Value::Text(murmur_replication::hex(&peer.node));
+        let node = Value::Text(murmur::replication::hex(&peer.node));
         let seen = Value::Integer(sat_int(peer.last_seen_millis));
         let retired = Value::Text(peer.retired.to_string());
         let collected = Value::Integer(sat_int(status.collected_transactions));
@@ -1023,13 +1014,13 @@ fn show_retention(
             continue;
         }
         let mut acks: Vec<_> = peer.acknowledged.iter().collect();
-        acks.sort_by_cached_key(|(origin, _)| murmur_replication::hex(*origin));
+        acks.sort_by_cached_key(|(origin, _)| murmur::replication::hex(*origin));
         for (origin, sequence) in acks {
             rows.push(vec![
                 node.clone(),
                 seen.clone(),
                 retired.clone(),
-                Value::Text(murmur_replication::hex(origin)),
+                Value::Text(murmur::replication::hex(origin)),
                 Value::Integer(sat_int(*sequence)),
                 collected.clone(),
                 last.clone(),
@@ -1077,7 +1068,7 @@ fn retention(
 
 #[cfg(feature = "replication")]
 fn retention_collect(state: &ServerState) -> PgWireResult<CommandOutput> {
-    use crate::model::Value;
+    use murmur::Value;
     use crate::server::query::ColInfo;
     let collected = replication_handle(state)?.collect_retention().map_err(replication_error)?;
     Ok(CommandOutput::Rows {
@@ -1098,8 +1089,8 @@ enum PolicyOp {
     CounterAdd(i64),
     SetAdd(String),
     SetRemove(String),
-    Min(crate::model::Value),
-    Max(crate::model::Value),
+    Min(murmur::Value),
+    Max(murmur::Value),
 }
 
 /// `MURMUR POLICY ...`: one CRDT operation on a single-TEXT-key row. The
@@ -1143,8 +1134,8 @@ fn policy(
 /// INTEGER when the word parses as `i64`, else REAL when it parses as a
 /// finite `f64`, else TEXT. NaN and infinities are rejected: extrema
 /// comparisons cannot order them.
-fn policy_literal(word: &str) -> PgWireResult<crate::model::Value> {
-    use crate::model::Value;
+fn policy_literal(word: &str) -> PgWireResult<murmur::Value> {
+    use murmur::Value;
     if let Ok(n) = word.parse::<i64>() {
         return Ok(Value::Integer(n));
     }
@@ -1165,7 +1156,7 @@ fn policy_apply(
     key: &str,
     op: PolicyOp,
 ) -> PgWireResult<CommandOutput> {
-    use crate::model::Value;
+    use murmur::Value;
     let db = state.require_db()?;
     if db.replication().is_none() {
         return Err(user_error("55000", "replication is not enabled".to_string()));
@@ -1245,7 +1236,7 @@ fn bridge_release(
     key: &str,
     column: Option<&str>,
 ) -> PgWireResult<CommandOutput> {
-    use crate::model::Value;
+    use murmur::Value;
     use crate::server::query::ColInfo;
     let db = state.require_db()?;
     let handle = db
@@ -1265,14 +1256,14 @@ fn bridge_release(
             return Err(user_error("22023", format!("unknown column: {table}.{name}")));
         }
     }
-    let keys = crate::primary_key::application_columns(resolved);
+    let keys = murmur::host::application_columns(resolved);
     if keys.len() != 1 || !keys[0].declared_type.eq_ignore_ascii_case("TEXT") {
         return Err(user_error(
             "22023",
             format!("bridge release needs a single-TEXT-key table, not {table:?}"),
         ));
     }
-    let encoded = crate::model::encode(&vec![Value::Text(key.to_owned())]).map_err(crate::server::query::engine_error)?;
+    let encoded = murmur::host::encode(&vec![Value::Text(key.to_owned())]).map_err(crate::server::query::engine_error)?;
     let released = bridge
         .release(table.to_owned(), encoded, column.map(str::to_owned))
         .map_err(replication_error)?;

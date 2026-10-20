@@ -1,6 +1,6 @@
 # Murmur Go examples
 
-Runnable feature examples. Each starts its own scratch `murmur-server`
+Runnable SQL examples using standard `database/sql` calls. Each starts its own scratch `murmur-server`
 (cargo builds it on first use), provisions what it needs, and verifies its
 result. Run from `clients/go`:
 
@@ -51,27 +51,27 @@ replication without peers, and configures a scratch encrypted object directory.
 It checks metadata and an arbitrary binary round-trip. Cargo builds the server
 with `--features replication`; a prebuilt `MURMUR_SERVER_BIN` must include that
 feature. Uploads replace atomically; file operations are independent of SQL
-transactions. Cursors pin a pooled connection and must be closed. Default staging
+transactions. The example pins a `*sql.Conn` for handles and explicitly closes or aborts them. Default staging
 is 1 GiB including encryption overhead; database backups exclude object payloads.
 
 The search example needs no peers or external extensions. It indexes `TEXT`
 columns on a table with one `INTEGER` application primary key, discovers the
 index name, checks parameterized FTS5 queries and verifies column disabling.
-Updates are eventual unless `RefreshIndexes` is called; schema declarations
+Updates are eventual unless `MURMUR REFRESH INDEXES` is executed; schema declarations
 persist and replicate, while index contents rebuild locally.
 
 The vectors example uses default server builds, without peers or external
 services. It supplies two-dimensional float32 BLOB embeddings, enables an L2
 index, verifies JSON-parameter KNN results and distances, and disables indexing.
 Production embeddings must have the declared dimensions and finite float32
-values. Updates are eventual unless refreshed; invalid data is reported through
+values. Updates are eventual unless `MURMUR REFRESH INDEXES` is executed; invalid data is reported through
 column status and must be repaired before the index is available again.
 
 The replication example provisions two scratch servers sharing one database
-id and CA, dials them together with `PeerAdd`, and checks `ShowPeers`,
-`ShowReplication`, `ShowRetention`, and `RetentionCollect`. It also runs
+id and CA, dials them together with `MURMUR PEER ADD`, and checks SHOW PEERS,
+SHOW REPLICATION, SHOW RETENTION, and RETENTION COLLECT results. It also runs
 counter, set add/remove, min and max policy operations against `merge_policies` and verifies
-`PeerRemove`/`PeerRetire`, including the retired retention row and the
+`MURMUR PEER REMOVE` / `MURMUR PEER RETIRE`, including the retired retention row and the
 self-retire `22023` rejection. A prebuilt `MURMUR_SERVER_BIN` must include
 the `replication` feature.
 
@@ -85,7 +85,7 @@ constraints and generated columns.
 
 The bridge example provisions one high-receiver scratch server (no bundles
 are exchanged), inserts a row so the High write claims field ownership, and
-checks `BridgeRelease`: the first release reports true, a second release of
+executes `MURMUR BRIDGE RELEASE`: the first release reports true, a second release of
 the same field fails with `22023`, and so do the row form without `COLUMN`
 (no row ownership exists) and an unknown table. A prebuilt
 `MURMUR_SERVER_BIN` must include the `replication` feature.

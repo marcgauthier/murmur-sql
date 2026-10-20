@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 // T implements servertest.TB for examples.

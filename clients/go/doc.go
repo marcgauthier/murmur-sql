@@ -1,13 +1,6 @@
-// Package murmur connects to a Murmur server over the PostgreSQL wire
-// protocol using database/sql. SQL is the SQLite dialect; parameters use $N.
-//
-// Every physical connection unlocks itself with the configured encryption
-// key before use (see MURMUR UNLOCK in the server manual). DDL runs through
-// server-side migrations, DML autocommits per statement, and MURMUR FLUSH
-// provides a durability barrier. Use SetTableReplicated and TableReplication
-// for per-table replication flags stored in the server's config.toml.
-// SetColumnFTS changes persistent column schema declarations; ColumnFTS reports
-// local index status and RefreshIndexes waits for local search maintenance.
-// SetColumnVector and ColumnVectors provide equivalent vector declarations
-// and status; embeddings are application-supplied little-endian float32 BLOBs.
+// Package murmur opens standard database/sql pools to Murmur-SQL using pgx.
+// SQL uses the SQLite dialect and $N parameters. Open authenticates and unlocks
+// every physical connection before use. Execute application and administrative
+// SQL directly with ExecContext, QueryContext, and QueryRowContext; the package
+// provides no command wrappers or result types.
 package murmur

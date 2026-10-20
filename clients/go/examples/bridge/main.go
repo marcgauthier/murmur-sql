@@ -4,14 +4,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	"github.com/jackc/pgx/v5/pgconn"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -48,25 +50,26 @@ func main() {
 		if _, err := db.ExecContext(ctx, "INSERT INTO notes VALUES ($1, $2)", "r1", "v1"); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
-		if err := db.Flush(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
 		// The High write above claimed ownership of title; releasing it
 		// reports true, and a second release finds nothing owned.
-		released, err := db.BridgeRelease(ctx, "notes", "r1", "title")
+		var released bool
+		err = db.QueryRowContext(ctx, "MURMUR BRIDGE RELEASE notes 'r1' COLUMN title").Scan(&released)
 		if err != nil || !released {
-			t.Fatalf("release: released=%v, err=%v", released, err)
+			t.Fatalf("release=%v: %v", released, err)
 		}
-		if _, err := db.BridgeRelease(ctx, "notes", "r1", "title"); murmur.CodeOf(err) != "22023" {
-			t.Fatalf("re-release: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
-		}
-		// Row release without COLUMN addresses whole-row ownership, which a
-		// plain insert never creates; unknown tables are rejected too.
-		if _, err := db.BridgeRelease(ctx, "notes", "r1"); murmur.CodeOf(err) != "22023" {
-			t.Fatalf("row release: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
-		}
-		if _, err := db.BridgeRelease(ctx, "missing", "r1", "title"); murmur.CodeOf(err) != "22023" {
-			t.Fatalf("unknown table: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+		for _, query := range []string{
+			"MURMUR BRIDGE RELEASE notes 'r1' COLUMN title",
+			"MURMUR BRIDGE RELEASE notes 'r1'",
+			"MURMUR BRIDGE RELEASE missing 'r1' COLUMN title",
+		} {
+			_, err := db.ExecContext(ctx, query)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
+				t.Fatalf("%s: %v", query, err)
+			}
 		}
 		fmt.Println("bridge: verified field release, re-release, row form, and unknown table")
 	})

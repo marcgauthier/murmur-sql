@@ -1,281 +1,218 @@
 # Murmur Go client
 
-A `database/sql` client for Murmur servers, speaking the PostgreSQL wire
-protocol through the pgx driver. SQL is the SQLite dialect; parameters use
-`$N`. No cgo, no native builds — pure Go plus the `pgx` module.
+A pure-Go PostgreSQL-wire connection package using pgx. `murmur.Open` returns
+an ordinary `*sql.DB` and unlocks every physical pooled connection before use.
+Use standard `database/sql` methods for application SQL and `MURMUR ...`
+commands. There are no command helpers, custom database wrapper, or public
+result structs. SQL is the SQLite dialect; value parameters use `$N`.
+
+## Quickstart
+
+Configure and start the server, then create the `greetings` table using the
+[root SQL quickstart](../../README.md#quickstart). Run this program with the
+same login and encryption key:
 
 ```go
+package main
+
 import (
     "context"
+    "fmt"
+    "log"
 
-    murmur "github.com/marcgauthier/murmur/clients/go"
+    murmur "github.com/marcgauthier/murmur-sql/clients/go"
 )
 
-db, err := murmur.Open(ctx, murmur.Config{
-    Host:     "127.0.0.1",
-    Port:     5432,
-    User:     "app",
-    Password: "secret",
-    Key:      "encryption-key-or-passphrase",
-})
-if err != nil {
-    log.Fatal(err)
-}
-defer db.Close()
+func main() {
+    ctx := context.Background()
+    db, err := murmur.Open(ctx, murmur.Config{
+        Host:     "127.0.0.1",
+        Port:     5432,
+        User:     "admin",
+        Password: "s3cret",
+        Key:      "database-encryption-key",
+    })
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
 
-var greeting string
-err = db.QueryRowContext(ctx,
-    "SELECT text FROM greetings WHERE lang = $1", "en").Scan(&greeting)
+    var greeting string
+    err = db.QueryRowContext(ctx,
+        "SELECT text FROM greetings WHERE lang = $1", "en").Scan(&greeting)
+    if err != nil {
+        log.Fatal(err)
+    }
+    fmt.Println(greeting)
+}
 ```
 
-## Connection
+## Connection and pooling
 
-`Config` takes the server address, an `auth.users` login from the server's
-`config.toml`, and the database encryption key (64 hex chars or a
-passphrase, hashed like `murmur-admin`). Every pooled connection unlocks
-itself with the key before first use; a wrong key fails `Open` with code
-`28000`. The `Database` name is accepted and ignored by the server.
+`Config` takes the server address, an `auth.users` login from `config.toml`,
+and the database key (64 hex characters or a passphrase). Each physical
+connection executes `MURMUR UNLOCK` before first use; a wrong key fails `Open`
+with SQLSTATE `28000`. Host defaults to `127.0.0.1`, port to `5432`, database
+name to `murmur`, and connect timeout to 10 seconds. The server accepts but
+ignores the database name. User, password, and key are required.
 
-TLS mirrors Postgres `sslmode`:
+Tune the returned pool with standard `SetMaxOpenConns` and `SetMaxIdleConns`,
+or the corresponding `Config` fields. A single manual unlock on `*sql.DB`
+would not unlock every connection; the connection hook in `Open` handles that.
+
+TLS mirrors PostgreSQL `sslmode`:
 
 ```go
 murmur.Config{
-    // ...
+    // Host, User, Password, Key, ...
     TLS: murmur.TLSConfig{
-        Mode:     murmur.TLSVerifyFull,
-        CAFile:   "/etc/murmur/ca.crt",
-        CertFile: "/etc/murmur/client.crt", // mutual TLS
-        KeyFile:  "/etc/murmur/client.key",
+        Mode: murmur.TLSVerifyFull,
+        CAFile: "/etc/murmur/ca.crt",
+        CertFile: "/etc/murmur/client.crt",
+        KeyFile: "/etc/murmur/client.key",
     },
 }
 ```
 
-`TLSDisable` sends passwords in cleartext. Production servers require TLS
-with a client certificate and reject anything else.
+The default `TLSDisable` sends passwords in cleartext. Production servers
+require TLS with a client certificate. Use verified TLS outside local development.
 
-## SQL
+## SQL and administration
 
-Use the embedded `*sql.DB` for everything: `ExecContext`, `QueryContext`,
-`QueryRowContext`, prepared statements. DDL runs through server-side
-migrations; DML autocommits per statement. Explicit `BEGIN`/`COMMIT` is
-accepted and each statement stays individually atomic.
-
-`$N` parameters are inferred from context (`INSERT` columns, `WHERE`
-comparisons, `IN`, `BETWEEN`) so drivers encode values correctly.
-
-`murmur.CodeOf(err)` extracts the SQLSTATE code (`28000`, `42P01`,
-`23505`, `42601`, ...); `murmur.IsLocked(err)` spots statements sent
-before unlock on a raw connection.
-
-## Administration
+Use `ExecContext`, `QueryContext`, `QueryRowContext`, and `PrepareContext`
+directly. Statements autocommit individually. `BEGIN`, `COMMIT`, and `ROLLBACK`
+are server no-ops; `database/sql` transactions do not provide multi-statement
+atomicity or rollback. Successful writes acknowledge RAM commits. Execute
+`MURMUR FLUSH` when local disk durability is required.
 
 ```go
-if err := db.Flush(ctx); err != nil { /* ... */ } // durability barrier
-if err := db.SetTableReplicated(ctx, "scratch", false); err != nil { /* ... */ }
-flags, err := db.TableReplication(ctx) // []TableFlag
-metrics, err := db.Metrics(ctx)        // []Metric{Subsystem, Metric, Value}
-sqliteMetrics, err := db.Metrics(ctx, "sqlite")
-```
-
-Remote backup moves single-file archives through the server's backup folder:
-
-```go
-saved, err := db.BackupSave(ctx) // BackupFile{Name, Size}
-files, err := db.BackupList(ctx) // []BackupFile
-err = db.BackupDownload(ctx, saved.Name, &buf)
-err = db.BackupUpload(ctx, "copy.murmur-backup", &buf)
-err = db.Restore(ctx, saved.Name, key) // live restore, key re-authenticates
-```
-
-Key rotation rewraps the registry under a new master key; open a fresh
-handle with the new key afterwards (run `go run ./examples/keys` for a
-checked rotation, old-key rejection, and data-preservation example):
-
-```go
-if err := db.RotateKey(ctx, oldKey, newKey); err != nil { /* ... */ }
-db.Close()
-db, err = murmur.Open(ctx, murmur.Config{ /* ... Key: newKey */ })
-```
-
-Tables are local-only by default and must declare an application primary key.
-Enabling replication rebuilds even a populated table: the application key becomes
-a unique index, and `id_murmur_primary_key TEXT NOT NULL PRIMARY KEY` contains an
-automatically generated UUIDv5 derived from the table name and application key.
-Read it with `SELECT` or `RETURNING`; applications cannot assign or update it.
-Supply every application-key component on replicated inserts; application keys
-remain immutable while replicated. Text keys, including UUID strings, and
-composite keys are supported. Disabling replication removes the managed column
-and restores the application primary key. Other server SQL restrictions still apply.
-Mode changes pause table access while rebuilding; existing queries should name
-columns explicitly because `SELECT *` changes shape.
-
-```go
-_, err = db.ExecContext(ctx,
-    "CREATE TABLE orders(id TEXT NOT NULL PRIMARY KEY, value TEXT)")
-err = db.SetTableReplicated(ctx, "orders", true)
-var replicationID string
-err = db.QueryRowContext(ctx,
-    "INSERT INTO orders(id, value) VALUES($1, $2) RETURNING id_murmur_primary_key",
-    "order-123", "ready").Scan(&replicationID)
-```
-
-Flags persist into the server's `config.toml`. Run `go run ./examples/tables`
-for a complete example with result checks, including populated conversions.
-
-## JSON
-
-Use SQLite JSON functions in ordinary SQL, with no column setting or extension.
-Store JSON as `TEXT`, bind JSON strings, and validate them in your application
-with `json.Valid` from `encoding/json` before writing. `json_extract`, `->>`, `json_set`,
-`json_each` and SQLite JSONB (`BLOB`) are available. `CHECK` constraints,
-generated columns and JSON expression indexes are currently rejected by managed
-migrations. Replication resolves conflicts on the whole JSON column value.
-
-Run `go run ./examples/json` for checked queries, updates, arrays, bound JSON,
-validation and JSONB conversion. See [JSON usage](../../docs/USAGE.md#json).
-
-## Full-text search
-
-```go
-err := db.SetColumnFTS(ctx, "documents", "body", true)
-err = db.RefreshIndexes(ctx)
-columns, err := db.ColumnFTS(ctx) // discover the quoted index identifier for MATCH
-_ = columns
-```
-
-Source columns must be declared `TEXT` and the table must have one `INTEGER`
-application primary key, including when replication uses a managed UUID physical
-key. All enabled columns in a table share a `unicode61` FTS5 index. Use ordinary
-SQL `MATCH $1` with a bound string; quote the discovered index name as an
-identifier, rather than a value parameter. `ColumnFTS` returns nullable pointers
-for disabled index/status fields.
-
-Declarations persist as schema metadata and follow existing schema replication
-rules. Index data is rebuilt locally, with eventual updates after source writes.
-`RefreshIndexes` waits for local collected writes, not peers or durable storage;
-use `Flush` for persistence. Default builds include FTS5. See the
-[complete restrictions](../../docs/USAGE.md#full-text-search) and run
-`go run ./examples/search` for a scratch-server example with result checks.
-
-## Vector search
-
-Vector search is included in ordinary server builds. Declare an index on a
-`BLOB` column of a table with one `INTEGER` application primary key:
-
-```go
-err := db.SetColumnVector(ctx, "documents", "embedding", &murmur.VectorOptions{
-    Dimensions: 384, Distance: murmur.VectorCosine,
-})
-err = db.RefreshIndexes(ctx)
-columns, err := db.ColumnVectors(ctx) // discover the index identifier and status
-_ = columns
-err = db.SetColumnVector(ctx, "documents", "embedding", nil) // disable
-```
-
-An empty distance selects L2; L1 and cosine are also supported. Store embeddings
-as little-endian finite float32 bytes using `encoding/binary` and `math.Float32bits`.
-Applications supply embeddings; the server does not generate them. Dimensions
-must be 1–8192, and source column names must be ASCII SQL identifiers starting
-with a letter. Nullable embeddings are excluded from search.
-
-Query the returned, quoted index name with `embedding MATCH $1 AND k=$2`;
-bind a JSON vector string and an integer neighbor count. KNN queries accept only
-`ORDER BY distance`; equal-distance ordering is unspecified. Explicitly typed
-BYTEA query parameters are also accepted by the server. Declarations persist and
-replicate like FTS, while indexes rebuild locally. Invalid populated settings
-roll back; malformed vectors written later leave source data intact but make the
-index unavailable until repaired and refreshed. Use `Flush` for durable storage.
-
-Run `go run ./examples/vectors` for checked neighbors, distances, and disabling.
-See [all restrictions](../../docs/USAGE.md#vector-search).
-
-## Encrypted files
-
-File contents live in encrypted disk objects; durable metadata lives in Spool.
-The server requires the `replication` Cargo feature, enabled replication with
-node credentials, and `[replication.files]`. No peers are required for local use.
-
-```go
-info, err := db.UploadFile(ctx, "reports/a.bin", reader)
-err = db.DownloadFile(ctx, info.Name, writer)
-cursor, err := db.SearchFiles(ctx, "reports/%.bin") // or db.ListFiles(ctx)
-if err != nil { /* handle error */ }
-defer cursor.Close()
-for cursor.Next(ctx) {
-    file := cursor.File() // Name, Size, ModifiedMillis, SHA256, Local
-    _ = file
+_, err := db.ExecContext(ctx, "MURMUR FLUSH")
+if err != nil {
+    return err
 }
-err = cursor.Err()
+_, err = db.ExecContext(ctx, "MURMUR SET TABLE scratch REPLICATED false")
+if err != nil {
+    return err
+}
+rows, err := db.QueryContext(ctx, "MURMUR SHOW TABLES REPLICATION")
+if err != nil {
+    return err
+}
+defer rows.Close()
+for rows.Next() {
+    var table string
+    var replicated bool
+    if err := rows.Scan(&table, &replicated); err != nil {
+        return err
+    }
+    fmt.Printf("%s replicated=%v\n", table, replicated)
+}
+return rows.Err()
 ```
 
-Uploads replace existing names atomically at completion. Downloads pin the
-selected version and authenticate it before streaming. Search uses case-sensitive
-LIKE (`%`, `_`, backslash escaping). Metadata cursors are snapshots and pin a
-pooled connection until exhausted or closed; serialize calls on each cursor.
-Transfers use 64 KiB BYTEA chunks. SQL ROLLBACK does not undo file operations.
-Remote-only content returns `CodeOf(err) == "55000"`; retry after peer fetching.
-Handles expire after five idle minutes and do not survive reconnect or restore.
-The default staging limit is 1 GiB including encrypted overhead, shared with
-peer fetches; increase it to upload larger files. Back up the object directory
-and file keys separately from the database. See [USAGE](../../docs/USAGE.md#files-over-postgresql-sql)
-for SQL commands, limits, and error codes, or run `go run ./examples/files` for
-a complete scratch-node example with result checks.
+Commands returning rows use `QueryContext` or `QueryRowContext`; scan results
+into application-owned variables. Use `sql.NullString`, `sql.NullInt64`, or
+pointers for nullable columns. `Rows.Scan` can convert the `true`/`false` text
+returned by administrative commands into Go booleans.
 
-## Replication
+Ordinary SQL supports bound values; most `MURMUR` commands require literal
+arguments. File commands explicitly support parameters. For literal command
+arguments, double embedded single quotes; for SQL identifiers, double embedded
+double quotes. Placeholders cannot substitute identifiers or command keywords.
 
-Peer management, retention inspection, and CRDT policy operations need a
-server built with the `replication` Cargo feature and enabled `[replication]`
-credentials; without them the server fails with code `55000`.
+## Command examples
+
+Execute these statements using `database/sql`; server setup and restrictions
+are in the [SQL reference](../../docs/USAGE.md#murmur-commands).
+
+```sql
+MURMUR SHOW METRICS;
+MURMUR SHOW METRICS SQLITE;
+MURMUR BACKUP SAVE;
+MURMUR BACKUP LIST;
+MURMUR RESTORE FROM 'saved.murmur-backup' KEY 'database-key';
+MURMUR ROTATE KEY 'previous-key' 'new-key';
+
+MURMUR SET COLUMN documents body FTS true;
+MURMUR SHOW COLUMNS FTS;
+MURMUR SET COLUMN documents embedding VECTOR true DIMENSIONS 384 DISTANCE cosine;
+MURMUR SHOW COLUMNS VECTOR;
+MURMUR REFRESH INDEXES;
+
+MURMUR PEER ADD '203.0.113.11:9001';
+MURMUR PEER SYNC;
+MURMUR SHOW PEERS;
+MURMUR SHOW REPLICATION;
+MURMUR SHOW RETENTION;
+MURMUR RETENTION COLLECT;
+MURMUR POLICY COUNTER_ADD stats count 'row-1' 5;
+MURMUR POLICY SET_ADD stats tags 'row-1' 'blue';
+MURMUR POLICY SET_REMOVE stats tags 'row-1' 'blue';
+MURMUR POLICY MIN stats lowest 'row-1' -1.5;
+MURMUR POLICY MAX stats highest 'row-1' 42;
+MURMUR BRIDGE RELEASE notes 'row-1' COLUMN title;
+```
+
+Tables are local-only by default. Enabling replication rebuilds a table,
+converts its application key into a unique index, and adds the read-only
+UUIDv5 `id_murmur_primary_key` column. Supply all application-key components
+on inserts, and name columns explicitly when table modes can change.
+
+FTS needs `TEXT` columns and one `INTEGER` application primary key; vectors
+need `BLOB` columns, that same key shape, and 1–8192 dimensions. Embeddings
+are application-supplied finite little-endian float32 bytes. Discover and
+quote the search index name from the SHOW results. Index updates are eventual;
+`MURMUR REFRESH INDEXES` waits for local maintenance, while `MURMUR FLUSH`
+waits for persistence. Managed migrations reject JSON expression indexes,
+`CHECK` constraints, and generated columns. JSON conflicts resolve per column.
+
+Peer/retention/policy commands require a replication-enabled server and node
+credentials. Policy operations require a configured matching merge policy and
+one TEXT application key. Bridge release additionally needs a high-receiver
+bridge. These commands do not provide an all-peer durability barrier.
+After key rotation, close the old pool and open a new one with the new key.
+
+## File and backup transfers
+
+Transfers also use SQL directly; no file API is needed. The checked
+[files example](examples/files/main.go) demonstrates the complete protocol:
+
+1. Pin a physical connection with `db.Conn(ctx)` and defer `conn.Close()`.
+2. Begin an upload, append BYTEA chunks, then finish and scan metadata.
+   Abort unfinished uploads using a cleanup context if the operation fails.
+3. Open a list/search cursor, fetch pages, and explicitly close the handle.
+4. Open a download, read chunks until EOF, and explicitly close the handle.
+
+Use the same `*sql.Conn` throughout each handle's lifetime. Returning a
+connection to the pool does not close server-side handles. Close or abort
+handles before releasing the connection; after cancellation, use a bounded
+cleanup context independent of the canceled request. Physical disconnection
+also releases handles. SQL rollback does not undo file operations.
+
+Files require the `replication` feature, enabled replication credentials, and
+`[replication.files]`; no peers are required for local use. Handles expire
+after five idle minutes. Uploads replace atomically at finish. Downloads pin
+one authenticated version. Default staging is 1 GiB including encryption
+overhead. Preserve object directories and file keys separately from database
+backups. See [file limits](../../docs/USAGE.md#files-over-postgresql-sql).
+
+The [backup example](examples/backup/main.go) shows literal byte ranges for
+`MURMUR BACKUP DOWNLOAD` and base64 chunks for `MURMUR BACKUP UPLOAD`.
+Application code controls streaming, cancellation, and destination errors.
+
+## Errors
+
+Use pgx errors with standard `errors.As`:
 
 ```go
-status, err := db.ShowReplication(ctx) // ReplicationStatus{Running, Address, ...}
-peers, err := db.ShowPeers(ctx)        // []PeerInfo ordered by node id
-err = db.PeerAdd(ctx, "203.0.113.11:9001")
-err = db.PeerSync(ctx)
-err = db.PeerRemove(ctx, nodeID) // reversible with PeerAdd
-err = db.PeerRetire(ctx, nodeID) // permanent, releases retention
-entries, err := db.ShowRetention(ctx)  // []RetentionEntry
-collected, err := db.RetentionCollect(ctx)
+var pgErr *pgconn.PgError
+if errors.As(err, &pgErr) && pgErr.Code == "28000" {
+    // Authentication, unlock, or TLS rejection; inspect pgErr.Message.
+}
 ```
 
-`PeerAdd` succeeds once the dial is queued; dial failures surface in
-`ShowReplication` (`LastError`). Node ids are 32 hex characters and are
-validated locally, as are peer addresses. `ShowPeers` is empty when
-peerless; nullable columns (`Address`, `LastSeenMillisAgo`, `LastError`,
-`Origin`, `Acknowledged`) are nil pointers when the server reports NULL.
-
-Policy operations apply one CRDT op to a single-TEXT-key row whose column
-carries the matching `replication.merge_policies` entry:
-
-```go
-err = db.PolicyCounterAdd(ctx, "stats", "count", "row-1", 5)
-err = db.PolicySetAdd(ctx, "stats", "tags", "row-1", "blue")
-err = db.PolicySetRemove(ctx, "stats", "tags", "row-1", "blue")
-err = db.PolicyMax(ctx, "stats", "highest", "row-1", 42)
-err = db.PolicyMin(ctx, "stats", "lowest", "row-1", -1.5)
-```
-
-`PolicyMin`/`PolicyMax` take an int, a finite float, or a string; other
-types fail locally. A column without the matching policy fails with `22023`,
-a missing row with `02000`. See
-[USAGE](../../docs/USAGE.md#murmur-policy-counter_add-set_add-set_remove-min-max)
-for merge semantics, and run `go run ./examples/replication` for a checked
-two-node example.
-
-On a `[replication.bridge]` high-receiver, local writes shield the touched
-cells from later Low updates; `BridgeRelease` drops that shield for one
-single-TEXT-key row so Low data flows through again:
-
-```go
-released, err := db.BridgeRelease(ctx, "notes", "row-1", "title") // field
-released, err = db.BridgeRelease(ctx, "notes", "row-1")          // whole row
-```
-
-The optional column is at most one name. `true` means the release applied;
-`false` means the engine was busy, retry. A Low exporter, an unknown table,
-or a field that is not High-owned fails with `22023`; without enabled
-replication or a configured bridge the server fails with `55000`. Run
-`go run ./examples/bridge` for a checked single-node example.
+Import `errors` and `github.com/jackc/pgx/v5/pgconn`. See the
+[SQLSTATE reference](../../docs/USAGE.md#error-codes).
 
 ## Features
 
@@ -302,16 +239,11 @@ replication or a configured bridge the server fails with `55000`. Run
 | CRDT policy operations | replication             |
 | Bridge ownership release | bridge               |
 
-The client covers the server SQL/MURMUR interface. Server configuration, node
-credentials, bridge transport, recovery tooling and scheduling stay on the
-server. Embedded callbacks, subscriptions and custom transport traits are not
-exposed by the PostgreSQL protocol.
-
-Backup downloads return `io.ErrShortWrite` if the destination accepts fewer
-bytes than supplied without reporting an error; other writer errors propagate.
-
-Browse the [runnable examples](examples/README.md). Each creates its scratch
-server automatically and verifies its result.
+The feature catalog maps SQL examples to server capabilities; it is not an
+exhaustive test of every SQL form or command argument. Server configuration,
+recovery tooling, and embedded callbacks/subscriptions remain outside the
+SQL interface. Browse the [runnable examples](examples/README.md); each
+creates a scratch server and checks its results.
 
 ## Development
 

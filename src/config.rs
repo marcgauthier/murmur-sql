@@ -9,7 +9,7 @@
 //! units (`"64KiB"`, `"64KB"`, `"256MiB"`, `"1GiB"`) or bare numbers meaning
 //! bytes. `KB`/`MB`/`GB` are powers of 1000, `KiB`/`MiB`/`GiB` powers of 1024.
 
-use crate::{Error, Result};
+use murmur::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -800,8 +800,8 @@ impl Config {
 impl EngineConfig {
     /// Convert to engine `Options`. Managed search indexes are not
     /// configurable in `config.toml` yet; engine defaults apply.
-    pub fn to_options(&self) -> Result<crate::Options> {
-        let mut options = crate::Options::default();
+    pub fn to_options(&self) -> Result<murmur::Options> {
+        let mut options = murmur::Options::default();
         options.capture_interval = self.capture_interval;
         options.capture_bytes = self.capture_bytes;
         options.queue_bytes = self.queue_bytes;
@@ -1097,15 +1097,15 @@ impl ReplicationConfig {
     /// Build the runtime replication config, loading PEM credentials and the
     /// signing key from disk. Call only when `enabled` is true; structural
     /// validation must have passed first.
-    pub fn to_replication_config(&self) -> Result<murmur_replication::Config> {
-        use murmur_replication::Config;
+    pub fn to_replication_config(&self) -> Result<murmur::replication::Config> {
+        use murmur::replication::Config;
         use std::collections::{BTreeMap, BTreeSet};
         let bind = parse_socket(&self.bind, "replication.bind")?;
         let chain = load_certs(required(&self.cert_chain_file, "replication.cert_chain_file")?)?;
         let private_key =
             load_private_key(required(&self.private_key_file, "replication.private_key_file")?)?;
         let roots = load_certs(required(&self.ca_file, "replication.ca_file")?)?;
-        let credentials = murmur_replication::Credentials {
+        let credentials = murmur::replication::Credentials {
             chain,
             private_key: zeroize::Zeroizing::new(private_key),
             roots,
@@ -1160,8 +1160,8 @@ impl ReplicationConfig {
             .collect::<Result<BTreeSet<_>>>()?;
         config.membership = self.membership;
         config.dissemination = match self.dissemination.to_ascii_lowercase().as_str() {
-            "plumtree" => murmur_replication::Dissemination::Plumtree,
-            _ => murmur_replication::Dissemination::Gossip,
+            "plumtree" => murmur::replication::Dissemination::Plumtree,
+            _ => murmur::replication::Dissemination::Gossip,
         };
         config.accept_remote_schema = self.accept_remote_schema;
         config.master = self.master;
@@ -1201,11 +1201,11 @@ impl ReplicationConfig {
                     ))
                 })?;
                 let policy = match policy.to_ascii_lowercase().as_str() {
-                    "counter" => murmur_replication::policies::Policy::Counter,
-                    "set" => murmur_replication::policies::Policy::Set,
-                    "min" => murmur_replication::policies::Policy::Min,
-                    "max" => murmur_replication::policies::Policy::Max,
-                    _ => murmur_replication::policies::Policy::Lww,
+                    "counter" => murmur::replication::policies::Policy::Counter,
+                    "set" => murmur::replication::policies::Policy::Set,
+                    "min" => murmur::replication::policies::Policy::Min,
+                    "max" => murmur::replication::policies::Policy::Max,
+                    _ => murmur::replication::policies::Policy::Lww,
                 };
                 Ok(((table.to_owned(), column.to_owned()), policy))
             })
@@ -1279,8 +1279,8 @@ fn load_signing_key(path: &str) -> Result<[u8; 32]> {
 }
 
 #[cfg(feature = "replication")]
-fn build_files(config: &ReplicationFilesConfig) -> Result<murmur_replication::files::Config> {
-    let mut built = murmur_replication::files::Config::new(
+fn build_files(config: &ReplicationFilesConfig) -> Result<murmur::replication::files::Config> {
+    let mut built = murmur::replication::files::Config::new(
         config.directory.clone().into(),
         parse_key32(&config.key_hex, "replication.files.key_hex")?,
         parse_socket(&config.fetch_bind, "replication.files.fetch_bind")?,
@@ -1300,8 +1300,8 @@ fn build_files(config: &ReplicationFilesConfig) -> Result<murmur_replication::fi
 }
 
 #[cfg(feature = "replication")]
-fn build_bridge(config: &ReplicationBridgeConfig) -> Result<murmur_replication::bridge::Config> {
-    use murmur_replication::bridge::{Config, Role};
+fn build_bridge(config: &ReplicationBridgeConfig) -> Result<murmur::replication::bridge::Config> {
+    use murmur::replication::bridge::{Config, Role};
     use std::collections::{BTreeMap, BTreeSet};
     let role = match config.role.as_str() {
         "high-receiver" => Role::HighReceiver,
@@ -1366,7 +1366,7 @@ mod tests {
     #[test]
     fn defaults_mirror_engine_options() {
         let options = Config::default().engine.to_options().unwrap();
-        let expected = crate::Options::default();
+        let expected = murmur::Options::default();
         assert_eq!(options.capture_interval, expected.capture_interval);
         assert_eq!(options.capture_bytes, expected.capture_bytes);
         assert_eq!(options.queue_bytes, expected.queue_bytes);

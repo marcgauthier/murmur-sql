@@ -7,7 +7,7 @@ edition = "2021"
 murmur-live-harness = { package = "murmur-live-sql-harness", path = "../sql-harness" }
 murmur-client = { path = "../../clients/rust" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
-spool = { package = "murmur-spool", path = "../../spool" }
+spool = { package = "murmur-spool", path = "../../../MURMUR/spool" }
 postcard = { version = "1", features = ["alloc"] }
 serde = { version = "1", features = ["derive"] }
 sha2 = "0.10"

@@ -5,8 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func TestColumnFTS(t *testing.T) {
@@ -21,21 +20,21 @@ func TestColumnFTS(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := db.SetColumnFTS(ctx, "doc list", "full text", true); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'doc list' 'full text' FTS true"); err != nil {
 		t.Fatal(err)
 	}
-	columns, err := db.ColumnFTS(ctx)
+	columns, err := sqlRows(ctx, db, "MURMUR SHOW COLUMNS FTS")
 	if err != nil {
 		t.Fatal(err)
 	}
 	var index string
 	for _, c := range columns {
-		if c.Column == "full text" {
-			if !c.Enabled || c.IndexName == nil || c.Ready == nil || !*c.Ready {
+		if c["column"].(string) == "full text" {
+			if c["enabled"] != "true" || c["index_name"] == nil || c["ready"] == nil || c["ready"] != "true" {
 				t.Fatalf("bad status: %+v", c)
 			}
-			index = *c.IndexName
-		} else if c.Enabled || c.IndexName != nil || c.Ready != nil || c.PendingKeys != nil {
+			index = c["index_name"].(string)
+		} else if c["enabled"] == "true" || c["index_name"] != nil || c["ready"] != nil || c["pending_keys"] != nil {
 			t.Fatalf("disabled status: %+v", c)
 		}
 	}
@@ -56,32 +55,32 @@ func TestColumnFTS(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `UPDATE "doc list" SET "full text"='changed'`); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.RefreshIndexes(ctx); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR REFRESH INDEXES"); err != nil {
 		t.Fatal(err)
 	}
 	if err := statement.QueryRowContext(ctx, "changed").Scan(&id); err != nil || id != 1 {
 		t.Fatalf("updated match: %d %v", id, err)
 	}
 	for _, column := range []string{"missing", "n"} {
-		if err := db.SetColumnFTS(ctx, "doc list", column, true); murmur.CodeOf(err) != "22023" {
+		if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'doc list' "+"'"+strings.ReplaceAll(column, "'", "''")+"'"+" FTS true"); codeOf(err) != "22023" {
 			t.Fatalf("invalid %s: %v", column, err)
 		}
 	}
-	if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN"); murmur.CodeOf(err) != "42601" {
+	if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN"); codeOf(err) != "42601" {
 		t.Fatalf("syntax: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, "DELETE FROM temp."+ident); err == nil {
 		t.Fatal("index writable")
 	}
-	if err := db.SetColumnFTS(ctx, "doc list", "full text", false); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'doc list' 'full text' FTS false"); err != nil {
 		t.Fatal(err)
 	}
-	columns, err = db.ColumnFTS(ctx)
+	columns, err = sqlRows(ctx, db, "MURMUR SHOW COLUMNS FTS")
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, c := range columns {
-		if c.Enabled || c.IndexName != nil || c.Ready != nil {
+		if c["enabled"] == "true" || c["index_name"] != nil || c["ready"] != nil {
 			t.Fatalf("disable: %+v", c)
 		}
 	}

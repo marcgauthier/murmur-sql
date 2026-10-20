@@ -4,10 +4,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -31,38 +32,37 @@ func main() {
 		if err != nil {
 			t.Fatalf("insert item: %v", err)
 		}
-		if err := db.Flush(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
 
-		metrics, err := db.Metrics(ctx)
-		if err != nil {
-			t.Fatalf("metrics: %v", err)
-		}
-		foundSqlite := false
-		foundSpool := false
-		for _, m := range metrics {
-			if m.Subsystem == "sqlite" {
-				foundSqlite = true
+		count := 0
+		for _, scope := range []string{"", "SQLITE", "SPOOL"} {
+			// Scope comes from this fixed list, not external input.
+			rows, err := db.QueryContext(ctx, "MURMUR SHOW METRICS "+scope)
+			if err != nil {
+				t.Fatalf("metrics: %v", err)
 			}
-			if m.Subsystem == "spool" {
-				foundSpool = true
+			found := map[string]bool{}
+			for rows.Next() {
+				var subsystem, metric, value string
+				if err := rows.Scan(&subsystem, &metric, &value); err != nil {
+					t.Fatalf("scan: %v", err)
+				}
+				found[subsystem] = true
+				count++
+			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("rows: %v", err)
+			}
+			rows.Close()
+			if scope == "" && (!found["sqlite"] || !found["spool"]) {
+				t.Fatalf("missing subsystems: %v", found)
+			}
+			if scope != "" && (len(found) != 1 || !found[strings.ToLower(scope)]) {
+				t.Fatalf("wrong scope: %v", found)
 			}
 		}
-		if !foundSqlite || !foundSpool {
-			t.Fatalf("expected both sqlite and spool metrics, got %d total", len(metrics))
-		}
-
-		sqliteOnly, err := db.Metrics(ctx, "sqlite")
-		if err != nil {
-			t.Fatalf("sqlite metrics: %v", err)
-		}
-		for _, m := range sqliteOnly {
-			if m.Subsystem != "sqlite" {
-				t.Fatalf("expected subsystem sqlite, got %s", m.Subsystem)
-			}
-		}
-
-		fmt.Printf("metrics: verified %d metrics\n", len(metrics))
+		fmt.Printf("metrics: verified %d metric rows\n", count)
 	})
 }

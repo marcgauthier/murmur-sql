@@ -70,7 +70,7 @@ fn write_config(
     production: bool,
     with_ca: bool,
 ) -> std::path::PathBuf {
-    let hash = sqlite_session::server::auth::hash_password(PASSWORD).unwrap();
+    let hash = murmur_sql::server::auth::hash_password(PASSWORD).unwrap();
     let cert_path = dir.path().join("server.crt");
     let key_path = dir.path().join("server.key");
     let ca_path = dir.path().join("ca.crt");

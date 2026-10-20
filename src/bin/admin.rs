@@ -21,7 +21,7 @@
 //!   -h, --help                              Print help
 
 use serde::Serialize;
-use sqlite_session::{Database, OpenMode, Options, RestoreOptions};
+use murmur::{Database, OpenMode, Options, RestoreOptions};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -321,7 +321,7 @@ fn cmd_inspect(data_dir: &str, opts: &GlobalOpts) -> Result<(), String> {
         return Err(format!("directory does not exist: {data_dir}"));
     }
     let (disk_bytes, file_count) = calculate_dir_size(path);
-    let key_hint = spool::read_key_hint(path).ok();
+    let key_hint = murmur::read_key_hint(path).ok();
 
     let key = opts.resolve_key()?;
     let db = open_existing_db(path, key)?;
@@ -642,8 +642,8 @@ fn cmd_keys(data_dir: &str, opts: &GlobalOpts) -> Result<(), String> {
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
             let status_str = match k.status {
-                sqlite_session::KeyStatus::Active => "active",
-                sqlite_session::KeyStatus::Retired => "retired",
+                murmur::KeyStatus::Active => "active",
+                murmur::KeyStatus::Retired => "retired",
             };
             KeyEntry {
                 id: k.id,
@@ -706,7 +706,7 @@ fn cmd_hash_password(opts: &GlobalOpts) -> Result<(), String> {
     if password.is_empty() {
         return Err("password must not be empty".into());
     }
-    let hash = sqlite_session::server::auth::hash_password(&password)
+    let hash = murmur_sql::server::auth::hash_password(&password)
         .map_err(|e| format!("cannot hash password: {e}"))?;
     if opts.json {
         println!("{}", serde_json::json!({ "password_hash": hash }));

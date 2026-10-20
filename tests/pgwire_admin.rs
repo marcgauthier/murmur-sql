@@ -36,7 +36,7 @@ fn write_config(
     storage_extra: &str,
     extra: &str,
 ) -> std::path::PathBuf {
-    let hash = sqlite_session::server::auth::hash_password(PASSWORD).unwrap();
+    let hash = murmur_sql::server::auth::hash_password(PASSWORD).unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
@@ -220,7 +220,7 @@ fn replication_config_toml(dir: &tempfile::TempDir, policies: &str) -> String {
     use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair, SanType};
     let node = [9u8; 16];
     let seed = [0xabu8; 32];
-    let public = sqlite_session::replication::protocol::public_key(&seed);
+    let public = murmur::replication::protocol::public_key(&seed);
 
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
@@ -230,7 +230,7 @@ fn replication_config_toml(dir: &tempfile::TempDir, policies: &str) -> String {
     let key = KeyPair::generate().unwrap();
     let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
     params.subject_alt_names = vec![SanType::URI(
-        format!("replicateddb://node/{}", sqlite_session::replication::hex(&node))
+        format!("replicateddb://node/{}", murmur::replication::hex(&node))
             .try_into()
             .unwrap(),
     )];
@@ -247,7 +247,7 @@ fn replication_config_toml(dir: &tempfile::TempDir, policies: &str) -> String {
     std::fs::write(&key_path, key.serialize_pem()).unwrap();
     std::fs::write(&ca_path, ca.pem()).unwrap();
 
-    let hex = sqlite_session::replication::hex;
+    let hex = murmur::replication::hex;
     format!(
         "[replication]\nenabled = true\nbind = \"127.0.0.1:0\"\n\
          cert_chain_file = \"{}\"\nprivate_key_file = \"{}\"\nca_file = \"{}\"\n\

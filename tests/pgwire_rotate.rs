@@ -26,7 +26,7 @@ fn free_port() -> u16 {
 }
 
 fn write_config(dir: &tempfile::TempDir, port: u16) -> std::path::PathBuf {
-    let hash = sqlite_session::server::auth::hash_password(PASSWORD).unwrap();
+    let hash = murmur_sql::server::auth::hash_password(PASSWORD).unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
@@ -128,7 +128,7 @@ async fn rotate_cycle_retires_old_key_and_persists_restart() {
     // Rotation persists across restarts: only the new key reopens the store.
     drop(server);
     let port = free_port();
-    let mut loaded = sqlite_session::config::Config::load(&config).unwrap();
+    let mut loaded = murmur_sql::config::Config::load(&config).unwrap();
     loaded.server.bind = format!("127.0.0.1:{port}");
     std::fs::write(&config, toml::to_string(&loaded).unwrap()).unwrap();
     let server = spawn_server(&config, port);

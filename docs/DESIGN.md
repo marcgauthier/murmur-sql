@@ -1,36 +1,41 @@
 # Architecture
 
+Murmur-SQL is a thin PostgreSQL-wire shell over the embedded Murmur engine
+(the `murmur` crate in the sibling `../MURMUR` checkout). This repository owns
+only the wire shell: `src/server` (PostgreSQL wire protocol, TLS/mTLS, auth,
+per-connection `MURMUR UNLOCK`, `MURMUR ...` commands, query fan-out),
+`src/config.rs` (`config.toml`, authoritative for replication and settings,
+including `[replication.tables]`), `src/logging.rs`, the `murmur-server` and
+`murmur-admin` binaries, the `clients/` wire clients, and `tests-live/`.
+All storage, replication, conflict-resolution, and search-index behavior lives
+in `../MURMUR` and is described in its own docs; the sections below summarize
+the behavior the shell projects over the wire.
+
 ```text
 PostgreSQL-wire client (SQLite dialect)
       |
 murmur-server: TLS/mTLS, auth, per-connection MURMUR UNLOCK, MURMUR commands
+      |  (this repo: src/server, src/config.rs, src/logging.rs)
+murmur::Database API boundary (table-flags sink callback for config.toml)
       |
-One SQLite :memory: connection + session
-      |
-Collect committed changeset + collection-time version
-      |
-Ordered, bounded background queue
-      |
-Changeset iterator -> Spool metadata reads
-      |
-Atomic Spool group: changeset + versions + tombstones + clock
-      |
-Zstd -> AES-256-GCM -> encrypted append-only segments
+Embedded Murmur engine (../MURMUR):
+one SQLite :memory: connection + session, collection-time versions,
+bounded background queue, Spool metadata, Zstd -> AES-256-GCM segments,
+QUIC replication mesh
 ```
 
-`murmur-server` (`src/server`) terminates the PostgreSQL wire protocol,
-authenticates users from `config.toml`, requires every connection to unlock the
-database with the key, and forwards application SQL to the engine. `MURMUR ...`
-commands (table replication flags, backup/restore, key rotation, files, flush)
-are handled in the server layer. Configuration, including `[replication.tables]`,
-lives in `config.toml` (`src/config.rs`) and is authoritative for table flags.
+Replication and settings live in `config.toml`. Table flag changes made over
+the wire (`MURMUR SET TABLE`, schema adoption) flow back through a
+`TableFlagsSink` callback that atomically rewrites `config.toml` and mirrors
+the running snapshot; the engine never touches the file directly.
 
-The database thread owns the single SQLite connection and its session. Normal
-writes execute only application SQL and transaction control; they do not execute
-CRDT SQL. Session extraction and resource admission are the coordination boundary.
-Compression, encryption, disk access, metadata generation, and changeset compaction
-run behind that boundary. Explicit migrations, exports, and incoming row application
-need coordinated database access.
+The engine behavior below is implemented in `../MURMUR`. The database thread
+owns the single SQLite connection and its session. Normal writes execute only
+application SQL and transaction control; they do not execute CRDT SQL. Session
+extraction and resource admission are the coordination boundary. Compression,
+encryption, disk access, metadata generation, and changeset compaction run
+behind that boundary. Explicit migrations, exports, and incoming row
+application need coordinated database access.
 
 ## Collection time
 
@@ -100,7 +105,7 @@ cannot resurrect it. A subsequent captured INSERT receives a new generation.
 A delete/reinsert that SQLite coalesces into UPDATE is indistinguishable from an
 ordinary update and keeps its generation.
 
-Peers replicate over QUIC (`replication/`): gossip or Plumtree dissemination,
+Peers replicate over QUIC (engine `replication/` crate in `../MURMUR`): gossip or Plumtree dissemination,
 membership exchange, anti-entropy, and bounded incoming batches. A peer that
 cannot recover from retained history fetches a resumable encrypted snapshot from
 a trusted source. Incoming rows are merged against Spool records and applied by
@@ -117,8 +122,8 @@ Enabling rebuilds the table with a read-only UUIDv5 `id_murmur_primary_key` and 
 unique application-key index; disabling restores the application key. Outgoing
 and incoming background paths filter rows, tombstones and table CRDT records by
 these flags; local persistence is unaffected and ordinary writes never check them.
-Drops and renames of replicated tables and columns are rejected in
-`schema::inspect`.
+Drops and renames of replicated tables and columns are rejected in the
+engine's `schema::inspect`.
 
 ## Retention
 

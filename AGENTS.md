@@ -1,8 +1,8 @@
 # Usage documentation maintenance
 
-Documentation layout: every Markdown file other than `AGENTS.md` and `README.md`
-(`USAGE.md`, `DESIGN.md`, `SCALABILITY.md`, `TESTING.md`, `TODO.md`, `VENDORS.md`)
-lives in the `./docs` folder. Only those two stay at the repository root.
+Documentation layout: every Markdown file other than `AGENTS.md`, `README.md`, and `VENDORS.md`
+(`USAGE.md`, `DESIGN.md`, `SCALABILITY.md`, `TESTING.md`, `TODO.md`)
+lives in the `./docs` folder. Those three stay at the repository root.
 Keep relative links valid when editing or moving them.
 
 Keep `./docs/USAGE.md` accurate after code changes. Any change to public APIs, SQL
@@ -27,69 +27,37 @@ the Go client, its README, examples, and docs/USAGE.md in the same change.
 Keep the Go example catalog and `clients/go/examples/coverage.json` aligned
 with the client feature table. New capabilities need a runnable example with
 result checks and documented setup/restrictions. Run the Go suite, `go vet`,
-and the race detector; preserve Linux, macOS, and Windows CI. Keep `docs/VENDORS.md`
+and the race detector; preserve Linux, macOS, and Windows CI. Keep `VENDORS.md`
 synchronized with the root Rust dependencies and the Go module requirements.
 Avoid duplicating Rust conflict, crypto, wire-format, or persistence
 implementations in Go.
 
 # Architecture guidance
 
-The design is an SQLITE in memory database that has background functions that provide data persistance with compression and encryption and data replication via masterless peer-to-peer. Keep this in mind when developping, it's SQLITE in memory (with some limitation) first and the replication and persistance is done in the background.
+This repository is a thin PostgreSQL-wire shell over the embedded Murmur
+engine (the `murmur` crate in the sibling `../MURMUR` checkout). All storage,
+replication, conflict-resolution, and search-index behavior lives in that
+engine; engine changes belong in `../MURMUR`, never duplicated here. This repo
+owns only `src/server` (wire protocol, auth, `MURMUR ...` commands), `src/config.rs`
+(`config.toml`), `src/logging.rs`, the two binaries, `clients/`, and `tests-live/`.
 
+Replication and settings live in `config.toml`, which is authoritative. Table
+replication is controlled by `MURMUR SET TABLE <name> REPLICATED true|false`
+and stored under `[replication.tables]`, keyed by stable table IDs. The server
+overlays the file onto the in-memory schema at unlock and rewrites the file
+atomically on every SET command. Missing entries mean disabled; missing
+settings never enable tables implicitly during unlock or recovery.
 
-Keep the SQLite crate lightweight and focused on local database operations.
-Replication and conflict resolution belong in a separate background task;
-they must not add blocking work or heavyweight dependencies to the SQLite
-operation path. Keep the boundary between SQLite and that task small.
+Engine-side flag changes (SET TABLE, schema adoption) flow back through the
+`TableFlagsSink` callback, which persists the full map to `config.toml` and
+mirrors the running snapshot. The engine never touches the file directly; keep
+that boundary: the shell owns the file, the engine owns the data.
 
+Keep the shell a projection, not a second implementation. Do not duplicate
+engine conflict, crypto, wire-format, schema, or persistence logic in
+`src/server`, the binaries, the clients, or the harnesses; add a `murmur::`
+API (or `murmur::host::` helper) in `../MURMUR` instead. Wire-visible behavior
+changes need a `tests/` pgwire test and a `docs/USAGE.md` example in the same
+change.
 
-Use exactly one in-memory SQLite database. Application writes must execute only
-application SQL, transaction control, and SQLite session capture. Do not add CRDT
-metadata tables, generated triggers, or metadata SQL to that database.
-
-Spool is the authoritative store for conflict versions and tombstones. Background
-workers read and update those Spool records directly; do not maintain a separate
-Rust metadata database or a second SQLite replica. Transient batch buffers and
-Spool's existing key/location index are permitted.
-
-Assign a batch's writing time when its changeset is collected from SQLite, before
-queueing it. Preserve that timestamp across worker delays and storage retries.
-
-Maintain a file docs/VENDORS.md that list all of the external package/crate that are dependencies.  I want to see the name of the company and author and country of orgin for the company if there is one otherwise the author. 
-Keep Spool point reads small: default to 64 KiB independently compressed and
-authenticated blocks, with oversized individual records isolated. Large atomic
-commits must span blocks. Keep a byte-bounded hot block cache inside Spool, with
-configurable capacity, eviction and decoded-buffer wiping. Cache data is disposable
-and must never become a separate authoritative metadata store.
-
-Table replication is controlled by `MURMUR SET TABLE <name> REPLICATED
-true|false` and stored in `config.toml` under `[replication.tables]`, keyed by
-stable table IDs. The config file is authoritative: the server overlays it onto
-the in-memory schema at unlock and rewrites the file atomically on every SET
-command. Legacy maps stored at `00/schema/replication` are imported into the
-config file once and never written back. Missing entries mean disabled.
-Missing settings never enable tables implicitly during unlock or recovery.
-Preserve settings through migrations and recovery. Filter row data, tombstones and table
-CRDT records in background outgoing and incoming paths; keep local persistence
-intact. Do not check these settings on ordinary application SQL writes.
-Drops and renames of tables and columns are rejected for replicated tables
-and allowed for local-only ones; the gate lives in `schema::inspect` (both
-statement scanning and the id diff) so engine and wire paths share it. An
-unmapped rename mints a new table identity that stays local-only until
-explicitly enabled.
-
-Local tables retain their application SQLite primary key. Enabling replication
-rebuilds even populated tables with a read-only `id_murmur_primary_key` UUIDv5
-SQLite primary key and a unique application-key constraint. Require supplied,
-non-null immutable application keys while replicated. Disabling restores the
-application primary key. Keep generation at the managed SQL boundary; never add
-triggers or metadata SQL to application writes. Preserve transition records and
-replicated tombstones in Spool across mode changes.
-
-Replication retention runs in background workers and persists peer ACKs, peer
-retirement, persistence-time ages, snapshot coverage and duplicate floors in
-Spool. Enforce both minimum age and minimum log count, protect unretired peers
-within the offline window and pending High/Low exports. Publish a durable
-snapshot boundary before atomically deleting logs/receipts and advancing floors.
-Keep CRDT tombstones. Recheck retained heads on the serialized Spool worker so
-cleanup cannot overwrite newer appends. Never add retention SQL to SQLite.
+Maintain a root VENDORS.md listing only direct external package/crate dependencies required to build or run the server and clients. Exclude test-only, benchmark-only, and transitive dependencies.  I want to see the name of the company and author and country of orgin for the company if there is one otherwise the author.

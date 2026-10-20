@@ -318,7 +318,7 @@ same for `tests-live/sql-harness/Cargo.toml`.
 2. Sequential single writer: one scenario in flight at a time per checkout.
 3. Flip ONLY your own `TESTS-LIVE-TODO.md` checkbox, and only on a clean
    `cargo test --no-run` for your scenario.
-4. Never touch product code (`src/`, `spool/`, `replication/`, `tests-benchmark/`,
+4. Never touch product code (`src/`, the `murmur` engine in `../MURMUR`,
    root `Cargo.toml`/`Cargo.lock`) or any other scenario's directory/checkbox.
 5. Never fix a missing product API by forking harness code into your scenario;
    shared needs go to the harness prerequisite, product gaps go in your report.
@@ -353,7 +353,7 @@ loadshare, write-priority, soak-slo, cert-lifecycle (rotation =
 (`allowed_peers`), addrpolicy (`allowed_networks`), dbid-isolation,
 version-skew, hostile-peer, hostile-schema (signed manifests), encryption
 (`WrongKey` on unlock), plaintext-audit, rekey (`MURMUR ROTATE`),
-file-permissions (0600/0700 in spool/backup), backup-restore,
+file-permissions (0600/0700 in data/backup), backup-restore,
 backup-under-fire, tampered-backup, downgrade-guard, files-bridge,
 files-soak, files-crash, files-corrupt-source, highlow (bridge
 export/stage/process/release), origin-signatures (`trusted_origins`),

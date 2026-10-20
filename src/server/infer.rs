@@ -12,7 +12,7 @@
 //! Identifiers resolve against the statement's table scope (`FROM`/`JOIN`
 //! with aliases, `UPDATE`, `INSERT INTO`, `DELETE FROM`, `TABLE`). Ambiguous
 //! or unknown references stay UNKNOWN. Inference never fails the describe.
-use crate::model::Schema;
+use murmur::Schema;
 use pgwire::api::Type;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -270,7 +270,7 @@ fn resolve<'a>(
     schema: &'a Schema,
     qualifier: Option<&str>,
     name: &str,
-) -> Option<&'a crate::model::Column> {
+) -> Option<&'a murmur::Column> {
     let mut found = None;
     for table in scope {
         let addressed = match qualifier {
@@ -297,7 +297,7 @@ fn resolve<'a>(
     found
 }
 
-fn column_type(column: &crate::model::Column) -> Type {
+fn column_type(column: &murmur::Column) -> Type {
     // BOOLEAN storage has no exact wire twin for result columns, but a bound
     // boolean must still encode; parameters alone map it to BOOL.
     if column.declared_type.eq_ignore_ascii_case("BOOL")
@@ -434,7 +434,7 @@ fn insert_assignments(
 /// Assign a lone `$N` tuple item to its target column.
 fn assign_position(
     inferred: &mut [Option<Type>],
-    table: Option<&crate::model::Table>,
+    table: Option<&murmur::Table>,
     columns: &[String],
     position: usize,
     item: &[Token],
@@ -470,12 +470,12 @@ pub(crate) fn infer_param_types(schema: &Schema, sql: &str, max_param: usize) ->
         for column in &table.columns {
             if column.vector.is_some() {
                 let columns = [(column.name.as_str(), "BLOB"), ("rowid", "INTEGER"), ("k", "INTEGER"), ("distance", "REAL")]
-                    .into_iter().map(|(name, ty)| crate::Column {
-                        vector: None, fts: false, policy: crate::MergePolicy::Lww,
+                    .into_iter().map(|(name, ty)| murmur::Column {
+                        vector: None, fts: false, policy: murmur::MergePolicy::Lww,
                         id: String::new(), name: name.into(), primary_key: 0, declared_type: ty.into(), not_null: false,
                     }).collect();
-                query_schema.tables.push(crate::Table { application_key: None, id: String::new(),
-                    name: crate::search::vector_index_name(table, column), sql: String::new(), columns });
+                query_schema.tables.push(murmur::Table { application_key: None, id: String::new(),
+                    name: murmur::host::vector_index_name(table, column), sql: String::new(), columns });
             }
         }
     }
@@ -578,7 +578,7 @@ pub(crate) fn infer_param_types(schema: &Schema, sql: &str, max_param: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Column, MergePolicy, Table};
+    use murmur::{Column, MergePolicy, Table};
 
     fn schema() -> Schema {
         let column = |name: &str, declared_type: &str| Column { vector: None, fts: false,

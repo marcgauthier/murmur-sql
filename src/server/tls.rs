@@ -9,7 +9,7 @@
 //!   non-TLS connections, since pgwire otherwise negotiates down.
 
 use crate::config::TlsConfig;
-use crate::{Error, Result};
+use murmur::{Error, Result};
 
 /// Build the pgwire TLS acceptor, or `None` when TLS is disabled. Fails fast
 /// on missing files, unparseable PEM, or a key that does not match the chain.

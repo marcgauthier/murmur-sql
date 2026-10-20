@@ -32,7 +32,7 @@ struct Session {
 }
 
 struct DbSlot {
-    db: Option<crate::Database>,
+    db: Option<murmur::Database>,
     key_hash: Option<[u8; 32]>,
 }
 
@@ -103,13 +103,16 @@ impl ServerState {
             .map(|u| u.password_hash.clone())
     }
 
-    pub fn set_table_flag_snapshot(&self, id: &str, replicated: bool) {
-        self.config
-            .write()
-            .unwrap()
-            .replication
-            .tables
-            .insert(id.to_owned(), replicated);
+    /// Sink the engine hands table flag changes to: persist the full map to
+    /// config.toml and mirror it in the running config snapshot.
+    pub(crate) fn table_flags_sink(&self) -> murmur::TableFlagsSink {
+        let path = self.config_path.clone();
+        let config = self.config.clone();
+        std::sync::Arc::new(move |flags: &std::collections::BTreeMap<String, bool>| {
+            crate::config::save_table_flags(&path, flags)?;
+            config.write().unwrap().replication.tables = flags.clone();
+            Ok(())
+        })
     }
 
     /// Unknown connections are locked (fail closed). A session only unlocks
@@ -146,7 +149,7 @@ impl ServerState {
     }
 
     /// Clone the open database or fail with the locked-connection error.
-    pub fn require_db(&self) -> Result<crate::Database, PgWireError> {
+    pub fn require_db(&self) -> Result<murmur::Database, PgWireError> {
         self.slot.lock().unwrap().db.clone().ok_or_else(|| {
             query::user_error(
                 "28000",
@@ -157,14 +160,14 @@ impl ServerState {
 
     /// Open (or create) the database with `key`, or verify `key` against the
     /// running instance. Blocking: performs storage I/O.
-    pub fn unlock(&self, config: &Config, key: &[u8; 32]) -> Result<UnlockOutcome, crate::Error> {
+    pub fn unlock(&self, config: &Config, key: &[u8; 32]) -> Result<UnlockOutcome, murmur::Error> {
         let hash = blake3::hash(key);
         let mut slot = self.slot.lock().unwrap();
         if slot.db.is_some() {
             return if slot.key_hash == Some(*hash.as_bytes()) {
                 Ok(UnlockOutcome::AlreadyOpen)
             } else {
-                Err(crate::Error::WrongKey)
+                Err(murmur::Error::WrongKey)
             };
         }
         let data_dir = Path::new(&config.storage.data_dir);
@@ -182,16 +185,16 @@ impl ServerState {
     /// Rotate the master key: `previous` must match the running instance,
     /// then the key registry is rewrapped under `new` and future unlocks
     /// require it. Sessions stay unlocked; old backups keep the old key.
-    pub fn rotate_key(&self, previous: &[u8; 32], new: &[u8; 32]) -> Result<(), crate::Error> {
+    pub fn rotate_key(&self, previous: &[u8; 32], new: &[u8; 32]) -> Result<(), murmur::Error> {
         if previous == new {
-            return Err(crate::Error::Invalid(
+            return Err(murmur::Error::Invalid(
                 "new key must differ from the previous key".into(),
             ));
         }
         let mut slot = self.slot.lock().unwrap();
-        let db = slot.db.clone().ok_or(crate::Error::Closed)?;
+        let db = slot.db.clone().ok_or(murmur::Error::Closed)?;
         if slot.key_hash != Some(*blake3::hash(previous).as_bytes()) {
-            return Err(crate::Error::WrongKey);
+            return Err(murmur::Error::WrongKey);
         }
         db.rotate_master_key(*new)?;
         // The registry is rewrapped; record the new key before flushing so a
@@ -202,13 +205,13 @@ impl ServerState {
     }
 
     /// Verify `key` against the running instance without opening anything.
-    pub fn verify_key(&self, key: &[u8; 32]) -> Result<(), crate::Error> {
+    pub fn verify_key(&self, key: &[u8; 32]) -> Result<(), murmur::Error> {
         let hash = blake3::hash(key);
         let slot = self.slot.lock().unwrap();
         match (slot.db.is_some(), slot.key_hash) {
             (true, Some(known)) if known == *hash.as_bytes() => Ok(()),
-            (true, _) => Err(crate::Error::WrongKey),
-            (false, _) => Err(crate::Error::Closed),
+            (true, _) => Err(murmur::Error::WrongKey),
+            (false, _) => Err(murmur::Error::Closed),
         }
     }
 
@@ -218,12 +221,12 @@ impl ServerState {
         config: &Config,
         key: &[u8; 32],
         data_dir: &Path,
-    ) -> Result<(crate::Database, bool), crate::Error> {
+    ) -> Result<(murmur::Database, bool), murmur::Error> {
         let mut options = config.engine.to_options()?;
         options.mode = if data_dir.exists() {
-            crate::OpenMode::Existing
+            murmur::OpenMode::Existing
         } else {
-            crate::OpenMode::CreateNew
+            murmur::OpenMode::CreateNew
         };
         if let Some(id) = &config.storage.database_id {
             options.database_id = Some(parse_id(id)?);
@@ -235,8 +238,8 @@ impl ServerState {
         if config.replication.enabled {
             options.replication = Some(config.replication.to_replication_config()?);
         }
-        let created = options.mode == crate::OpenMode::CreateNew;
-        let db = crate::Database::open_with_flags(
+        let created = options.mode == murmur::OpenMode::CreateNew;
+        let db = murmur::Database::open_with_flags(
             data_dir,
             key,
             options,
@@ -258,10 +261,10 @@ impl ServerState {
         config: &Config,
         key: &[u8; 32],
         unpacked: &Path,
-    ) -> Result<PathBuf, crate::Error> {
+    ) -> Result<PathBuf, murmur::Error> {
         let mut slot = self.slot.lock().unwrap();
         if slot.db.is_none() {
-            return Err(crate::Error::Closed);
+            return Err(murmur::Error::Closed);
         }
         let data_dir = PathBuf::from(&config.storage.data_dir);
         let parent = data_dir.parent().filter(|p| !p.as_os_str().is_empty());
@@ -271,7 +274,7 @@ impl ServerState {
         };
         let staging = backup::staging_dir(&staging_base, "restoring");
         // The live database keeps serving until the swap below.
-        if let Err(e) = crate::Database::restore(unpacked, &staging, key) {
+        if let Err(e) = murmur::Database::restore(unpacked, &staging, key) {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
@@ -320,14 +323,14 @@ impl ServerState {
                 }
             }
             let _ = std::fs::remove_dir_all(&staging);
-            return Err(crate::Error::Io(e));
+            return Err(murmur::Error::Io(e));
         }
         if let Err(e) = std::fs::rename(&staging, &data_dir) {
             let _ = std::fs::rename(&replaced, &data_dir);
             if let Ok((db, _)) = Self::open_database(config, key, &data_dir) {
                 slot.db = Some(db);
             }
-            return Err(crate::Error::Io(e));
+            return Err(murmur::Error::Io(e));
         }
         let (db, _) = Self::open_database(config, key, &data_dir)?;
         self.apply_table_settings(&db, config)?;
@@ -341,10 +344,10 @@ impl ServerState {
     /// Missing entries always mean local-only.
     fn apply_table_settings(
         &self,
-        db: &crate::Database,
+        db: &murmur::Database,
         config: &Config,
-    ) -> Result<(), crate::Error> {
-        db.bind_table_config(&self.config_path, self.config.clone())?;
+    ) -> Result<(), murmur::Error> {
+        db.bind_table_flags_sink(self.table_flags_sink())?;
         if !config.replication.tables.is_empty() || db.table_config_owned()? {
             db.set_table_replication_memory(config.replication.tables.clone())?;
             db.mark_table_config_owned()?;
@@ -365,7 +368,7 @@ impl ServerState {
     }
 }
 
-fn parse_id(hex: &str) -> Result<[u8; 16], crate::Error> {
+fn parse_id(hex: &str) -> Result<[u8; 16], murmur::Error> {
     let bytes = crate::config::parse_hex(hex, 16, "storage id")?;
     let mut id = [0u8; 16];
     id.copy_from_slice(&bytes);

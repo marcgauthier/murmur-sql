@@ -25,7 +25,7 @@ fn free_port() -> u16 {
 }
 
 fn write_config(dir: &tempfile::TempDir, port: u16) -> std::path::PathBuf {
-    let hash = sqlite_session::server::auth::hash_password(PASSWORD).unwrap();
+    let hash = murmur_sql::server::auth::hash_password(PASSWORD).unwrap();
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,

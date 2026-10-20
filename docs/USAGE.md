@@ -1,11 +1,14 @@
 # Murmur usage and restrictions
 
-Murmur is a server database. `murmur-server` runs one in-memory SQLite
-engine, speaks the PostgreSQL wire protocol, and accepts the SQLite dialect —
-Postgres-specific syntax is not translated. SQLite sessions capture
-source-table changes; background workers compress and encrypt them in Spool
-and, when configured, replicate them between peers. Spool stores durable
-conflict versions and tombstones.
+Murmur-SQL is a thin PostgreSQL-wire shell over the embedded Murmur engine
+(the `murmur` crate in the sibling `../MURMUR` checkout): `murmur-server`
+speaks the PostgreSQL wire protocol and accepts the SQLite dialect —
+Postgres-specific syntax is not translated — while storage, replication, and
+conflict resolution all run inside the embedded engine. Replication and
+settings live in `config.toml`. SQLite sessions capture source-table changes;
+background workers compress and encrypt them in Spool and, when configured,
+replicate them between peers. Spool stores durable conflict versions and
+tombstones.
 
 This guide describes server operation: configuration, connection, SQL
 behavior, administration, and restrictions. Repeated-byte keys and IDs below
@@ -367,8 +370,8 @@ One row per connected peer, ordered by node id, with stable columns:
 
 With no peers the result is empty but still describes these columns.
 
-The Go client provides `PeerAdd`, `PeerRemove`, `PeerRetire`, `PeerSync`,
-and `ShowPeers`; the Rust client mirrors them as `peer_add`,
+Go callers execute these commands with `database/sql`. The Rust client
+provides `peer_add`,
 `peer_remove`, `peer_retire`, `peer_sync`, and `show_peers`. Run
 `go run ./examples/replication` from `clients/go` for a checked two-node
 example.
@@ -389,8 +392,8 @@ retained-batch growth: `committed - collected_transactions`). The first
 seven column indices are stable; new columns are appended. Counters
 saturate at `2^63 - 1` instead of failing.
 
-The Go client returns this row as `ReplicationStatus` from `ShowReplication`;
-the Rust client returns `ReplicationStatus` from `show_replication`.
+Go callers scan this row using `QueryRowContext`. The Rust client returns
+`ReplicationStatus` from `show_replication`.
 
 ### MURMUR SHOW RETENTION
 
@@ -415,9 +418,8 @@ Peers with no acknowledgements get one row with NULL `origin` and
 The trailing counters repeat on every row. With no known peers the result
 is empty.
 
-The Go client returns these rows as `RetentionEntry` values from
-`ShowRetention`; the Rust client returns `RetentionEntry` values from
-`show_retention`.
+Go callers iterate these rows with `QueryContext` and `Rows.Scan`. The Rust
+client returns `RetentionEntry` values from `show_retention`.
 
 ### MURMUR RETENTION COLLECT
 
@@ -432,8 +434,8 @@ deleted. Quiet passes delete no logs; they still update the
 last-collection timestamp and still drive physical segment reclamation,
 which can span several passes (deleting one sealed file can unblock the
 next). See [Replication retention](#replication-retention-and-snapshot-catch-up)
-for what protects history. The Go client exposes this as `RetentionCollect`;
-the Rust client as `retention_collect`.
+for what protects history. Go callers scan `collected` using `QueryRowContext`;
+the Rust client provides `retention_collect`.
 
 ### MURMUR POLICY COUNTER_ADD, SET_ADD, SET_REMOVE, MIN, MAX
 
@@ -459,9 +461,8 @@ NULL keys); no TEXT/BLOB choice for set elements; one operation per
 statement (at most 10,000 intents per engine transaction still applies to
 engine-coupled callers); ordinary `UPDATE` to policy columns stays
 rejected. See [Counters, sets, minimum, and
-maximum](#counters-sets-minimum-and-maximum) for merge semantics. The Go
-client provides `PolicyCounterAdd`, `PolicySetAdd`, `PolicySetRemove`,
-`PolicyMin`, and `PolicyMax`; the Rust client mirrors them as
+maximum](#counters-sets-minimum-and-maximum) for merge semantics. Go callers
+execute the SQL with `ExecContext`. The Rust client provides
 `policy_counter_add`, `policy_set_add`, `policy_set_remove`, `policy_min`,
 and `policy_max` (with `PolicyValue` literals).
 
@@ -485,8 +486,8 @@ same field. Table and column names match exactly (case-sensitive).
 
 Limits: single-TEXT-key rows only (no composite or non-TEXT keys, no NULL
 keys); one field or row per statement. See [One-way Low-to-High
-bridge](#one-way-low-to-high-bridge) for ownership semantics. The Go client
-provides `BridgeRelease`; the Rust client mirrors it as `bridge_release`.
+bridge](#one-way-low-to-high-bridge) for ownership semantics. Go callers scan
+`released` with `QueryRowContext`; the Rust client provides `bridge_release`.
 
 ## SQL behavior and schema restrictions
 
@@ -802,7 +803,7 @@ Explicit `Options::search_indexes` remain node-local and must be supplied again
 on reopen. They coexist with schema-derived indexes; conflicting names are
 rejected. `set_search_indexes` replaces only explicit definitions.
 
-The Go client provides `SetColumnFTS`, `ColumnFTS`, and `RefreshIndexes`; run
+Go callers execute the SET, SHOW, and REFRESH SQL commands directly; run
 `go run ./examples/search` from `clients/go` for a complete checked example.
 
 ## Vector search
@@ -892,7 +893,7 @@ Limits and behavior:
 
 Rust callers use `Column::vector`, `VectorColumnConfig { dimensions, distance }`,
 and `Database::set_column_vector(table, column, Some(config))`; `None` disables.
-Go callers use `SetColumnVector`, `ColumnVectors`, and `RefreshIndexes`. Run
+Go callers execute the SET, SHOW, and REFRESH SQL commands directly. Run
 `go run ./examples/vectors` from `clients/go` for checked nearest-neighbor results.
 
 ## Migrations
@@ -929,6 +930,35 @@ accepted as no-ops returning their tags, so drivers and ORMs that bracket
 work keep functioning — but each statement stays individually atomic and
 there is no multi-statement rollback. Anything else starting with those
 words falls through to SQLite for an honest error.
+
+To amortize wire and transaction overhead, put multiple items in one statement:
+
+```sql
+CREATE TABLE batch_example(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+INSERT INTO batch_example VALUES (1, 'first'), (2, 'second'), (3, 'third');
+SELECT batch_example.*
+FROM (VALUES (1), (2), (3)) AS requested
+JOIN batch_example ON batch_example.id = requested.column1;
+```
+
+The multi-row INSERT is one atomic engine transaction. Sending several INSERT
+statements separated by semicolons still creates separate transactions.
+
+The pgwire benchmark compares 1, 100, and 1,000 items per statement by default:
+
+```sh
+cargo run --release --manifest-path benchmark/Cargo.toml -- --duration 30
+# Run only one size:
+cargo run --release --manifest-path benchmark/Cargo.toml -- --batch 1000
+```
+
+Each size runs for the requested duration with an 80% read / 20% write mix.
+Writes use one engine transaction per statement; reads use one engine read call.
+Reported throughput counts successful items, while latency measures whole
+batches. Sizes are limited to 1–1,000 items. Setup and the final durability flush
+are outside timing, so this measures RAM commit throughput, not durable commits.
+The benchmark recreates the `users` table, including on an external server;
+use only a disposable database. See [benchmark details](../benchmark/README.md).
 
 ## Durability, recovery, and backpressure
 
@@ -968,7 +998,8 @@ buffers.
 
 ## Error codes
 
-Failures carry SQLSTATE codes (`murmur.CodeOf` in Go extracts them):
+Failures carry SQLSTATE codes. In Go, use `errors.As` with
+`*pgconn.PgError` from pgx and read its `Code` field:
 
 | Code | Meaning | Typical response |
 | --- | --- | --- |
@@ -1189,7 +1220,7 @@ and a configured file store). Dropping an unfinished upload aborts it;
 authenticate one version:
 
 ```rust
-use sqlite_session::replication::files::Objects;
+use murmur::replication::files::Objects;
 use std::sync::Arc;
 
 fn incremental_file(objects: Arc<Objects>) -> Result<(), Box<dyn std::error::Error>> {
@@ -1278,25 +1309,16 @@ shared by active uploads and peer fetches. Encrypted container overhead counts
 against staging: the default 1 GiB staging limit can prevent uploading a file
 below the 4 GiB file-size limit. Increase staging capacity for larger uploads.
 
-Go helpers pin a connection and stream without buffering the full file:
-
-```go
-info, err := db.UploadFile(ctx, "reports/a.bin", reader)
-err = db.DownloadFile(ctx, info.Name, writer)
-cursor, err := db.SearchFiles(ctx, "reports/%.bin") // or db.ListFiles(ctx)
-if err != nil { /* handle error */ }
-defer cursor.Close()
-for cursor.Next(ctx) {
-    file := cursor.File() // FileInfo{Name, Size, ModifiedMillis, SHA256, Local}
-    _ = file
-}
-err = cursor.Err()
-```
-
-Close cursors promptly; an open cursor occupies a pooled connection. FileCursor
-calls must be serialized. The helpers clean up handles after cancellation or
-failure; a broken connection is cleaned up by the server. File backups still
-require preserving the external object directory and its keys separately.
+Go callers use a standard `*sql.Conn` from `db.Conn(ctx)` to pin the physical
+connection for each handle's lifetime. Execute the file commands above with
+`ExecContext`, `QueryRowContext`, and `QueryContext`, and scan ordinary SQL
+rows. Close/abort handles explicitly before returning the connection to the
+pool; use a bounded independent cleanup context after request cancellation.
+Physical disconnect also releases handles. The checked
+[Go files example](../clients/go/examples/files/main.go) shows chunk loops,
+metadata pagination, and cleanup without a file-specific client API.
+File backups still require preserving the external object directory and its
+keys separately.
 
 ## One-way Low-to-High bridge
 
@@ -1401,7 +1423,8 @@ loop with increasing offsets until `offset + len == total`. LIMIT defaults
 to 1 MiB. `UPLOAD` streams base64 chunks into a hidden partial file that
 `LIST` never shows; `FINISH` publishes it atomically and refuses to
 overwrite an existing file (`23505`), while `ABORT` discards partial state.
-The Go client wraps both loops (`BackupUpload`/`BackupDownload`).
+The [Go backup example](../clients/go/examples/backup/main.go) implements
+both loops with standard `database/sql` calls.
 
 `RESTORE` re-authenticates with the database key, then unpacks the archive,
 restores into staging next to the live data dir, trial-opens it with the
@@ -1435,14 +1458,16 @@ go run ./examples/keys
 go run ./examples/replication
 ```
 
-The keys example rotates with `db.RotateKey(ctx, oldKey, newKey)`, rejects
+The Go package returns a plain `*sql.DB`; it has no command wrappers or
+public result structs. Execute SQL directly and scan application-owned variables.
+The keys example executes `MURMUR ROTATE KEY`, rejects
 the old key and verifies data through a fresh pool. Replace the pool immediately
 after rotation so newly opened connections use the new key. No peers are needed.
 The replication example provisions two scratch nodes and checks counter, set
 add/remove, min and max operations; it requires a server built with
 `--features replication`. Examples build that server automatically unless
-`MURMUR_SERVER_BIN` is set. Backup downloads propagate writer errors and return
-`io.ErrShortWrite` when a destination silently accepts only part of a chunk.
+`MURMUR_SERVER_BIN` is set. Applications own transfer loops and must handle
+reader/writer errors, short writes, and cancellation themselves.
 
 ### Python client coverage
 

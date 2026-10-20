@@ -1,5 +1,5 @@
 //! `config.toml` loading against the shipped example and temp copies.
-use sqlite_session::config::{Config, save_table_flag};
+use murmur_sql::config::{Config, save_table_flag};
 
 #[test]
 fn example_config_loads_with_documented_defaults() {
@@ -17,7 +17,7 @@ fn example_config_loads_with_documented_defaults() {
 
 #[test]
 fn bridge_example_roles_validate() {
-    use sqlite_session::config::ReplicationBridgeConfig;
+    use murmur_sql::config::ReplicationBridgeConfig;
     // Mirrors the low-exporter / high-receiver blocks in config.example.toml.
     let low = ReplicationBridgeConfig {
         role: "low-exporter".into(),
@@ -79,7 +79,7 @@ fn missing_file_and_bad_toml_fail_loudly() {
 #[cfg(feature = "replication")]
 #[test]
 fn replication_builder_loads_credentials_and_maps_fields() {
-    use sqlite_session::config::ReplicationConfig;
+    use murmur_sql::config::ReplicationConfig;
     let dir = tempfile::tempdir().unwrap();
 
     let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
@@ -91,7 +91,7 @@ fn replication_builder_loads_credentials_and_maps_fields() {
     let key = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     params.subject_alt_names = vec![rcgen::SanType::URI(
-        format!("replicateddb://node/{}", murmur_replication::hex(&node)).try_into().unwrap(),
+        format!("replicateddb://node/{}", murmur::replication::hex(&node)).try_into().unwrap(),
     )];
     let cert = params.signed_by(&key, &ca, &ca_key).unwrap();
 
@@ -127,7 +127,7 @@ fn replication_builder_loads_credentials_and_maps_fields() {
     assert_eq!(built.allowed_networks.len(), 1);
     assert_eq!(
         built.merge_policies.get(&("items".to_owned(), "count".to_owned())),
-        Some(&murmur_replication::policies::Policy::Counter)
+        Some(&murmur::replication::policies::Policy::Counter)
     );
 
     // Missing credential files fail the build, not validation.

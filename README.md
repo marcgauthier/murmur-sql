@@ -2,10 +2,12 @@
 
 # Murmur-SQL
 
-Murmur is an SQL database server accessible over the PostgreSQL wire protocol.
-It executes queries against an in-memory SQLite engine for high-speed local SQL
-processing, while background workers handle encrypted, compressed persistence in
-Murmur Spool and masterless peer-to-peer data replication.
+Murmur-SQL is a thin shell over the embedded Murmur database, accessible
+over the PostgreSQL wire protocol. The server speaks PostgreSQL wire and the
+SQLite SQL dialect; the embedded Murmur engine (`../MURMUR`) executes queries
+against its in-memory SQLite core, while background workers handle encrypted,
+compressed persistence in Murmur Spool and masterless peer-to-peer data
+replication. Replication and settings live in `config.toml`.
 
 Clients connect using any PostgreSQL wire protocol client or driver and speak the
 SQLite SQL dialect. The server provides authentication, TLS/mTLS, per-connection
@@ -51,43 +53,6 @@ CREATE TABLE greetings(id INTEGER PRIMARY KEY, lang TEXT NOT NULL, text TEXT NOT
 INSERT INTO greetings VALUES (1, 'en', 'hello');
 SELECT text FROM greetings WHERE lang = 'en';
 MURMUR FLUSH;
-```
-
-Or connect using the [Go client](clients/go/README.md) (`database/sql`, pure Go, no cgo):
-
-```go
-package main
-
-import (
-    "context"
-    "fmt"
-    "log"
-
-    murmur "github.com/marcgauthier/murmur/clients/go"
-)
-
-func main() {
-    ctx := context.Background()
-    db, err := murmur.Open(ctx, murmur.Config{
-        Host:     "127.0.0.1",
-        Port:     5432,
-        User:     "admin",
-        Password: "s3cret",
-        Key:      "database-encryption-key",
-    })
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer db.Close()
-
-    var greeting string
-    err = db.QueryRowContext(ctx,
-        "SELECT text FROM greetings WHERE lang = $1", "en").Scan(&greeting)
-    if err != nil {
-        log.Fatal(err)
-    }
-    fmt.Println(greeting)
-}
 ```
 
 The database encryption key is required before executing application queries: the first
@@ -150,7 +115,7 @@ Production mode (`production = true`) requires TLS with client certificates (mTL
 
 Application statements execute on the server's in-memory SQLite connection; the SQLite session extension records changes with no CRDT tables, triggers, or metadata statements on that connection. At a collection boundary the server extracts the committed changeset, assigns its collection-time HLC version, and queues the batch; a background worker commits changeset, versions, tombstones, and clock into Spool as one atomic group (Zstandard compression, then AES-256-GCM encryption).
 
-Statements acknowledge **in-memory commit**, not disk durability. `MURMUR FLUSH` (or the client's `Flush`) waits for a durable checkpoint. The default one-second collection schedule gives an approximate loss window; a full queue fails writes with `Error::Busy` mapped to a connection error, and storage failure stops writes while reads stay available.
+Statements acknowledge **in-memory commit**, not disk durability. `MURMUR FLUSH` waits for a durable checkpoint. The default one-second collection schedule gives an approximate loss window; a full queue fails writes with `Error::Busy` mapped to a connection error, and storage failure stops writes while reads stay available.
 
 Engine tuning options (`capture_interval`, `queue_bytes`, `spool_cache_bytes`, ...) are configured in `config.toml`; see [USAGE.md](docs/USAGE.md#engine-and-enginescheduler).
 
@@ -164,17 +129,17 @@ Protocol version **13** requires upgraded peers with no rolling compatibility. D
 
 Because Murmur speaks the standard PostgreSQL wire protocol, applications can connect using any PostgreSQL-compatible driver or client tool (such as `psql`, or drivers for Go, Python, Node.js, Java, Rust, etc.). SQL is the SQLite dialect; parameters use `$1`, `$2`, etc.
 
-Murmur provides official pure-Go, pure-Python and pure-Rust clients:
-- [clients/go](clients/go/README.md) — a `database/sql` driver client using `pgx` (pure Go, no cgo, no native library dependencies).
-- [Runnable Go examples](clients/go/examples/README.md) covering connect/unlock, CRUD with parameters, migrations, replication flags, verified TLS/mTLS, and concurrency.
-- [clients/python](clients/python/README.md) — a DB-API client built on `pg8000` (pure Python, no libpq) with MURMUR helpers for unlock, replication flags, backups, metrics, and encrypted files, plus runnable examples in `clients/python/examples`.
-- [clients/rust](clients/rust/README.md) — an async `tokio-postgres` client (`rustls`, standalone crate that does not link the engine) with the same MURMUR helpers and runnable examples in `clients/rust/examples`.
+Client setup, API usage, and runnable examples are documented separately:
+
+- [Go client](clients/go/README.md)
+- [Python client](clients/python/README.md)
+- [Rust client](clients/rust/README.md)
 
 Error codes follow standard SQLSTATE conventions (`28000` auth/locked, `42P01` unknown table, `23505` constraint violation, `42601` syntax error).
 
 ## Encrypted file objects
 
-File listing, LIKE search, uploads, and downloads are available through `MURMUR FILE` SQL commands with typed metadata rows, explicit cursors, and BYTEA chunks. Payloads stay in encrypted disk objects; metadata stays in Spool. Enable the `replication` feature and configure `[replication.files]` plus node credentials. See [file usage and limits](docs/USAGE.md#encrypted-file-objects) and the [Go files example](clients/go/examples/files/main.go).
+File listing, LIKE search, uploads, and downloads are available through `MURMUR FILE` SQL commands with typed metadata rows, explicit cursors, and BYTEA chunks. Payloads stay in encrypted disk objects; metadata stays in Spool. Enable the `replication` feature and configure `[replication.files]` plus node credentials. See [file usage and limits](docs/USAGE.md#encrypted-file-objects).
 
 ## Documentation
 
@@ -182,22 +147,19 @@ File listing, LIKE search, uploads, and downloads are available through `MURMUR 
 - [DESIGN.md](docs/DESIGN.md) — engine and persistence architecture.
 - [SCALABILITY.md](docs/SCALABILITY.md) — scaling properties and resource limits.
 - [TESTING.md](docs/TESTING.md) — test suites and commands.
-- [VENDORS.md](docs/VENDORS.md) — external dependency inventory.
+- [VENDORS.md](VENDORS.md) — external dependency inventory.
 - [TODO.md](docs/TODO.md) — roadmap notes.
 
 ## Building and testing
 
-Rust edition 2024 with a C linker, plus Go 1.24+ for the client:
+Rust edition 2024 with a C linker is required. The
+engine comes from the sibling `../MURMUR` checkout (a `murmur` path
+dependency); engine, replication, and Spool tests run in that repository.
 
 ```sh
 cargo build --bin murmur-server --bin murmur-admin
 cargo test
 cargo test --features replication
-cargo test --manifest-path replication/Cargo.toml
-cargo test --manifest-path spool/Cargo.toml
-cd clients/go && go test ./...
-cd clients/python && python -m pytest
-cd clients/rust && cargo test
 ```
 
 Live multi-process scenarios (`tests-live/`: one `murmur-server` child per

@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"strings"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func main() {
@@ -29,23 +29,35 @@ func main() {
 			}
 		}
 		for _, col := range []string{"title", "body"} {
-			if err := db.SetColumnFTS(ctx, "documents", col, true); err != nil {
+			if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'documents' "+"'"+strings.ReplaceAll(col, "'", "''")+"'"+" FTS true"); err != nil {
 				t.Fatalf("enable: %v", err)
 			}
 		}
-		if err := db.RefreshIndexes(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR REFRESH INDEXES"); err != nil {
 			t.Fatalf("refresh: %v", err)
 		}
-		columns, err := db.ColumnFTS(ctx)
+		rows, err := db.QueryContext(ctx, "MURMUR SHOW COLUMNS FTS")
 		if err != nil {
 			t.Fatalf("status: %v", err)
 		}
 		var name string
-		for _, c := range columns {
-			if c.Enabled && c.IndexName != nil && c.Ready != nil && *c.Ready {
-				name = *c.IndexName
+		for rows.Next() {
+			var table, column string
+			var enabled bool
+			var indexName, indexError *string
+			var ready, rebuilding *bool
+			var pending, queued *int64
+			if err := rows.Scan(&table, &column, &enabled, &indexName, &ready, &rebuilding, &pending, &queued, &indexError); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if enabled && indexName != nil && ready != nil && *ready {
+				name = *indexName
 			}
 		}
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
+		}
+		rows.Close()
 		if name == "" {
 			t.Fatalf("no ready index")
 		}
@@ -58,20 +70,20 @@ func main() {
 		if _, err := db.ExecContext(ctx, "UPDATE documents SET body='updated' WHERE id=1"); err != nil {
 			t.Fatalf("update: %v", err)
 		}
-		if err := db.RefreshIndexes(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR REFRESH INDEXES"); err != nil {
 			t.Fatalf("refresh update: %v", err)
 		}
 		if err := db.QueryRowContext(ctx, query, "updated").Scan(&id); err != nil || id != 1 {
 			t.Fatalf("updated match: id=%d err=%v", id, err)
 		}
-		if err := db.SetColumnFTS(ctx, "documents", "body", false); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR SET COLUMN 'documents' 'body' FTS false"); err != nil {
 			t.Fatalf("disable: %v", err)
 		}
 		var count int64
 		if err := db.QueryRowContext(ctx, "SELECT count(*) FROM temp."+ident+" WHERE "+ident+" MATCH $1", "updated").Scan(&count); err != nil || count != 0 {
 			t.Fatalf("disabled column: count=%d err=%v", count, err)
 		}
-		if err := db.Flush(ctx); err != nil {
+		if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 			t.Fatalf("flush: %v", err)
 		}
 		fmt.Println("search: verified column FTS, MATCH, refresh and disable")

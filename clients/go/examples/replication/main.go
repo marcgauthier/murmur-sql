@@ -4,17 +4,21 @@ package main
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/examples/internal/run"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	"github.com/jackc/pgx/v5/pgconn"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
-func open(t servertest.TB, port int) *murmur.DB {
+func open(t servertest.TB, port int) *sql.DB {
 	db, err := murmur.Open(context.Background(), murmur.Config{
 		Host: "127.0.0.1", Port: port,
 		User: "admin", Password: "test-password", Key: "example-key",
@@ -46,32 +50,40 @@ func main() {
 		db1 := open(t, servers[1].Port)
 		defer db1.Close()
 
-		status, err := db0.ShowReplication(ctx)
-		if err != nil || !status.Running || status.Peers != 0 {
-			t.Fatalf("status: %+v, %v", status, err)
+		var running bool
+		var address, lastError *string
+		var peers, members, staged, applied, committed int64
+		if err := db1.QueryRowContext(ctx, "MURMUR SHOW REPLICATION").Scan(&running, &address, &peers, &members, &staged, &applied, &lastError, &committed); err != nil || !running || address == nil {
+			t.Fatalf("status: %v", err)
 		}
-		peerStatus, err := db1.ShowReplication(ctx)
-		if err != nil || peerStatus.Address == nil {
-			t.Fatalf("peer status: %+v, %v", peerStatus, err)
-		}
-		fmt.Printf("node0 repl=%s node1 repl=%s\n", *status.Address, *peerStatus.Address)
-
-		if err := db0.PeerAdd(ctx, *peerStatus.Address); err != nil {
+		// The address is produced by our scratch server. Escape SQL literals.
+		if _, err := db0.ExecContext(ctx, "MURMUR PEER ADD '"+strings.ReplaceAll(*address, "'", "''")+"'"); err != nil {
 			t.Fatalf("add: %v", err)
 		}
 		deadline := time.Now().Add(30 * time.Second)
 		for {
-			peers, err := db0.ShowPeers(ctx)
+			rows, err := db0.QueryContext(ctx, "MURMUR SHOW PEERS")
 			if err != nil {
 				t.Fatalf("peers: %v", err)
 			}
 			connected := false
-			for _, p := range peers {
-				if p.NodeID == node1 && p.Connected {
+			for rows.Next() {
+				var id string
+				var addr *string
+				var active, schema, push bool
+				var seen *int64
+				var watermark int64
+				if err := rows.Scan(&id, &addr, &active, &seen, &watermark, &schema, &push); err != nil {
+					t.Fatalf("scan: %v", err)
+				}
+				if id == node1 && active {
 					connected = true
-					fmt.Printf("peer %s connected sent_watermark=%d\n", p.NodeID, p.SentWatermark)
 				}
 			}
+			if err := rows.Err(); err != nil {
+				t.Fatalf("rows: %v", err)
+			}
+			rows.Close()
 			if connected {
 				break
 			}
@@ -80,18 +92,13 @@ func main() {
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		if err := db0.PeerSync(ctx); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR PEER SYNC"); err != nil {
 			t.Fatalf("sync: %v", err)
 		}
-		if collected, err := db0.RetentionCollect(ctx); err != nil || collected < 0 {
-			t.Fatalf("collect: %d, %v", collected, err)
+		var collected int64
+		if err := db0.QueryRowContext(ctx, "MURMUR RETENTION COLLECT").Scan(&collected); err != nil || collected < 0 {
+			t.Fatalf("collect: %v", err)
 		}
-		entries, err := db0.ShowRetention(ctx)
-		if err != nil {
-			t.Fatalf("retention: %v", err)
-		}
-		fmt.Printf("retention rows: %d\n", len(entries))
-
 		if _, err := db0.ExecContext(ctx, `CREATE TABLE stats(key TEXT NOT NULL PRIMARY KEY,
 			count INTEGER NOT NULL, highest INTEGER NOT NULL, lowest REAL NOT NULL, tags BLOB)`); err != nil {
 			t.Fatalf("create: %v", err)
@@ -100,23 +107,23 @@ func main() {
 			"row-1", 10, 5); err != nil {
 			t.Fatalf("insert: %v", err)
 		}
-		if err := db0.PolicyCounterAdd(ctx, "stats", "count", "row-1", 5); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'stats' 'count' 'row-1' 5"); err != nil {
 			t.Fatalf("counter: %v", err)
 		}
-		if err := db0.PolicyMax(ctx, "stats", "highest", "row-1", 42); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR POLICY MAX 'stats' 'highest' 'row-1' 42"); err != nil {
 			t.Fatalf("max: %v", err)
 		}
-		if err := db0.PolicyMin(ctx, "stats", "lowest", "row-1", -1.5); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR POLICY MIN 'stats' 'lowest' 'row-1' -1.5"); err != nil {
 			t.Fatalf("min: %v", err)
 		}
-		if err := db0.PolicySetAdd(ctx, "stats", "tags", "row-1", "blue"); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR POLICY SET_ADD 'stats' 'tags' 'row-1' 'blue'"); err != nil {
 			t.Fatalf("set add: %v", err)
 		}
 		var added []byte
 		if err := db0.QueryRowContext(ctx, "SELECT tags FROM stats WHERE key=$1", "row-1").Scan(&added); err != nil || len(added) == 0 {
 			t.Fatalf("set after add: %x, %v", added, err)
 		}
-		if err := db0.PolicySetRemove(ctx, "stats", "tags", "row-1", "blue"); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR POLICY SET_REMOVE 'stats' 'tags' 'row-1' 'blue'"); err != nil {
 			t.Fatalf("set remove: %v", err)
 		}
 		var removed []byte
@@ -136,27 +143,41 @@ func main() {
 			t.Fatalf("got %d/%d, want 15/42", count, highest)
 		}
 
-		if err := db0.PeerRemove(ctx, node1); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR PEER REMOVE "+"'"+strings.ReplaceAll(node1, "'", "''")+"'"); err != nil {
 			t.Fatalf("remove: %v", err)
 		}
-		if err := db0.PeerRetire(ctx, node1); err != nil {
+		if _, err := db0.ExecContext(ctx, "MURMUR PEER RETIRE "+"'"+strings.ReplaceAll(node1, "'", "''")+"'"); err != nil {
 			t.Fatalf("retire: %v", err)
 		}
-		entries, err = db0.ShowRetention(ctx)
+		rows, err := db0.QueryContext(ctx, "MURMUR SHOW RETENTION")
 		if err != nil {
 			t.Fatalf("retention: %v", err)
 		}
-		retired := false
-		for _, e := range entries {
-			if e.NodeID == node1 && e.Retired {
-				retired = true
+		retiredPeer := false
+		for rows.Next() {
+			var id string
+			var seen, collected, last int64
+			var retired bool
+			var origin *string
+			var ack *int64
+			if err := rows.Scan(&id, &seen, &retired, &origin, &ack, &collected, &last); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+			if id == node1 && retired {
+				retiredPeer = true
 			}
 		}
-		if !retired {
-			t.Fatalf("retired peer missing from retention")
+		if err := rows.Err(); err != nil {
+			t.Fatalf("rows: %v", err)
 		}
-		if err := db0.PeerRetire(ctx, node0); murmur.CodeOf(err) != "22023" {
-			t.Fatalf("self-retire: code = %q, want 22023", murmur.CodeOf(err))
+		rows.Close()
+		if !retiredPeer {
+			t.Fatalf("retired peer missing")
+		}
+		_, err = db0.ExecContext(ctx, "MURMUR PEER RETIRE '"+node0+"'")
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
+			t.Fatalf("self-retire: %v", err)
 		}
 		fmt.Println("replication: verified peers, retention, policy ops, and retire")
 	})

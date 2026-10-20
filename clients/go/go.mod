@@ -1,4 +1,4 @@
-module github.com/marcgauthier/murmur/clients/go
+module github.com/marcgauthier/murmur-sql/clients/go
 
 go 1.24.0
 

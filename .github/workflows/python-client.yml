@@ -1,9 +1,9 @@
 name: Python client
 on:
   push:
-    paths: ['clients/python/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/python-client.yml']
+    paths: ['clients/python/**', 'src/**', 'Cargo.*', '.github/workflows/python-client.yml']
   pull_request:
-    paths: ['clients/python/**', 'src/**', 'replication/**', 'spool/**', 'Cargo.*', '.github/workflows/python-client.yml']
+    paths: ['clients/python/**', 'src/**', 'Cargo.*', '.github/workflows/python-client.yml']
   workflow_dispatch:
 permissions:
   contents: read
@@ -21,6 +21,13 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          path: murmur-sql
+      # Sibling checkout for the `murmur` path dependency (`../MURMUR`).
+      - uses: actions/checkout@v4
+        with:
+          repository: marcgauthier/murmur
+          path: MURMUR
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -29,13 +36,15 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
       - name: Build server binary
+        working-directory: murmur-sql
         shell: bash
+        # No --locked: the sibling murmur checkout floats on its default branch.
         run: |
-          cargo build --locked --features replication --bin murmur-server --bin murmur-admin
-          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/target/debug/murmur-server${{ runner.os == 'Windows' && '.exe' || '' }}" >> $GITHUB_ENV
+          cargo build --features replication --bin murmur-server --bin murmur-admin
+          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/murmur-sql/target/debug/murmur-server${{ runner.os == 'Windows' && '.exe' || '' }}" >> $GITHUB_ENV
       - name: Install client
-        working-directory: clients/python
+        working-directory: murmur-sql/clients/python
         run: pip install -e '.[test]'
       - name: Python tests and examples
-        working-directory: clients/python
+        working-directory: murmur-sql/clients/python
         run: python -m pytest -q

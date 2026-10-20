@@ -23,7 +23,7 @@ libc = "0.2"
 # `sha2` and `zeroize` match the product's versions (see
 # `replication/Cargo.toml`) because they appear in the product's public API
 # (endpoint/streams, snapshot digests, TLS credentials).
-murmur-replication = { path = "../../replication" }
+murmur-replication = { path = "../../../MURMUR/replication" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 sha2 = "0.10"
 zeroize = "1"

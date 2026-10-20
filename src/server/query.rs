@@ -14,7 +14,7 @@
 //! Parameters use `$N` (rewritten to SQLite `?N`). Multi-statement strings are
 //! only accepted on the simple-query path, one response per statement.
 
-use crate::model::Value;
+use murmur::Value;
 use crate::server::ServerState;
 use async_trait::async_trait;
 use futures::stream;
@@ -340,9 +340,9 @@ async fn describe_parts(
                     (
                         Vec<ColInfo>,
                         Option<Vec<Value>>,
-                        Option<crate::model::Schema>,
+                        Option<murmur::Schema>,
                     ),
-                    crate::Error,
+                    murmur::Error,
                 > {
                     let schema = if need_infer { Some(db.schema()?) } else { None };
                     // Describe only prepares the statement and reads column
@@ -350,7 +350,7 @@ async fn describe_parts(
                     // the read path; anything else keeps a write transaction
                     // because SQLite authorizes writes at prepare time.
                     let readonly = first_word(&rewritten).eq_ignore_ascii_case("SELECT");
-                    let run = move |sql: &crate::Sql| {
+                    let run = move |sql: &murmur::Sql| {
                         let stmt = sql.prepare(&rewritten)?;
                         let columns = statement_columns(&stmt);
                         // Untyped columns need a sample row so describe and
@@ -491,7 +491,7 @@ fn probe_sql(rewritten: &str) -> Option<String> {
 }
 
 /// First probe row, or `None` when probing is impossible or fails.
-fn probe_sample(sql: &crate::Sql, rewritten: &str, params: &[StoredParam]) -> Option<Vec<Value>> {
+fn probe_sample(sql: &murmur::Sql, rewritten: &str, params: &[StoredParam]) -> Option<Vec<Value>> {
     let probe = probe_sql(rewritten)?;
     let bound: Vec<Box<dyn rusqlite::ToSql + Send>> =
         params.iter().map(StoredParam::to_sql).collect();
@@ -626,7 +626,7 @@ fn execute_one(
                 return Err(user_error("42601", "DDL takes no parameters".to_string()));
             }
             let db = state.require_db()?;
-            db.migrate(crate::Migration::new(sql.to_owned()))
+            db.migrate(murmur::Migration::new(sql.to_owned()))
                 .map_err(engine_error)?;
             Ok(StmtOutput::BareTag(tag))
         }
@@ -659,7 +659,7 @@ fn execute_one(
 }
 
 fn exec_sql(
-    db: &crate::Database,
+    db: &murmur::Database,
     rewritten: &str,
     max_param: usize,
     params: &[StoredParam],
@@ -684,7 +684,7 @@ fn exec_sql(
     // accounting). The authorizer denies every write under read access, so
     // even a smuggled write fails closed here.
     let readonly = verb == "SELECT";
-    let run = move |tx: &crate::Sql| {
+    let run = move |tx: &murmur::Sql| {
         let refs: Vec<&dyn rusqlite::ToSql> = bound
             .iter()
             .map(|b| b.as_ref() as &dyn rusqlite::ToSql)
@@ -1513,25 +1513,25 @@ pub fn user_error(code: &str, message: String) -> PgWireError {
 }
 
 /// Map engine errors to SQLSTATE codes without leaking internals.
-pub fn engine_error(error: crate::Error) -> PgWireError {
+pub fn engine_error(error: murmur::Error) -> PgWireError {
     match error {
-        crate::Error::Sql(sqlite) => sqlite_error(sqlite),
-        crate::Error::WrongKey => user_error("28000", "incorrect key".to_string()),
-        crate::Error::Busy => user_error(
+        murmur::Error::Sql(sqlite) => sqlite_error(sqlite),
+        murmur::Error::WrongKey => user_error("28000", "incorrect key".to_string()),
+        murmur::Error::Busy => user_error(
             "40001",
             "queue full or merge baseline changed; retry".to_string(),
         ),
-        crate::Error::Closed => user_error("08003", "database is closed".to_string()),
-        crate::Error::Invalid(message) => user_error("22023", message),
-        crate::Error::Corrupt(message) => user_error("XX001", message),
-        crate::Error::Limit(message) => user_error("54000", message),
-        crate::Error::SchemaMismatch => user_error(
+        murmur::Error::Closed => user_error("08003", "database is closed".to_string()),
+        murmur::Error::Invalid(message) => user_error("22023", message),
+        murmur::Error::Corrupt(message) => user_error("XX001", message),
+        murmur::Error::Limit(message) => user_error("54000", message),
+        murmur::Error::SchemaMismatch => user_error(
             "55000",
             "database identity or schema history mismatch".to_string(),
         ),
-        crate::Error::Storage(message) => user_error("58000", format!("storage error: {message}")),
-        crate::Error::Io(error) => user_error("58000", format!("storage error: {error}")),
-        crate::Error::CallbackPanicked => user_error(
+        murmur::Error::Storage(message) => user_error("58000", format!("storage error: {message}")),
+        murmur::Error::Io(error) => user_error("58000", format!("storage error: {error}")),
+        murmur::Error::CallbackPanicked => user_error(
             "XX000",
             "SQL callback panicked; transaction rolled back".to_string(),
         ),

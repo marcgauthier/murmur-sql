@@ -5,7 +5,7 @@
 //!
 //! Exit codes: 0 ok, 1 configuration error, 2 bind error.
 
-use sqlite_session::config::Config;
+use murmur_sql::config::Config;
 use std::process::ExitCode;
 
 const VERSION: &str = "0.1.0";
@@ -58,7 +58,7 @@ fn main() -> ExitCode {
         }
     };
     if validate_only {
-        if let Err(e) = sqlite_session::server::tls::build_acceptor(
+        if let Err(e) = murmur_sql::server::tls::build_acceptor(
             &config.server.tls,
             config.server.production,
         ) {
@@ -86,12 +86,12 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let _log = match sqlite_session::logging::init(&config.logging, runtime.handle()) {
+    let _log = match murmur_sql::logging::init(&config.logging, runtime.handle()) {
         Ok(guard) => guard,
         Err(e) => {
             eprintln!("cannot initialize logging: {e}");
             return ExitCode::from(1);
         }
     };
-    runtime.block_on(sqlite_session::server::serve(config_path.into(), config))
+    runtime.block_on(murmur_sql::server::serve(config_path.into(), config))
 }

@@ -3,16 +3,17 @@ package murmur_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
+	"encoding/base64"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func caFile(server *servertest.Server) string {
@@ -34,7 +35,7 @@ func testConfig(server *servertest.Server) murmur.Config {
 	}
 }
 
-func open(t *testing.T, cfg murmur.Config) *murmur.DB {
+func open(t *testing.T, cfg murmur.Config) *sql.DB {
 	t.Helper()
 	db, err := murmur.Open(context.Background(), cfg)
 	if err != nil {
@@ -83,7 +84,7 @@ func TestWrongKey(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected wrong-key failure")
 	}
-	if code := murmur.CodeOf(err); code != "28000" {
+	if code := codeOf(err); code != "28000" {
 		t.Fatalf("code = %q, want 28000 (%v)", code, err)
 	}
 }
@@ -179,7 +180,7 @@ func TestSQLErrorCodes(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%q: expected error", c.sql)
 		}
-		if code := murmur.CodeOf(err); code != c.code {
+		if code := codeOf(err); code != c.code {
 			t.Fatalf("%q: code = %q, want %q (%v)", c.sql, code, c.code, err)
 		}
 	}
@@ -209,7 +210,7 @@ func TestFlushAndRestart(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "INSERT INTO kept VALUES (1, 'durable')"); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := db.Flush(ctx); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	db.Close()
@@ -237,28 +238,28 @@ func TestTableFlags(t *testing.T) {
 			t.Fatalf("create %s: %v", table, err)
 		}
 	}
-	flags, err := db.TableReplication(ctx)
+	flags, err := sqlRows(ctx, db, "MURMUR SHOW TABLES REPLICATION")
 	if err != nil {
 		t.Fatalf("flags: %v", err)
 	}
-	if len(flags) != 2 || flags[0].Replicated || flags[1].Replicated {
+	if len(flags) != 2 || flags[0]["replicated"] == "true" || flags[1]["replicated"] == "true" {
 		t.Fatalf("default flags: %+v", flags)
 	}
-	if err := db.SetTableReplicated(ctx, "shared", true); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR SET TABLE 'shared' REPLICATED true"); err != nil {
 		t.Fatalf("set: %v", err)
 	}
-	flags, err = db.TableReplication(ctx)
+	flags, err = sqlRows(ctx, db, "MURMUR SHOW TABLES REPLICATION")
 	if err != nil {
 		t.Fatalf("flags: %v", err)
 	}
 	byName := map[string]bool{}
 	for _, f := range flags {
-		byName[f.Table] = f.Replicated
+		byName[f["table"].(string)] = f["replicated"] == "true"
 	}
 	if byName["scratch"] || !byName["shared"] {
 		t.Fatalf("flags after set: %+v", flags)
 	}
-	if err := db.SetTableReplicated(ctx, "missing", false); err == nil {
+	if _, err := db.ExecContext(ctx, "MURMUR SET TABLE 'missing' REPLICATED false"); err == nil {
 		t.Fatal("expected unknown-table error")
 	}
 }
@@ -336,7 +337,7 @@ func TestMutualTLS(t *testing.T) {
 	// Plaintext is rejected in production.
 	if _, err := murmur.Open(context.Background(), testConfig(server)); err == nil {
 		t.Fatal("expected plaintext rejection")
-	} else if code := murmur.CodeOf(err); code != "28000" {
+	} else if code := codeOf(err); code != "28000" {
 		t.Fatalf("plaintext code = %q, want 28000 (%v)", code, err)
 	}
 
@@ -376,15 +377,6 @@ func TestConfigValidation(t *testing.T) {
 	}
 }
 
-func TestCodeHelpers(t *testing.T) {
-	if got := murmur.CodeOf(nil); got != "" {
-		t.Fatalf("CodeOf(nil) = %q", got)
-	}
-	if murmur.IsLocked(nil) {
-		t.Fatal("IsLocked(nil) = true")
-	}
-}
-
 func TestBackupSaveListDownload(t *testing.T) {
 	dir := t.TempDir()
 	server := servertest.Start(t, dir, servertest.Options{})
@@ -396,7 +388,11 @@ func TestBackupSaveListDownload(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "INSERT INTO docs VALUES (1, 'saved')"); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	saved, err := db.BackupSave(ctx)
+	var saved struct {
+		Name string
+		Size int64
+	}
+	err := db.QueryRowContext(ctx, "MURMUR BACKUP SAVE").Scan(&saved.Name, &saved.Size)
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -406,22 +402,35 @@ func TestBackupSaveListDownload(t *testing.T) {
 	if saved.Size <= 0 {
 		t.Fatalf("size = %d", saved.Size)
 	}
-	files, err := db.BackupList(ctx)
+	files, err := sqlRows(ctx, db, "MURMUR BACKUP LIST")
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	if len(files) != 1 || files[0].Name != saved.Name || files[0].Size != saved.Size {
+	if len(files) != 1 || files[0]["name"].(string) != saved.Name || files[0]["size"].(int64) != saved.Size {
 		t.Fatalf("list = %+v", files)
 	}
-	if !strings.HasSuffix(files[0].Modified, "Z") {
-		t.Fatalf("modified = %q", files[0].Modified)
+	if !strings.HasSuffix(files[0]["modified"].(string), "Z") {
+		t.Fatalf("modified = %q", files[0]["modified"].(string))
 	}
 	var downloaded bytes.Buffer
-	if err := db.BackupDownload(ctx, saved.Name, &downloaded); err != nil {
-		t.Fatalf("download: %v", err)
-	}
-	if err := db.BackupDownload(ctx, saved.Name, shortBackupWriter{}); err != io.ErrShortWrite {
-		t.Fatalf("short writer: got %v, want %v", err, io.ErrShortWrite)
+	for offset := int64(0); ; {
+		var actual, total int64
+		var chunk []byte
+		query := fmt.Sprintf("MURMUR BACKUP DOWNLOAD '%s' OFFSET %d LIMIT 1048576", saved.Name, offset)
+		if err := db.QueryRowContext(ctx, query).Scan(&actual, &total, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		if actual != offset {
+			t.Fatalf("offset %d, want %d", actual, offset)
+		}
+		downloaded.Write(chunk)
+		offset += int64(len(chunk))
+		if offset >= total {
+			break
+		}
+		if len(chunk) == 0 {
+			t.Fatal("empty nonfinal chunk")
+		}
 	}
 	onDisk, err := os.ReadFile(filepath.Join(dir, "backups", saved.Name))
 	if err != nil {
@@ -430,10 +439,10 @@ func TestBackupSaveListDownload(t *testing.T) {
 	if !bytes.Equal(downloaded.Bytes(), onDisk) {
 		t.Fatalf("downloaded %d bytes, file has %d", downloaded.Len(), len(onDisk))
 	}
-	if err := db.BackupDownload(ctx, "absent.murmur-backup", io.Discard); err == nil {
+	if _, err := db.ExecContext(ctx, "MURMUR BACKUP DOWNLOAD 'absent.murmur-backup'"); err == nil {
 		t.Fatal("expected missing-file error")
-	} else if murmur.CodeOf(err) != "58P01" {
-		t.Fatalf("code = %q", murmur.CodeOf(err))
+	} else if codeOf(err) != "58P01" {
+		t.Fatalf("code = %q", codeOf(err))
 	}
 }
 
@@ -449,23 +458,48 @@ func TestBackupUploadRoundtrip(t *testing.T) {
 	for i := range payload {
 		payload[i] = byte(i % 251)
 	}
-	if err := db.BackupUpload(ctx, "big.murmur-backup", bytes.NewReader(payload)); err != nil {
-		t.Fatalf("upload: %v", err)
+	if _, err := db.ExecContext(ctx, "MURMUR BACKUP UPLOAD BEGIN 'big.murmur-backup'"); err != nil {
+		t.Fatal(err)
 	}
-	var downloaded bytes.Buffer
-	if err := db.BackupDownload(ctx, "big.murmur-backup", &downloaded); err != nil {
-		t.Fatalf("download: %v", err)
+	for offset := 0; offset < len(payload); offset += 256 << 10 {
+		end := min(offset+(256<<10), len(payload))
+		query := "MURMUR BACKUP UPLOAD APPEND 'big.murmur-backup' '" + base64.StdEncoding.EncodeToString(payload[offset:end]) + "'"
+		if _, err := db.ExecContext(ctx, query); err != nil {
+			t.Fatal(err)
+		}
 	}
-	if !bytes.Equal(downloaded.Bytes(), payload) {
+	if _, err := db.ExecContext(ctx, "MURMUR BACKUP UPLOAD FINISH 'big.murmur-backup'"); err != nil {
+		t.Fatal(err)
+	}
+	var downloaded []byte
+	for offset := int64(0); ; {
+		var actual, total int64
+		var chunk []byte
+		query := fmt.Sprintf("MURMUR BACKUP DOWNLOAD 'big.murmur-backup' OFFSET %d LIMIT 131072", offset)
+		if err := db.QueryRowContext(ctx, query).Scan(&actual, &total, &chunk); err != nil {
+			t.Fatal(err)
+		}
+		if actual != offset {
+			t.Fatalf("offset %d, want %d", actual, offset)
+		}
+		downloaded = append(downloaded, chunk...)
+		offset += int64(len(chunk))
+		if offset >= total {
+			break
+		}
+		if len(chunk) == 0 {
+			t.Fatal("empty nonfinal chunk")
+		}
+	}
+	if !bytes.Equal(downloaded, payload) {
 		t.Fatal("roundtrip mismatch")
 	}
-	// Client-side name validation fails before any SQL is sent.
 	for _, bad := range []string{"", "../evil.murmur-backup", ".hidden", "a b"} {
-		if err := db.BackupUpload(ctx, bad, bytes.NewReader(payload)); err == nil {
-			t.Fatalf("%q: expected name error", bad)
-		}
-		if err := db.BackupDownload(ctx, bad, io.Discard); err == nil {
-			t.Fatalf("%q: expected name error", bad)
+		for _, verb := range []string{"UPLOAD BEGIN", "DOWNLOAD"} {
+			query := "MURMUR BACKUP " + verb + " '" + strings.ReplaceAll(bad, "'", "''") + "'"
+			if _, err := db.ExecContext(ctx, query); codeOf(err) != "22023" {
+				t.Fatalf("%s: %v", query, err)
+			}
 		}
 	}
 }
@@ -481,7 +515,11 @@ func TestRestoreCycle(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "INSERT INTO docs VALUES (1, 'before')"); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	saved, err := db.BackupSave(ctx)
+	var saved struct {
+		Name string
+		Size int64
+	}
+	err := db.QueryRowContext(ctx, "MURMUR BACKUP SAVE").Scan(&saved.Name, &saved.Size)
 	if err != nil {
 		t.Fatalf("save: %v", err)
 	}
@@ -489,12 +527,12 @@ func TestRestoreCycle(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 	// Wrong key first: the live data must survive.
-	if err := db.Restore(ctx, saved.Name, "wrong-key"); err == nil {
+	if _, err := db.ExecContext(ctx, "MURMUR RESTORE FROM "+"'"+strings.ReplaceAll(saved.Name, "'", "''")+"'"+" KEY 'wrong-key'"); err == nil {
 		t.Fatal("expected wrong-key failure")
-	} else if murmur.CodeOf(err) != "28000" {
-		t.Fatalf("code = %q", murmur.CodeOf(err))
+	} else if codeOf(err) != "28000" {
+		t.Fatalf("code = %q", codeOf(err))
 	}
-	if err := db.Restore(ctx, saved.Name, testKey); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR RESTORE FROM "+"'"+strings.ReplaceAll(saved.Name, "'", "''")+"'"+" KEY "+"'"+strings.ReplaceAll(testKey, "'", "''")+"'"); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	rows, err := db.QueryContext(ctx, "SELECT v FROM docs ORDER BY id")
@@ -530,16 +568,16 @@ func TestRotateKey(t *testing.T) {
 		t.Fatalf("insert: %v", err)
 	}
 	const newKey = "rotated-go-key"
-	if err := db.RotateKey(ctx, testKey, newKey); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR ROTATE KEY "+"'"+strings.ReplaceAll(testKey, "'", "''")+"'"+" "+"'"+strings.ReplaceAll(newKey, "'", "''")+"'"); err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
 	// Wrong previous key and identical keys fail; the rotation above stands.
-	if err := db.RotateKey(ctx, "wrong", "other"); err == nil {
+	if _, err := db.ExecContext(ctx, "MURMUR ROTATE KEY 'wrong' 'other'"); err == nil {
 		t.Fatal("expected wrong-previous failure")
-	} else if murmur.CodeOf(err) != "28000" {
-		t.Fatalf("code = %q", murmur.CodeOf(err))
+	} else if codeOf(err) != "28000" {
+		t.Fatalf("code = %q", codeOf(err))
 	}
-	if err := db.RotateKey(ctx, newKey, newKey); err == nil {
+	if _, err := db.ExecContext(ctx, "MURMUR ROTATE KEY "+"'"+strings.ReplaceAll(newKey, "'", "''")+"'"+" "+"'"+strings.ReplaceAll(newKey, "'", "''")+"'"); err == nil {
 		t.Fatal("expected identical-keys failure")
 	}
 	db.Close()
@@ -571,7 +609,7 @@ func TestManagedReplicationKeys(t *testing.T) {
 	if _, err := db.ExecContext(ctx, "INSERT INTO identities VALUES($1,$2,$3)", "a", "app-uuid", "local"); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.SetTableReplicated(ctx, "identities", true); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR SET TABLE 'identities' REPLICATED true"); err != nil {
 		t.Fatal(err)
 	}
 	var first string
@@ -595,11 +633,11 @@ func TestManagedReplicationKeys(t *testing.T) {
 		{"INSERT INTO identities(tenant,id) VALUES('c',NULL)", "23502"},
 		{"INSERT INTO identities(tenant,id) VALUES('a','app-uuid')", "23505"},
 	} {
-		if _, err := db.ExecContext(ctx, tc.sql); murmur.CodeOf(err) != tc.code {
-			t.Errorf("%s: code %q, want %q: %v", tc.sql, murmur.CodeOf(err), tc.code, err)
+		if _, err := db.ExecContext(ctx, tc.sql); codeOf(err) != tc.code {
+			t.Errorf("%s: code %q, want %q: %v", tc.sql, codeOf(err), tc.code, err)
 		}
 	}
-	if err := db.Flush(ctx); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 		t.Fatal(err)
 	}
 	db.Close()
@@ -610,7 +648,7 @@ func TestManagedReplicationKeys(t *testing.T) {
 	if err := db2.QueryRowContext(ctx, "SELECT id_murmur_primary_key FROM identities WHERE tenant='a'").Scan(&recovered); err != nil || recovered != first {
 		t.Fatalf("recovered %q, want %q: %v", recovered, first, err)
 	}
-	if err := db2.SetTableReplicated(ctx, "identities", false); err != nil {
+	if _, err := db2.ExecContext(ctx, "MURMUR SET TABLE 'identities' REPLICATED false"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := db2.ExecContext(ctx, "UPDATE identities SET id='managed-by-app' WHERE tenant='a'"); err != nil {
@@ -624,7 +662,7 @@ func TestMetrics(t *testing.T) {
 	db := open(t, testConfig(server))
 	ctx := context.Background()
 
-	metrics, err := db.Metrics(ctx)
+	metrics, err := sqlRows(ctx, db, "MURMUR SHOW METRICS")
 	if err != nil {
 		t.Fatalf("Metrics: %v", err)
 	}
@@ -633,13 +671,13 @@ func TestMetrics(t *testing.T) {
 	}
 	subsystems := map[string]bool{}
 	for _, m := range metrics {
-		subsystems[m.Subsystem] = true
+		subsystems[m["subsystem"].(string)] = true
 	}
 	if !subsystems["sqlite"] || !subsystems["spool"] {
 		t.Fatalf("expected both sqlite and spool subsystems, got: %v", subsystems)
 	}
 
-	sqliteMetrics, err := db.Metrics(ctx, "sqlite")
+	sqliteMetrics, err := sqlRows(ctx, db, "MURMUR SHOW METRICS SQLITE")
 	if err != nil {
 		t.Fatalf("Metrics(sqlite): %v", err)
 	}
@@ -647,12 +685,12 @@ func TestMetrics(t *testing.T) {
 		t.Fatal("expected sqlite metrics")
 	}
 	for _, m := range sqliteMetrics {
-		if m.Subsystem != "sqlite" {
-			t.Fatalf("expected subsystem sqlite, got %s", m.Subsystem)
+		if m["subsystem"].(string) != "sqlite" {
+			t.Fatalf("expected subsystem sqlite, got %s", m["subsystem"].(string))
 		}
 	}
 
-	spoolMetrics, err := db.Metrics(ctx, "spool")
+	spoolMetrics, err := sqlRows(ctx, db, "MURMUR SHOW METRICS SPOOL")
 	if err != nil {
 		t.Fatalf("Metrics(spool): %v", err)
 	}
@@ -660,19 +698,14 @@ func TestMetrics(t *testing.T) {
 		t.Fatal("expected spool metrics")
 	}
 	for _, m := range spoolMetrics {
-		if m.Subsystem != "spool" {
-			t.Fatalf("expected subsystem spool, got %s", m.Subsystem)
+		if m["subsystem"].(string) != "spool" {
+			t.Fatalf("expected subsystem spool, got %s", m["subsystem"].(string))
 		}
 	}
 
-	if _, err := db.Metrics(ctx, "invalid"); err == nil {
+	if _, err := sqlRows(ctx, db, "MURMUR SHOW METRICS INVALID"); err == nil {
 		t.Fatal("expected error for invalid scope")
-	} else if murmur.CodeOf(err) != "42601" {
-		t.Fatalf("got code %q, want 42601", murmur.CodeOf(err))
+	} else if codeOf(err) != "42601" {
+		t.Fatalf("got code %q, want 42601", codeOf(err))
 	}
 }
-
-// shortBackupWriter models a destination that accepts only part of a chunk.
-type shortBackupWriter struct{}
-
-func (shortBackupWriter) Write(p []byte) (int, error) { return len(p) / 2, nil }

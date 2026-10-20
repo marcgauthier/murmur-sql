@@ -2,16 +2,15 @@ package murmur_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
-	"math"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	murmur "github.com/marcgauthier/murmur/clients/go"
-	"github.com/marcgauthier/murmur/clients/go/internal/servertest"
+	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
 )
 
 func TestReplicationCommandsNeedEnabledReplication(t *testing.T) {
@@ -19,64 +18,28 @@ func TestReplicationCommandsNeedEnabledReplication(t *testing.T) {
 	server := servertest.Start(t, dir, servertest.Options{})
 	db := open(t, testConfig(server))
 	ctx := context.Background()
-	cases := map[string]error{}
-	var err error
-	_, err = db.ShowPeers(ctx)
-	cases["peers"] = err
-	_, err = db.ShowReplication(ctx)
-	cases["replication"] = err
-	_, err = db.ShowRetention(ctx)
-	cases["retention"] = err
-	_, err = db.RetentionCollect(ctx)
-	cases["collect"] = err
-	cases["sync"] = db.PeerSync(ctx)
-	cases["add"] = db.PeerAdd(ctx, "127.0.0.1:9")
-	cases["counter"] = db.PolicyCounterAdd(ctx, "t", "c", "k", 1)
-	_, err = db.BridgeRelease(ctx, "t", "k")
-	cases["release-row"] = err
-	_, err = db.BridgeRelease(ctx, "t", "k", "c")
-	cases["release-field"] = err
-	for name, err := range cases {
-		if err == nil {
-			t.Fatalf("%s: expected 55000 failure", name)
+	for _, query := range []string{
+		"MURMUR SHOW PEERS", "MURMUR SHOW REPLICATION", "MURMUR SHOW RETENTION",
+		"MURMUR RETENTION COLLECT", "MURMUR PEER SYNC", "MURMUR PEER ADD '127.0.0.1:9'",
+		"MURMUR POLICY COUNTER_ADD t c 'k' 1", "MURMUR BRIDGE RELEASE t 'k'",
+		"MURMUR BRIDGE RELEASE t 'k' COLUMN c",
+	} {
+		_, err := db.ExecContext(ctx, query)
+		if codeOf(err) != "55000" {
+			t.Fatalf("%s: expected 55000, got %v", query, err)
 		}
-		if code := murmur.CodeOf(err); code != "55000" {
-			t.Fatalf("%s: code = %q, want 55000 (%v)", name, code, err)
-		}
-	}
-	// Client-side validation fails before any SQL is sent.
-	if err := db.PeerAdd(ctx, "not-an-addr"); err == nil {
-		t.Fatal("PeerAdd(bogus): expected validation error")
-	}
-	if err := db.PeerRemove(ctx, "short"); err == nil {
-		t.Fatal("PeerRemove(short): expected validation error")
-	}
-	if err := db.PolicyMax(ctx, "s", "c", "k", math.NaN()); err == nil {
-		t.Fatal("PolicyMax(NaN): expected validation error")
-	}
-	if err := db.PolicyMin(ctx, "", "c", "k", 1); err == nil {
-		t.Fatal("PolicyMin(empty table): expected validation error")
-	}
-	if _, err := db.BridgeRelease(ctx, "", "k"); err == nil {
-		t.Fatal("BridgeRelease(empty table): expected validation error")
-	}
-	if _, err := db.BridgeRelease(ctx, "t", "k", " "); err == nil {
-		t.Fatal("BridgeRelease(empty column): expected validation error")
-	}
-	if _, err := db.BridgeRelease(ctx, "t", "k", "a", "b"); err == nil {
-		t.Fatal("BridgeRelease(two columns): expected validation error")
 	}
 	// Server-side usage errors surface before the replication gate.
-	if _, err := db.ExecContext(ctx, "MURMUR PEER ADD 'bogus'"); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("raw bad address: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := db.ExecContext(ctx, "MURMUR PEER ADD 'bogus'"); codeOf(err) != "22023" {
+		t.Fatalf("raw bad address: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
 }
 
-func meshDBs(t *testing.T, dirs []string, replicationTOML string) ([]*servertest.Server, []*murmur.DB, []servertest.Options) {
+func meshDBs(t *testing.T, dirs []string, replicationTOML string) ([]*servertest.Server, []*sql.DB, []servertest.Options) {
 	t.Helper()
 	opts := servertest.MeshOptions(t, dirs, replicationTOML)
 	servers := make([]*servertest.Server, len(dirs))
-	dbs := make([]*murmur.DB, len(dirs))
+	dbs := make([]*sql.DB, len(dirs))
 	for i, dir := range dirs {
 		servers[i] = servertest.Start(t, dir, opts[i])
 		cfg := testConfig(servers[i])
@@ -97,35 +60,35 @@ func TestPeerMeshShowAndRetention(t *testing.T) {
 	}
 	_, dbs, opts := meshDBs(t, dirs, "")
 	node0, node1 := opts[0].NodeID, opts[1].NodeID
-	status, err := dbs[0].ShowReplication(ctx)
+	status, err := sqlRows(ctx, dbs[0], "MURMUR SHOW REPLICATION")
 	if err != nil {
 		t.Fatalf("status: %v", err)
 	}
-	if !status.Running || status.Peers != 0 {
+	if (len(status) != 1 || status[0]["running"] != "true") || status[0]["peers"].(int64) != 0 {
 		t.Fatalf("status = %+v, want running with 0 peers", status)
 	}
-	peerStatus, err := dbs[1].ShowReplication(ctx)
-	if err != nil || peerStatus.Address == nil {
+	peerStatus, err := sqlRows(ctx, dbs[1], "MURMUR SHOW REPLICATION")
+	if err != nil || (len(peerStatus) != 1 || peerStatus[0]["address"] == nil) {
 		t.Fatalf("peer status = %+v, %v", peerStatus, err)
 	}
-	if peers, err := dbs[0].ShowPeers(ctx); err != nil || len(peers) != 0 {
+	if peers, err := sqlRows(ctx, dbs[0], "MURMUR SHOW PEERS"); err != nil || len(peers) != 0 {
 		t.Fatalf("peers = %+v, %v", peers, err)
 	}
 
-	if err := dbs[0].PeerAdd(ctx, *peerStatus.Address); err != nil {
+	if _, err := dbs[0].ExecContext(ctx, "MURMUR PEER ADD "+"'"+strings.ReplaceAll(peerStatus[0]["address"].(string), "'", "''")+"'"); err != nil {
 		t.Fatalf("add: %v", err)
 	}
 	deadline := time.Now().Add(30 * time.Second)
 	for {
-		peers, err := dbs[0].ShowPeers(ctx)
+		peers, err := sqlRows(ctx, dbs[0], "MURMUR SHOW PEERS")
 		if err != nil {
 			t.Fatalf("peers: %v", err)
 		}
 		connected := false
 		for _, p := range peers {
-			if p.NodeID == node1 && p.Connected {
+			if p["node_id"].(string) == node1 && p["connected"] == "true" {
 				connected = true
-				if p.SentWatermark < 0 {
+				if p["sent_watermark"].(int64) < 0 {
 					t.Fatalf("peer = %+v", p)
 				}
 			}
@@ -138,46 +101,47 @@ func TestPeerMeshShowAndRetention(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	if err := dbs[0].PeerSync(ctx); err != nil {
+	if _, err := dbs[0].ExecContext(ctx, "MURMUR PEER SYNC"); err != nil {
 		t.Fatalf("sync: %v", err)
 	}
-	if status, err := dbs[0].ShowReplication(ctx); err != nil || status.Peers < 1 {
+	if status, err := sqlRows(ctx, dbs[0], "MURMUR SHOW REPLICATION"); err != nil || status[0]["peers"].(int64) < 1 {
 		t.Fatalf("status = %+v, %v", status, err)
 	}
-	if collected, err := dbs[0].RetentionCollect(ctx); err != nil || collected < 0 {
+	var collected int64
+	if err := dbs[0].QueryRowContext(ctx, "MURMUR RETENTION COLLECT").Scan(&collected); err != nil || collected < 0 {
 		t.Fatalf("collect = %d, %v", collected, err)
 	}
-	entries, err := dbs[0].ShowRetention(ctx)
+	entries, err := sqlRows(ctx, dbs[0], "MURMUR SHOW RETENTION")
 	if err != nil {
 		t.Fatalf("retention: %v", err)
 	}
 	for _, e := range entries {
-		if len(e.NodeID) != 32 || e.CollectedTransactions < 0 {
+		if len(e["node_id"].(string)) != 32 || e["collected_transactions"].(int64) < 0 {
 			t.Fatalf("entry = %+v", e)
 		}
 	}
 
-	if err := dbs[0].PeerRemove(ctx, node1); err != nil {
+	if _, err := dbs[0].ExecContext(ctx, "MURMUR PEER REMOVE "+"'"+strings.ReplaceAll(node1, "'", "''")+"'"); err != nil {
 		t.Fatalf("remove: %v", err)
 	}
-	if err := dbs[0].PeerRetire(ctx, node1); err != nil {
+	if _, err := dbs[0].ExecContext(ctx, "MURMUR PEER RETIRE "+"'"+strings.ReplaceAll(node1, "'", "''")+"'"); err != nil {
 		t.Fatalf("retire: %v", err)
 	}
-	entries, err = dbs[0].ShowRetention(ctx)
+	entries, err = sqlRows(ctx, dbs[0], "MURMUR SHOW RETENTION")
 	if err != nil {
 		t.Fatalf("retention: %v", err)
 	}
 	retired := false
 	for _, e := range entries {
-		if e.NodeID == node1 && e.Retired {
+		if e["node_id"].(string) == node1 && e["retired"] == "true" {
 			retired = true
 		}
 	}
 	if !retired {
 		t.Fatalf("retired peer missing from retention: %+v", entries)
 	}
-	if err := dbs[0].PeerRetire(ctx, node0); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("self-retire: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := dbs[0].ExecContext(ctx, "MURMUR PEER RETIRE "+"'"+strings.ReplaceAll(node0, "'", "''")+"'"); codeOf(err) != "22023" {
+		t.Fatalf("self-retire: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
 }
 
@@ -196,22 +160,22 @@ func TestPolicyOperations(t *testing.T) {
 		"row-1", 10, 5, 2.5); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := db.PolicyCounterAdd(ctx, "stats", "count", "row-1", 5); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'stats' 'count' 'row-1' 5"); err != nil {
 		t.Fatalf("counter: %v", err)
 	}
-	if err := db.PolicySetAdd(ctx, "stats", "tags", "row-1", "blue"); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY SET_ADD 'stats' 'tags' 'row-1' 'blue'"); err != nil {
 		t.Fatalf("set add: %v", err)
 	}
-	if err := db.PolicySetRemove(ctx, "stats", "tags", "row-1", "blue"); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY SET_REMOVE 'stats' 'tags' 'row-1' 'blue'"); err != nil {
 		t.Fatalf("set remove: %v", err)
 	}
-	if err := db.PolicyMax(ctx, "stats", "highest", "row-1", 42); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY MAX 'stats' 'highest' 'row-1' 42"); err != nil {
 		t.Fatalf("max: %v", err)
 	}
-	if err := db.PolicyMax(ctx, "stats", "highest", "row-1", 1); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY MAX 'stats' 'highest' 'row-1' 1"); err != nil {
 		t.Fatalf("max: %v", err)
 	}
-	if err := db.PolicyMin(ctx, "stats", "lowest", "row-1", -1.5); err != nil {
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY MIN 'stats' 'lowest' 'row-1' -1.5"); err != nil {
 		t.Fatalf("min: %v", err)
 	}
 	var count, highest int64
@@ -223,11 +187,11 @@ func TestPolicyOperations(t *testing.T) {
 	if count != 15 || highest != 42 || lowest != -1.5 {
 		t.Fatalf("got %d/%d/%v, want 15/42/-1.5", count, highest, lowest)
 	}
-	if err := db.PolicyCounterAdd(ctx, "stats", "highest", "row-1", 1); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("mismatch: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'stats' 'highest' 'row-1' 1"); codeOf(err) != "22023" {
+		t.Fatalf("mismatch: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
-	if err := db.PolicyCounterAdd(ctx, "stats", "count", "missing", 1); murmur.CodeOf(err) != "02000" {
-		t.Fatalf("missing: code = %q, want 02000 (%v)", murmur.CodeOf(err), err)
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'stats' 'count' 'missing' 1"); codeOf(err) != "02000" {
+		t.Fatalf("missing: code = %q, want 02000 (%v)", codeOf(err), err)
 	}
 }
 
@@ -259,36 +223,37 @@ func TestBridgeRelease(t *testing.T) {
 	if _, err := high.ExecContext(ctx, "INSERT INTO notes VALUES ($1, $2)", "r1", "v1"); err != nil {
 		t.Fatalf("insert: %v", err)
 	}
-	if err := high.Flush(ctx); err != nil {
+	if _, err := high.ExecContext(ctx, "MURMUR FLUSH"); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
 	// The High write above claimed ownership of title; the first release
 	// reports true and a second finds nothing owned.
-	released, err := high.BridgeRelease(ctx, "notes", "r1", "title")
+	var released bool
+	err := high.QueryRowContext(ctx, "MURMUR BRIDGE RELEASE notes 'r1' COLUMN title").Scan(&released)
 	if err != nil || !released {
 		t.Fatalf("release: released=%v, err=%v", released, err)
 	}
-	if _, err := high.BridgeRelease(ctx, "notes", "r1", "title"); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("re-release: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := high.ExecContext(ctx, "MURMUR BRIDGE RELEASE notes 'r1' COLUMN title"); codeOf(err) != "22023" {
+		t.Fatalf("re-release: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
 	// Row release without COLUMN addresses whole-row ownership, which a
 	// plain insert never creates.
-	if _, err := high.BridgeRelease(ctx, "notes", "r1"); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("row release: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := high.ExecContext(ctx, "MURMUR BRIDGE RELEASE notes 'r1'"); codeOf(err) != "22023" {
+		t.Fatalf("row release: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
-	if _, err := high.BridgeRelease(ctx, "missing", "r1", "title"); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("unknown table: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := high.ExecContext(ctx, "MURMUR BRIDGE RELEASE missing 'r1' COLUMN title"); codeOf(err) != "22023" {
+		t.Fatalf("unknown table: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
-	if _, err := high.BridgeRelease(ctx, "notes", "r1", "missing"); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("unknown column: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := high.ExecContext(ctx, "MURMUR BRIDGE RELEASE notes 'r1' COLUMN missing"); codeOf(err) != "22023" {
+		t.Fatalf("unknown column: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
 
 	// Replication without a bridge is gated with 55000.
 	plainDir := t.TempDir()
 	plainOpts := servertest.MeshOptions(t, []string{plainDir}, "")
 	plain := open(t, testConfig(servertest.Start(t, plainDir, plainOpts[0])))
-	if _, err := plain.BridgeRelease(ctx, "t", "k"); murmur.CodeOf(err) != "55000" {
-		t.Fatalf("no bridge: code = %q, want 55000 (%v)", murmur.CodeOf(err), err)
+	if _, err := plain.ExecContext(ctx, "MURMUR BRIDGE RELEASE t 'k'"); codeOf(err) != "55000" {
+		t.Fatalf("no bridge: code = %q, want 55000 (%v)", codeOf(err), err)
 	}
 
 	// A Low exporter rejects even a well-formed address with 22023.
@@ -300,7 +265,7 @@ func TestBridgeRelease(t *testing.T) {
 	if _, err := low.ExecContext(ctx, "CREATE TABLE notes(name TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL)"); err != nil {
 		t.Fatalf("low create: %v", err)
 	}
-	if _, err := low.BridgeRelease(ctx, "notes", "r1", "title"); murmur.CodeOf(err) != "22023" {
-		t.Fatalf("exporter: code = %q, want 22023 (%v)", murmur.CodeOf(err), err)
+	if _, err := low.ExecContext(ctx, "MURMUR BRIDGE RELEASE notes 'r1' COLUMN title"); codeOf(err) != "22023" {
+		t.Fatalf("exporter: code = %q, want 22023 (%v)", codeOf(err), err)
 	}
 }
