@@ -73,7 +73,7 @@ async fn migrate_all(cluster: &Cluster) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
@@ -91,7 +91,7 @@ async fn insert_row(cluster: &Cluster, idx: usize, name: &str) -> Result<(), Str
         .map_err(|e| format!("node{} typed insert failed: {e}", idx + 1))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after typed insert: {e}", idx + 1))?;
     Ok(())
@@ -177,7 +177,7 @@ async fn policy(cluster: &Cluster, idx: usize, op: &str) -> Result<(), String> {
         .map_err(|e| format!("node{} {op}: {e}", idx + 1))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after {op}: {e}", idx + 1))?;
     Ok(())

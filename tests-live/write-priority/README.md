@@ -1,52 +1,35 @@
-# write-priority (Rust port)
+# write-priority
 
-Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/write-priority/`
-(`write_priority_test.go`, `TestLocalWritePriority`).
+Concurrent SQL writers on both nodes compete with incoming replication while
+reads continue. Each writer has an independent Rust-client connection and uses
+atomic 25-row statements over a bounded owned range, updating those rows to
+keep state bounded while maintaining engine contention. The test checks
+minimum progress, then reads engine scheduler
+counters through SQL: at least one second of dual-contention service must be
+observed before enforcing the maximum 25% remote-service share. Every
+acknowledged row must subsequently converge exactly.
 
-## What it proves
+`MURMUR_LIVE_WRITE_PRIORITY_SECONDS` defaults to 12 seconds;
+`MURMUR_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS` defaults to 120 seconds.
 
-Two nodes take continuous writes on both nodes (dense writers with
-disjoint 16-byte row-ID ranges) while serving reads, under full-mesh
-replication. The test gates on local progress, the replication share of
-dual-contention writer service, and convergence.
+All database operations use explicit SQL through `clients/rust` against live
+`murmur-server` child processes. Schema setup explicitly enables table
+replication; missing settings never implicitly enable it. Peer topology uses
+`MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use
+`MURMUR SHOW STATUS`. No embedded database handles are linked or opened.
 
-## Env knobs
+Run from the repository root:
 
-- `MURMUR_LIVE_WRITE_PRIORITY_SECONDS` (default 12): write-phase duration.
-- `MURMUR_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS` (default 120):
-  convergence deadline after writes stop.
+```sh
+tests-live/run.sh write-priority
+```
 
-## Pass criteria
+Use `MURMUR_SERVER_BIN` (and optionally `MURMUR_ADMIN_BIN`) to reuse prebuilt
+replication-enabled binaries. Success prints `RESULT: PASS`; failure retains
+runtime artifacts for inspection. Full-duration runs are required for soak
+qualification; a compile check or short smoke run does not establish it.
 
-1. Local progress: at least 80 rows written and 4 reads served.
-2. Priority: the replication share of dual-contention writer service
-   (granted while the other interactive class had waiters) is at most
-   25%, with at least 1s of dual service measured. The scheduler
-   targets 90/10 local/remote with a 1s debt bound; the gate leaves
-   headroom above the 10% target.
-3. Convergence: identical row counts and identical row sets on both
-   nodes after writes stop.
-
-## Deviations from the Go original
-
-- Plain SQL (`records(id TEXT NOT NULL PRIMARY KEY, name TEXT)` via
-  `Database::transaction`/`read` + `flush`) replaces the typed-contention
-  HTTP API; one transaction per insert, as in Go. Same key shapes
-  (16-byte node/worker/seq row IDs, `v-n<node>-w<worker>-<seq>` names).
-- Scheduler assertions read the in-process
-  `Database::scheduler().snapshot()` dual-service counters
-  (`local`/`remote.dual_service_nanos`) instead of scraping Prometheus
-  `/metrics`. The port follows the Go README's dual-*service* gate
-  (share <= 25%, >= 1s measured): the Rust product exposes
-  `dual_service_nanos` but no dual-grants counter, so the
-  `write_priority_test.go` dual-grants variant (share of
-  `spedsql_sched_dual_grants_total`, >= 100 grants) has no in-process
-  equivalent.
-- 64 OS-thread writers per node instead of 256 goroutines per node;
-  still enough looping writers to keep both scheduler classes
-  backlogged, where the 90/10 policy binds.
-- Convergence compares the full sorted row sets for equality (strictly
-  stronger than the Go SHA-256-over-rows hash) and requires both nodes
-  to hold the full set; no new hash dependency.
-- In-process `Cluster` nodes instead of `testnode` daemons; forensics via
-  `dump_forensics` on failure.
+Current SQL validation fails the remote-service share assertion. One run
+measured 1.057 seconds of remote dual-contention service and zero local
+dual-contention service. The assertion is retained; this scenario is not
+currently a passing release check, and the cause requires investigation.

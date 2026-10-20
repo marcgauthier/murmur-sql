@@ -22,8 +22,8 @@ async fn skewed_clocks_resolve_identical_winners() {
             .simple("CREATE TABLE IF NOT EXISTS skew(id TEXT NOT NULL PRIMARY KEY, val TEXT NOT NULL)")
             .await
             .unwrap();
-        client.set_table_replicated("skew", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE skew REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Phase 1: Concurrent same-key writes on node 0 and node 1
@@ -37,7 +37,7 @@ async fn skewed_clocks_resolve_identical_winners() {
                 .await
                 .unwrap();
         }
-        client.flush().await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     };
 
     let write_node1 = async {
@@ -50,7 +50,7 @@ async fn skewed_clocks_resolve_identical_winners() {
                 .await
                 .unwrap();
         }
-        client.flush().await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     };
 
     tokio::join!(write_node0, write_node1);
@@ -82,7 +82,7 @@ async fn skewed_clocks_resolve_identical_winners() {
             .unwrap();
         expected_updated.push(vec![id, val]);
     }
-    client2.flush().await.unwrap();
+    client2.simple("MURMUR FLUSH").await.unwrap();
 
     // Verify all 3 nodes converge to node 2's later writes
     assert_rows(

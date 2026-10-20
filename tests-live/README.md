@@ -27,16 +27,20 @@ Therefore Rust ports are **multi-process integration tests**:
 - Stop/restart/kill act on the child directly (`stop_node`, `start_node`,
   `kill_node`); unix-only `suspend_node`/`resume_node` (SIGSTOP/SIGCONT)
   cover pause legs on the classic harness. No fixture binary is needed.
-- Tests are `async` and speak SQL plus `MURMUR ...` over the wire. Two
-  harness packages provide the cluster fixture (section 2): the classic
-  `harness/` drives raw `tokio-postgres` through its `NodeClient`
-  (`execute`/`query`/`simple`/`flush`) with mesh helpers
-  (`add_peer`/`remove_peer`/`retire_peer`/`mesh`/`sync_all`); the
-  `sql-harness/` returns `murmur-client` connections (`clients/rust`;
-  `cluster.node(i)` is a `&Client` with `set_table_replicated`/`flush`/
-  `peer_add`/`policy_*`/file helpers). Both manage the mesh with
-  `MURMUR PEER ...`, `MURMUR SHOW ...`, `MURMUR RETENTION COLLECT`, and
-  `MURMUR POLICY ...`.
+- All 73 scenario packages use `clients/rust` against live `murmur-server`
+  processes. Application data, DDL, settings, diagnostics, backups, and files
+  are exercised with explicit SQL statements, including `MURMUR ...` commands.
+- Two fixture packages remain: `harness/` wraps a Rust client connection with
+  process/fault management and replayable-write retry; `sql-harness/` returns
+  the Rust client directly. Neither links the embedded database or opens data
+  directories. The attack fixture reuses the engine's replication protocol
+  crate only to send hostile QUIC traffic; honest database operations use SQL.
+- Scheduler, persistence, and replication-counter assertions read the existing
+  engine snapshot through `MURMUR SHOW STATUS`. The shell projects that snapshot
+  without implementing engine behavior. `MURMUR SHOW PEERS` verifies topology.
+- The root `live_sql_architecture` test prevents embedded dependencies and
+  transaction closures from returning, requires both harnesses to use the Rust
+  client, and checks that the runner lists every scenario.
 
 ## 2. Exact layout
 
@@ -50,7 +54,7 @@ compile-checks alone without touching product manifests.
   run.sh                       # sequential runner (all/gate/soak/stress/single; port agents NEVER run it)
   .gitignore                   # runtime/ failures/ target/
   harness/                     # classic package `murmur-live-harness` (TODO item 1)
-    Cargo.toml                 # lib only; registry deps (tokio, tokio-postgres, rcgen, ...) + murmur-replication path dep (attacker fixture only)
+    Cargo.toml                 # lib only; registry deps (tokio, rcgen, ...) + murmur-client path dep + murmur-replication path dep (attacker fixture only)
     src/lib.rs                 # re-exports: tokio_postgres, replication (product wire impl), Cluster, ClusterOptions, Error, env_seconds, wait_until(_async)
     src/cluster.rs             # Cluster / Node multi-process management + NodeClient wire wrapper
     src/certs.rs               # rcgen CA + per-node certs (SAN URI replicateddb://node/<hex>)
@@ -97,13 +101,14 @@ via `harness::replication`, never a direct `murmur-replication` dep.
 | `Cluster.DumpForensics` (`/v1/status`, `/v1/debug/peers`, `/metrics`, `/v1/debug/stacks`, 10s bound each, `forensics-<reason>-*` files) | `cluster.dump_forensics(reason).await`: `MURMUR SHOW REPLICATION/PEERS/METRICS` per node (10 s bound each) -> truncated test log + full per-node files; every fetch infallible | harness prereq |
 | Failure artifacts (`runtime/<scenario>/` -> `failures/<ts>-<scenario>/` on fail, else removed; `RESULT: PASS/FAIL` line) | `harness::artifacts`: identical convention under `tests-live/runtime/` and `tests-live/failures/` | harness prereq |
 | Fixture `testnode` binary (HTTPS daemon, `MURMUR_BIN` override, `.tags` freshness rebuild) | **Dropped**: crash/signal legs act on the server children directly (`kill_node`, `suspend_node`/`resume_node`, `node_pid`); `MURMUR_SERVER_BIN` reuses a prebuilt `--features replication` server, else the harness builds once per process | dropped by design |
-| `run.sh` (per-scenario `go test -timeout`, `all`/`gate`/`soak`/`stress` sets, runtime-dir daemon sweep trap, `MURMUR_LIVE_RUNTIME` isolation) | `tests-live/run.sh`: builds server bins, exports `MURMUR_SERVER_BIN`, sequential per-scenario `cargo test --manifest-path`, same set names, server-PID sweep scoped to its runtime dir | harness prereq |
+| `run.sh` (per-scenario `go test -timeout`, `all`/`gate`/`soak`/`stress` sets, runtime-dir daemon sweep trap, `MURMUR_LIVE_RUNTIME` isolation) | `tests-live/run.sh`: reuses `MURMUR_SERVER_BIN` or builds server bins, sequential per-scenario `cargo test --manifest-path`, same set names, server-PID sweep scoped to its runtime dir | harness prereq |
 
 ## 4. Shared harness API sketch
 
 ```rust
 // murmur-live-harness (tests-live/harness/src/lib.rs)
-pub use tokio_postgres; // scenarios use harness::tokio_postgres::{Row, types::ToSql}
+pub use murmur_client;
+pub use murmur_client::tokio_postgres; // wire row/parameter types only
 
 pub enum Dissemination { Gossip, Plumtree }
 pub enum MergePolicy { Lww, Counter, Set, Min, Max }
@@ -152,10 +157,9 @@ pub struct Node {
 
 pub struct NodeClient { /* one unlocked wire connection */ }
 impl NodeClient {
-    pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<u64, tokio_postgres::Error>;
-    pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> Result<Vec<Row>, tokio_postgres::Error>;
-    pub async fn simple(&self, sql: &str) -> Result<Vec<Vec<String>>, tokio_postgres::Error>; // NULL -> ""
-    pub async fn flush(&self) -> Result<(), tokio_postgres::Error>; // MURMUR FLUSH
+    pub async fn execute(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> murmur_client::Result<u64>;
+    pub async fn query(&self, sql: &str, params: &[&(dyn ToSql + Sync)]) -> murmur_client::Result<Vec<Row>>;
+    pub async fn simple(&self, sql: &str) -> murmur_client::Result<Vec<Vec<String>>>; // NULL -> ""
     pub fn inner(&self) -> &tokio_postgres::Client;
 }
 
@@ -397,7 +401,7 @@ use murmur_live_harness::tokio_postgres::types::ToSql; // param refs
   indices first, others get seed `bootstrap` addrs), then full-meshes
   unless `manual_peers`.
 - `cluster.node(i) -> &NodeClient` (panics if stopped: a test bug) with
-  `execute`/`query`/`simple`/`flush`/`inner`; `node_info(i) -> &Node`
+  `execute`/`query`/`simple`/`inner`; `node_info(i) -> &Node`
   (label/dir/data_dir/node_id/repl_addr/sql_addr, also while stopped),
   `node_id(i)`, `node_origin_pubkey(i)`, `node_pid(i)`, `len()`, `name()`,
   `runtime_dir()`, `database_id()`.
@@ -450,3 +454,19 @@ No workspace wiring: the root `Cargo.toml` is untouched; each package checks alo
 `assert_rows`) live in `tests-live/sql-harness/README.md`; `MURMUR ...`
 command syntax lives in `docs/USAGE.md#murmur-commands` and the
 `murmur-client` helper table in `clients/rust/README.md`.
+
+## SQL migration validation
+
+Compile every scenario independently with one shared `CARGO_TARGET_DIR`; use
+`cargo test --no-run --manifest-path tests-live/<scenario>/Cargo.toml`.
+Runtime checks must use `tests-live/run.sh <scenario>` (or `all`, `gate`,
+`soak`, `stress`). Missing scenario manifests are errors rather than skips.
+The runner accepts `MURMUR_SERVER_BIN` and `MURMUR_ADMIN_BIN` for prebuilt
+replication-enabled binaries. A compile sweep does not replace runtime fault
+checks; shortened soak runs do not establish long-duration stability.
+
+The downgrade guard's future-format corruption fixture is generated by a separate
+engine-owned ignored unit-test executable. `run.sh downgrade-guard` builds it
+before the scenario, or reuses `MURMUR_FORMAT_FIXTURE_BIN`. The live scenario
+itself links no engine/Spool implementation and verifies refusal and recovery
+over SQL. This requires the matching fixture test in the sibling engine checkout.

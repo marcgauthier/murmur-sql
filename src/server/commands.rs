@@ -290,12 +290,22 @@ fn show(
     state: &ServerState,
     mut words: std::collections::VecDeque<String>,
 ) -> PgWireResult<CommandOutput> {
-    let usage = "usage: MURMUR SHOW TABLES REPLICATION | MURMUR SHOW COLUMNS FTS | MURMUR SHOW PEERS | MURMUR SHOW REPLICATION | MURMUR SHOW RETENTION | MURMUR SHOW METRICS [SQLITE|SPOOL]";
+    let usage = "usage: MURMUR SHOW TABLES REPLICATION | MURMUR SHOW COLUMNS FTS | MURMUR SHOW PEERS | MURMUR SHOW REPLICATION | MURMUR SHOW RETENTION | MURMUR SHOW STATUS | MURMUR SHOW METRICS [SQLITE|SPOOL]";
     match words.pop_front() {
         Some(w) if w.eq_ignore_ascii_case("TABLES") => show_tables(state, words),
         Some(w) if w.eq_ignore_ascii_case("METRICS") => show_metrics(state, words),
         Some(w) if w.eq_ignore_ascii_case("PEERS") => show_peers(state, words),
         Some(w) if w.eq_ignore_ascii_case("REPLICATION") => show_replication(state, words),
+        Some(w) if w.eq_ignore_ascii_case("STATUS") => {
+            if !words.is_empty() { return Err(user_error("42601", "usage: MURMUR SHOW STATUS".into())); }
+            let snapshot = state.require_db()?.status();
+            let json = serde_json::to_string(&snapshot)
+                .map_err(|e| pgwire::error::PgWireError::ApiError(Box::new(e)))?;
+            Ok(CommandOutput::Rows {
+                columns: vec![crate::server::query::ColInfo { name: "status".into(), decltype: Some("TEXT".into()) }],
+                rows: vec![vec![murmur::Value::Text(json)]],
+            })
+        }
         Some(w) if w.eq_ignore_ascii_case("RETENTION") => show_retention(state, words),
         Some(w) if w.eq_ignore_ascii_case("COLUMNS") => {
             if words.front().is_some_and(|w| w.eq_ignore_ascii_case("VECTOR")) { show_column_vectors(state, words) }
@@ -1297,6 +1307,7 @@ pub(crate) fn describe_columns(
             let sub = words.pop_front()?.to_ascii_uppercase();
             match sub.as_str() {
                 "TABLES" => Some(vec![("table", Type::TEXT), ("replicated", Type::TEXT)]),
+                "STATUS" => Some(vec![("status", Type::TEXT)]),
                 "PEERS" => Some(vec![
                     ("node_id", Type::TEXT),
                     ("address", Type::TEXT),

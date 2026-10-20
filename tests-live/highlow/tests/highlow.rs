@@ -139,7 +139,7 @@ async fn insert_contact(cluster: &Cluster, idx: usize, id: &str, name: &str, sco
     }
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush after contact insert: {e}"))?;
     Ok(())
@@ -157,7 +157,7 @@ async fn rename(cluster: &Cluster, idx: usize, id: &str, name: &str) -> Result<(
     }
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush after contact rename: {e}"))?;
     Ok(())
@@ -175,7 +175,7 @@ async fn set_email(cluster: &Cluster, idx: usize, id: &str, email: &str) -> Resu
     }
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush after email update: {e}"))?;
     Ok(())
@@ -203,7 +203,7 @@ async fn add_score(cluster: &Cluster, idx: usize, id: &str, delta: i64) -> Resul
     }
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush after score update: {e}"))?;
     Ok(())
@@ -264,7 +264,7 @@ async fn migrate(cluster: &Cluster, idx: usize, ddl: &str, label: &str) -> Resul
         .map_err(|e| format!("{label} SET TABLE REPLICATED: {e}"))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("{label} flush after migrate: {e}"))?;
     Ok(())
@@ -1137,7 +1137,7 @@ async fn run_schema_body(
     high.ensure_migrated(0, ADD_EMAIL)
         .await
         .map_err(|e| format!("high ADD_EMAIL migrate failed: {e}"))?;
-    high.node(0).flush().await.map_err(|e| format!("high flush after ADD_EMAIL: {e}"))?;
+    high.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("high flush after ADD_EMAIL: {e}"))?;
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
         if email_of(high, 0, "ann-id").await.as_deref() == Some("a@x") {

@@ -12,9 +12,9 @@ async fn sql_key_rotation_survives_kill_and_rejects_old_key() {
     .await
     .unwrap();
     cluster.node(0).simple("CREATE TABLE records(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO records VALUES(1,'before-rotation')").await.unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     let new_key = "live-new-encryption-key-after-rotation";
-    cluster.node(0).rotate_key(KEY, new_key).await.unwrap();
+    cluster.node(0).simple(&format!("MURMUR ROTATE KEY {} {}",murmur_live_harness::sql_literal(KEY),murmur_live_harness::sql_literal(new_key))).await.unwrap();
     // No graceful shutdown or additional flush after the acknowledged rotation.
     cluster.stop_node(0);
     cluster.set_key(0, new_key);
@@ -39,7 +39,7 @@ async fn sql_key_rotation_survives_kill_and_rejects_old_key() {
         .simple("INSERT INTO records VALUES(2,'after-rotation')")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(0);
     cluster.start_node(0).await.unwrap();
     assert_eq!(

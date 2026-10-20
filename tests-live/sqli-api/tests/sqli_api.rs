@@ -20,7 +20,7 @@ async fn sql_parameters_do_not_execute_injected_statements() {
             .unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -45,7 +45,7 @@ async fn sql_parameters_do_not_execute_injected_statements() {
         );
         expected.push(vec![body.to_string()]);
     }
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &[0, 1],

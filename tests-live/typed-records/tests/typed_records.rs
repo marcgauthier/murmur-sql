@@ -7,7 +7,7 @@ async fn schema(cluster: &Cluster) {
         cluster.node(i).simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, title TEXT NOT NULL, score REAL, payload BLOB, optional TEXT)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -35,7 +35,7 @@ async fn sql_typed_records_replicate_update_delete_and_rebuild_after_restart() {
         .unwrap();
     cluster.node(1).simple("INSERT INTO records(id,title,score,payload,optional) VALUES(2,'second',-2.5,x'', 'present')").await.unwrap();
     for i in 0..3 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     let projection = "SELECT id,title,score,hex(payload),optional FROM records ORDER BY id";
     let expected = vec![
@@ -96,7 +96,7 @@ async fn sql_typed_records_replicate_update_delete_and_rebuild_after_restart() {
         .await
         .unwrap();
     for i in 0..3 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     let final_rows = vec![vec![
         "1".into(),
@@ -106,7 +106,7 @@ async fn sql_typed_records_replicate_update_delete_and_rebuild_after_restart() {
         "".into(),
     ]];
     assert_rows(&cluster, &[0, 1, 2], projection, &final_rows).await;
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(2);
     cluster.start_node(2).await.unwrap();
     assert_rows(&cluster, &[2], projection, &final_rows).await;
@@ -136,7 +136,7 @@ async fn sql_transaction_words_are_noops_and_each_statement_is_atomic() {
         .await
         .unwrap();
     cluster.node(0).simple("BEGIN; INSERT INTO records(id,title) VALUES(2,'kept'); INSERT INTO records(id,title) VALUES(3,'also-kept'); COMMIT").await.unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     // The first row of a failed multi-row statement must not leak into RAM,
     // persistence, or replication when the second row violates a unique key.
     assert!(cluster
@@ -185,19 +185,19 @@ async fn sql_node_local_records_stay_local_and_persist_after_restart() {
             .unwrap();
         assert!(cluster
             .node(i)
-            .table_replication()
+            .simple("MURMUR SHOW TABLES REPLICATION")
             .await
             .unwrap()
             .iter()
-            .any(|f| f.table == "private_records" && !f.replicated));
-        cluster.node(i).flush().await.unwrap();
+            .any(|f| f[0] == "private_records" && f[1] == "false"));
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     cluster
         .node(0)
         .simple("INSERT INTO records(id,title) VALUES(10,'replicated-control')")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &[0, 1],
@@ -237,7 +237,7 @@ async fn sql_replication_rebuilds_populated_keys_and_enforces_immutable_applicat
     cluster.node(0).simple("CREATE TABLE records(tenant TEXT NOT NULL, code INTEGER NOT NULL, body TEXT, PRIMARY KEY(tenant,code)); INSERT INTO records VALUES('one',7,'preserved')").await.unwrap();
     cluster
         .node(0)
-        .set_table_replicated("records", true)
+        .simple("MURMUR SET TABLE records REPLICATED true")
         .await
         .unwrap();
     let first = cluster
@@ -278,7 +278,7 @@ async fn sql_replication_rebuilds_populated_keys_and_enforces_immutable_applicat
     );
     cluster
         .node(0)
-        .set_table_replicated("records", false)
+        .simple("MURMUR SET TABLE records REPLICATED false")
         .await
         .unwrap();
     assert_eq!(
@@ -291,7 +291,7 @@ async fn sql_replication_rebuilds_populated_keys_and_enforces_immutable_applicat
     );
     cluster
         .node(0)
-        .set_table_replicated("records", true)
+        .simple("MURMUR SET TABLE records REPLICATED true")
         .await
         .unwrap();
     assert_eq!(
@@ -302,7 +302,7 @@ async fn sql_replication_rebuilds_populated_keys_and_enforces_immutable_applicat
             .unwrap(),
         first
     );
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(0);
     cluster.start_node(0).await.unwrap();
     assert_eq!(
@@ -315,11 +315,11 @@ async fn sql_replication_rebuilds_populated_keys_and_enforces_immutable_applicat
     );
     assert!(cluster
         .node(0)
-        .table_replication()
+        .simple("MURMUR SHOW TABLES REPLICATION")
         .await
         .unwrap()
         .iter()
-        .any(|f| f.table == "records" && f.replicated));
+        .any(|f| f[0] == "records" && f[1] == "true"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -336,38 +336,40 @@ async fn sql_files_replicate_and_download_through_the_rust_client() {
         .map(|i| ((i * 131 + i / 251) % 256) as u8)
         .collect();
     let name = "typed/file ' unicode 日本語.bin";
-    let metadata = cluster
-        .node(0)
-        .upload_file(name, &payload[..])
-        .await
-        .unwrap();
-    assert_eq!(metadata.size, payload.len() as i64);
+    let client = cluster.node(0);
+    let upload = client.query("MURMUR FILE UPLOAD BEGIN $1", &[&name]).await.unwrap();
+    let token: String = upload[0].get(0);
+    for chunk in payload.chunks(65536) {
+        client.execute("MURMUR FILE UPLOAD APPEND $1 $2", &[&token, &chunk]).await.unwrap();
+    }
+    let metadata = client.query("MURMUR FILE UPLOAD FINISH $1", &[&token]).await.unwrap();
+    assert_eq!(metadata[0].get::<_, i64>(1), payload.len() as i64);
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
-        let files = cluster
-            .node(1)
-            .list_files()
-            .await
-            .unwrap()
-            .collect()
-            .await
-            .unwrap();
-        if files.iter().any(|f| f.name == name) {
-            let mut got = Vec::new();
-            if cluster.node(1).download_file(name, &mut got).await.is_ok() {
-                assert_eq!(got, payload);
-                break;
+        let cursor = cluster.node(1).query("MURMUR FILE LIST", &[]).await.unwrap();
+        let token: String = cursor[0].get(0);
+        let mut found = false;
+        loop {
+            let page = cluster.node(1).query("MURMUR FILE NEXT $1 LIMIT 100", &[&token]).await.unwrap();
+            if page.is_empty() { break; }
+            found |= page.iter().any(|row| row.get::<_, &str>(0) == name);
+        }
+        cluster.node(1).execute("MURMUR FILE CLOSE $1", &[&token]).await.unwrap();
+        if found {
+            match file_bytes(cluster.node(1), name).await {
+                Ok(got) => { assert_eq!(got, payload); break; }
+                Err(error) if error.code() == Some("55000") => {}
+                Err(error) => panic!("SQL file download: {error}"),
             }
         }
         assert!(Instant::now() < deadline, "replicated file did not fetch");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(1);
     cluster.start_node(1).await.unwrap();
-    let mut got = Vec::new();
-    cluster.node(1).download_file(name, &mut got).await.unwrap();
-    assert_eq!(got, payload);
+    assert_eq!(file_bytes(cluster.node(1), name).await.unwrap(), payload);
+
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -386,7 +388,7 @@ async fn sql_concurrent_additive_schema_branches_preserve_both_values() {
         .simple("INSERT INTO records(id,title) VALUES(1,'branched-record')")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &[0, 1],
@@ -395,7 +397,7 @@ async fn sql_concurrent_additive_schema_branches_preserve_both_values() {
     )
     .await;
     for i in 0..2 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
         cluster.set_peers(i, &[]).unwrap();
     }
@@ -415,7 +417,7 @@ async fn sql_concurrent_additive_schema_branches_preserve_both_values() {
         .await
         .is_err());
     for i in 0..2 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
         cluster.set_peers(i, &[1 - i]).unwrap();
     }
@@ -446,7 +448,7 @@ async fn sql_crdt_operations_converge_across_offline_partition() {
         cluster.node(i).simple("CREATE TABLE IF NOT EXISTS policies(name TEXT PRIMARY KEY NOT NULL, counter INTEGER NOT NULL, tags BLOB NOT NULL, peak INTEGER NOT NULL, floor REAL NOT NULL)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("policies", true)
+            .simple("MURMUR SET TABLE policies REPLICATED true")
             .await
             .unwrap();
     }
@@ -462,7 +464,7 @@ async fn sql_crdt_operations_converge_across_offline_partition() {
         .simple("MURMUR POLICY SET_ADD policies tags 'shared' 'seed'")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     let initial = cluster
         .node(0)
         .simple("SELECT name,counter,hex(tags),peak,floor FROM policies")
@@ -476,7 +478,7 @@ async fn sql_crdt_operations_converge_across_offline_partition() {
     )
     .await;
     for i in 0..2 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
         cluster.set_peers(i, &[]).unwrap();
     }
@@ -503,7 +505,7 @@ async fn sql_crdt_operations_converge_across_offline_partition() {
         cluster.node(1).simple(sql).await.unwrap();
     }
     for i in 0..2 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
         cluster.set_peers(i, &[1 - i]).unwrap();
     }
@@ -541,7 +543,7 @@ async fn sql_crdt_operations_converge_across_offline_partition() {
             .is_err(),
         "direct assignment bypassed CRDT policy"
     );
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(1);
     cluster.start_node(1).await.unwrap();
     assert_rows(
@@ -570,7 +572,7 @@ async fn sql_empty_peer_recovers_typed_rows_from_a_retention_snapshot() {
     schema(&cluster).await;
     // Authorize only this source to send snapshots to the empty receiver.
     let source = cluster.node_info(0).node_id.clone();
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(1);
     cluster
         .edit_config(1, |doc| {
@@ -591,7 +593,7 @@ async fn sql_empty_peer_recovers_typed_rows_from_a_retention_snapshot() {
             )
             .await
             .unwrap();
-        cluster.node(0).flush().await.unwrap();
+        cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
         expected.push(vec![id.to_string(), title]);
     }
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -642,7 +644,7 @@ async fn sql_empty_peer_recovers_typed_rows_from_a_retention_snapshot() {
             .unwrap(),
         keys
     );
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(1);
     cluster.start_node(1).await.unwrap();
     assert_rows(
@@ -652,4 +654,26 @@ async fn sql_empty_peer_recovers_typed_rows_from_a_retention_snapshot() {
         &expected,
     )
     .await;
+}
+
+// File handles remain on this Client's one physical SQL connection.
+async fn file_bytes(client: &murmur_client::Client, name: &str) -> murmur_client::Result<Vec<u8>> {
+    let opened = client.query("MURMUR FILE DOWNLOAD $1", &[&name]).await?;
+    let token: String = opened[0].get(0);
+    let result = async {
+        let mut data = Vec::new();
+        loop {
+            let page = client.query("MURMUR FILE DOWNLOAD NEXT $1 LIMIT 65536", &[&token]).await?;
+            let offset: i64 = page[0].get(0);
+            let total: i64 = page[0].get(1);
+            let chunk: &[u8] = page[0].get(2);
+            assert_eq!(offset as usize, data.len());
+            data.extend_from_slice(chunk);
+            let eof: bool = page[0].get(3);
+            if eof { assert_eq!(data.len(), total as usize); return Ok(data); }
+            assert!(!chunk.is_empty());
+        }
+    }.await;
+    client.execute("MURMUR FILE CLOSE $1", &[&token]).await?;
+    result
 }

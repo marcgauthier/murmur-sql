@@ -21,7 +21,7 @@ async fn concurrent_sql_migrations_leave_one_complete_schema_and_all_acknowledge
             .unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -30,7 +30,7 @@ async fn concurrent_sql_migrations_leave_one_complete_schema_and_all_acknowledge
         .simple("INSERT INTO records(id,name) VALUES(0,'seed')")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &[0, 1, 2],
@@ -52,7 +52,7 @@ async fn concurrent_sql_migrations_leave_one_complete_schema_and_all_acknowledge
             expected.push(vec![name]);
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        writer.flush().await.unwrap();
+        writer.simple("MURMUR FLUSH").await.unwrap();
         expected
     };
     let (first, second, expected) = tokio::join!(
@@ -90,7 +90,7 @@ async fn concurrent_sql_migrations_leave_one_complete_schema_and_all_acknowledge
             )
             .await
             .unwrap();
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     assert_rows(
         &cluster,

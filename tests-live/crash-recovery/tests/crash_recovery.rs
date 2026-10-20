@@ -83,7 +83,7 @@ async fn insert(shared: &Shared, node: usize, id: i64, name: &str) -> Result<(),
             .await
             .map_err(|_| format!("node{} insert '{name}' timed out", node + 1))?
             .map_err(|e| format!("node{} insert '{name}': {e}", node + 1))?;
-        let flush = cluster.node(node).flush();
+        let flush = cluster.node(node).simple("MURMUR FLUSH");
         tokio::time::timeout(INSERT_TIMEOUT, flush)
             .await
             .map_err(|_| format!("node{} flush after '{name}' timed out", node + 1))?
@@ -306,7 +306,7 @@ async fn restart_node(shared: &Shared, node: usize) -> Result<(), String> {
             .map_err(|e| format!("re-set replicated node{}: {e}", node + 1))?;
         cluster
             .node(node)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("flush node{}: {e}", node + 1))?;
         cluster
@@ -349,7 +349,7 @@ async fn run_body(shared: Arc<Shared>, write_burst: Duration, settle: Duration) 
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }

@@ -33,8 +33,8 @@ async fn cross_database_peers_never_replicate() {
                 .simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
                 .await
                 .unwrap();
-            client.set_table_replicated("records", true).await.unwrap();
-            client.flush().await.unwrap();
+            client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+            client.simple("MURMUR FLUSH").await.unwrap();
         }
     }
 
@@ -100,14 +100,14 @@ async fn cross_database_peers_never_replicate() {
         .execute("INSERT INTO records(id, name) VALUES($1, $2)", &[&1i64, &"cluster-a-marker"])
         .await
         .unwrap();
-    cluster_a.node(0).flush().await.unwrap();
+    cluster_a.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     cluster_b
         .node(0)
         .execute("INSERT INTO records(id, name) VALUES($1, $2)", &[&2i64, &"cluster-b-marker"])
         .await
         .unwrap();
-    cluster_b.node(0).flush().await.unwrap();
+    cluster_b.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     // Verify cluster A converges internally on marker A
     let expected_a = vec![vec!["cluster-a-marker".into()]];

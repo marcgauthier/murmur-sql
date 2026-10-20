@@ -328,33 +328,27 @@ pub struct Node {
 
 /// One unlocked wire connection to a node. Share by reference; concurrent
 /// queries multiplex over the connection.
+#[derive(Clone)]
 pub struct NodeClient {
-    client: tokio_postgres::Client,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Drop for NodeClient {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    client: std::sync::Arc<murmur_client::Client>,
 }
 
 impl NodeClient {
-    pub(crate) fn new(client: tokio_postgres::Client, task: tokio::task::JoinHandle<()>) -> Self {
-        Self { client, task }
+    pub(crate) fn new(client: murmur_client::Client) -> Self {
+        Self { client: std::sync::Arc::new(client) }
     }
 
     /// The underlying driver client for application SQL.
-    pub fn inner(&self) -> &tokio_postgres::Client {
-        &self.client
+    pub fn inner(&self) -> &murmur_client::tokio_postgres::Client {
+        self.client.inner()
     }
 
     /// Run a statement with `$1`, `$2`, ... parameters.
     pub async fn execute(
         &self,
         sql: &str,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-    ) -> std::result::Result<u64, tokio_postgres::Error> {
+        params: &[&(dyn murmur_client::tokio_postgres::types::ToSql + Sync)],
+    ) -> murmur_client::Result<u64> {
         self.client.execute(sql, params).await
     }
 
@@ -365,15 +359,15 @@ impl NodeClient {
     pub async fn execute_retry(
         &self,
         sql: &str,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
+        params: &[&(dyn murmur_client::tokio_postgres::types::ToSql + Sync)],
         timeout: Duration,
-    ) -> std::result::Result<u64, tokio_postgres::Error> {
+    ) -> murmur_client::Result<u64> {
         let end = tokio::time::Instant::now() + timeout;
         loop {
             match self.execute(sql, params).await {
                 Ok(n) => return Ok(n),
                 Err(e) => {
-                    let retryable = e.code().is_some_and(|c| c.code() == "40001");
+                    let retryable = e.code() == Some("40001");
                     if !retryable || tokio::time::Instant::now() >= end {
                         return Err(e);
                     }
@@ -387,8 +381,8 @@ impl NodeClient {
     pub async fn query(
         &self,
         sql: &str,
-        params: &[&(dyn tokio_postgres::types::ToSql + Sync)],
-    ) -> std::result::Result<Vec<tokio_postgres::Row>, tokio_postgres::Error> {
+        params: &[&(dyn murmur_client::tokio_postgres::types::ToSql + Sync)],
+    ) -> murmur_client::Result<Vec<murmur_client::tokio_postgres::Row>> {
         self.client.query(sql, params).await
     }
 
@@ -397,20 +391,11 @@ impl NodeClient {
     pub async fn simple(
         &self,
         sql: &str,
-    ) -> std::result::Result<Vec<Vec<String>>, tokio_postgres::Error> {
-        let mut out = Vec::new();
-        for msg in self.client.simple_query(sql).await? {
-            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                out.push((0..row.len()).map(|i| row.get(i).unwrap_or("").to_string()).collect());
-            }
-        }
-        Ok(out)
+    ) -> murmur_client::Result<Vec<Vec<String>>> {
+        self.client.simple(sql).await
     }
 
-    /// Wait for a durable checkpoint of everything written so far.
-    pub async fn flush(&self) -> std::result::Result<(), tokio_postgres::Error> {
-        self.simple("MURMUR FLUSH").await.map(|_| ())
-    }
+
 }
 
 /// Per-node config inputs, stored for restarts. `config.toml` is re-rendered
@@ -1132,6 +1117,12 @@ impl Cluster {
             .unwrap_or_else(|| panic!("node{} is stopped", idx + 1))
     }
 
+    /// Open an independent Rust-client SQL connection for a concurrent worker.
+    pub async fn connect(&self, idx: usize) -> Result<NodeClient> {
+        let st = self.states.get(idx).ok_or(Error::UnknownNode(idx))?;
+        crate::unlock::connect_with_watchdog(st.node.sql_addr, PG_USER, PG_PASSWORD, &crate::hex(&st.inputs.key)).await
+    }
+
     /// Child PID, or `None` while stopped. Panics on unknown index.
     pub fn node_pid(&self, idx: usize) -> Option<u32> {
         self.states
@@ -1151,10 +1142,10 @@ impl Cluster {
     pub async fn ensure_migrated(&self, idx: usize, sql: &str) -> Result<()> {
         match self.node(idx).simple(sql).await {
             Ok(_) => {
-                self.node(idx).flush().await?;
+                self.node(idx).simple("MURMUR FLUSH").await?;
                 Ok(())
             }
-            Err(e) if idx > 0 && e.to_string().contains("already exists") => {
+            Err(e) if idx > 0 && crate::db_message(&e).contains("already exists") => {
                 eprintln!(
                     "node{}: fixture schema already converged, skipping identical migrate",
                     idx + 1

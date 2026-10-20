@@ -11,7 +11,7 @@
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
-use tokio_postgres::NoTls;
+use murmur_client::{Client, Config};
 
 use crate::cluster::NodeClient;
 
@@ -65,21 +65,11 @@ async fn try_connect_once(
     password: &str,
     key_hex: &str,
 ) -> crate::Result<NodeClient> {
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host(sql_addr.ip().to_string())
-        .port(sql_addr.port())
-        .user(user)
-        .password(password)
-        .dbname("murmur")
-        .connect_timeout(Duration::from_secs(5));
-    let (client, connection) = config.connect(NoTls).await?;
-    let task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    let node = NodeClient::new(client, task);
-    node.simple(&format!("MURMUR UNLOCK KEY '{key_hex}'")).await?;
-    Ok(node)
+    let mut config = Config::new(user, password, key_hex);
+    config.host = sql_addr.ip().to_string();
+    config.port = sql_addr.port();
+    config.connect_timeout = Duration::from_secs(5);
+    Ok(NodeClient::new(Client::connect(&config).await?))
 }
 
 fn short_error(error: &crate::Error) -> String {

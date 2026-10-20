@@ -278,7 +278,7 @@ async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
             .map_err(|e| format!("set replicated node {i}: {e}"))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("flush schema node {i}: {e}"))?;
     }
@@ -295,7 +295,7 @@ async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
     }
     cluster
         .node(STALE)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush baseline: {e}"))?;
     wait_converged(cluster, 5, BASELINE_TIMEOUT).await;
@@ -319,7 +319,7 @@ async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
         insert(cluster, 0, 100 + i, &format!("fresh-{i}")).await;
         cluster
             .node(0)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("flush survivor write: {e}"))?;
     }
@@ -383,7 +383,7 @@ async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
         .map_err(|e| format!("re-set replicated on stale node: {e}"))?;
     cluster
         .node(STALE)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush schema on stale node: {e}"))?;
     let victim_addr = cluster.node_info(STALE).repl_addr;

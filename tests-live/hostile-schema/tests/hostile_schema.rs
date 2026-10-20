@@ -523,8 +523,8 @@ max_transaction_bytes = "1MiB"
             .simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .await
             .unwrap();
-        client.set_table_replicated("records", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Positive control (pre-attack): honest writes replicate everywhere
@@ -536,7 +536,7 @@ max_transaction_bytes = "1MiB"
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     let pre_attack = vec![vec!["baseline".to_string()]];
     assert_rows(
@@ -680,7 +680,7 @@ max_transaction_bytes = "1MiB"
         )
         .await
         .unwrap();
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
 
     cluster
         .node(2)
@@ -690,7 +690,7 @@ max_transaction_bytes = "1MiB"
         )
         .await
         .unwrap();
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
 
     cluster
         .node(0)
@@ -700,7 +700,7 @@ max_transaction_bytes = "1MiB"
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     let post_attack = vec![
         vec!["attacked-node-write".to_string()],

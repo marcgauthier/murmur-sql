@@ -15,32 +15,30 @@ async fn sql_backup_stream_round_trip_restores_types_and_replication_flags() {
     // Table flags are authoritative config state and must survive restore.
     cluster
         .node(0)
-        .set_table_replicated("records", true)
+        .simple("MURMUR SET TABLE records REPLICATED true")
         .await
         .unwrap();
     let query="SELECT id,title,score,hex(payload),optional,id_murmur_primary_key FROM records ORDER BY id";
     let expected = cluster.node(0).simple(query).await.unwrap();
-    let saved = cluster.node(0).backup_save().await.unwrap();
-    assert!(saved.size > 0);
+    let saved = cluster.node(0).simple("MURMUR BACKUP SAVE").await.unwrap();
+    assert!(saved[0][1].parse::<i64>().unwrap() > 0);
     let mut bytes = Vec::new();
-    cluster
-        .node(0)
-        .backup_download(&saved.name, &mut bytes)
+    murmur_live_harness::transfers::download(cluster
+        .node(0), &format!("MURMUR BACKUP DOWNLOAD {}", murmur_live_harness::sql_literal(&saved[0][0])), &mut bytes)
         .await
         .unwrap();
-    assert_eq!(bytes.len() as i64, saved.size);
-    cluster
-        .node(0)
-        .backup_upload("roundtrip.murmur-backup", &bytes[..])
+    assert_eq!(bytes.len() as i64, saved[0][1].parse::<i64>().unwrap());
+    murmur_live_harness::transfers::upload(cluster
+        .node(0), "roundtrip.murmur-backup", &bytes[..])
         .await
         .unwrap();
     assert!(cluster
         .node(0)
-        .backup_list()
+        .simple("MURMUR BACKUP LIST")
         .await
         .unwrap()
         .iter()
-        .any(|b| b.name == "roundtrip.murmur-backup" && b.size == saved.size));
+        .any(|b| b[0] == "roundtrip.murmur-backup" && b[1].parse::<i64>().unwrap() == saved[0][1].parse::<i64>().unwrap()));
     cluster
         .node(0)
         .simple("DELETE FROM records; INSERT INTO records(id,title) VALUES(99,'after-backup')")
@@ -48,18 +46,18 @@ async fn sql_backup_stream_round_trip_restores_types_and_replication_flags() {
         .unwrap();
     cluster
         .node(0)
-        .restore("roundtrip.murmur-backup", KEY)
+        .simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal("roundtrip.murmur-backup"),murmur_live_harness::sql_literal(KEY)))
         .await
         .unwrap();
     let fresh = cluster.connect(0).await.unwrap();
     assert_eq!(fresh.simple(query).await.unwrap(), expected);
     assert!(fresh
-        .table_replication()
+        .simple("MURMUR SHOW TABLES REPLICATION")
         .await
         .unwrap()
         .iter()
-        .any(|f| f.table == "records" && f.replicated));
-    fresh.flush().await.unwrap();
+        .any(|f| f[0] == "records" && f[1] == "true"));
+    fresh.simple("MURMUR FLUSH").await.unwrap();
     drop(fresh);
     cluster.stop_node(0);
     cluster.start_node(0).await.unwrap();
@@ -93,10 +91,10 @@ async fn restore_rejects_wrong_key_and_foreign_identity_without_changing_live_ro
         .simple("INSERT INTO records VALUES(2,'target-kept')")
         .await
         .unwrap();
-    let saved = cluster.node(0).backup_save().await.unwrap();
+    let saved = cluster.node(0).simple("MURMUR BACKUP SAVE").await.unwrap();
     let error = cluster
         .node(0)
-        .restore(&saved.name, "wrong-restore-key")
+        .simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal(&saved[0][0]),murmur_live_harness::sql_literal("wrong-restore-key")))
         .await
         .unwrap_err();
     assert_eq!(error.code(), Some("28000"));
@@ -109,20 +107,18 @@ async fn restore_rejects_wrong_key_and_foreign_identity_without_changing_live_ro
         vec![vec!["source".to_string()]]
     );
     let mut bytes = Vec::new();
-    cluster
-        .node(0)
-        .backup_download(&saved.name, &mut bytes)
+    murmur_live_harness::transfers::download(cluster
+        .node(0), &format!("MURMUR BACKUP DOWNLOAD {}", murmur_live_harness::sql_literal(&saved[0][0])), &mut bytes)
         .await
         .unwrap();
-    cluster
-        .node(1)
-        .backup_upload("foreign.murmur-backup", &bytes[..])
+    murmur_live_harness::transfers::upload(cluster
+        .node(1), "foreign.murmur-backup", &bytes[..])
         .await
         .unwrap();
     assert!(
         cluster
             .node(1)
-            .restore("foreign.murmur-backup", KEY)
+            .simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal("foreign.murmur-backup"),murmur_live_harness::sql_literal(KEY)))
             .await
             .is_err(),
         "backup with foreign writer identity accepted"

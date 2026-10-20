@@ -4,98 +4,33 @@
 
 use murmur_live_harness::{Cluster, ClusterOptions, KEY};
 use sha2::{Digest, Sha256};
-use spool::{Codec, Durability, Mutation};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::sync::Arc;
 
-const IDENTITY_KEY: &[u8] = b"00/identity";
-const ZSTD_CODEC_ID: u8 = 128;
-const ZSTD_LEVEL: i32 = 3;
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct StoreIdentity {
-    database: [u8; 16],
-    node: [u8; 16],
-    format: u32,
-}
-
-struct ZstdBlock(i32);
-
-impl Codec for ZstdBlock {
-    fn id(&self) -> u8 {
-        ZSTD_CODEC_ID
-    }
-    fn name(&self) -> &str {
-        "sqlite-session-zstd-v1"
-    }
-    fn compress(&self, src: &[u8]) -> spool::Result<Vec<u8>> {
-        zstd::stream::encode_all(src, self.0)
-            .map_err(|e| spool::Error::new(spool::ErrorKind::Io, e.to_string()))
-    }
-    fn decompress(&self, src: &[u8], max: usize) -> spool::Result<Vec<u8>> {
-        use std::io::Read;
-        let decoder = zstd::stream::read::Decoder::new(src)
-            .map_err(|e| spool::Error::new(spool::ErrorKind::Corrupt, e.to_string()))?;
-        let mut out = Vec::new();
-        decoder
-            .take(max as u64 + 1)
-            .read_to_end(&mut out)
-            .map_err(|e| spool::Error::new(spool::ErrorKind::Corrupt, e.to_string()))?;
-        if out.len() > max {
-            return Err(spool::Error::new(
-                spool::ErrorKind::Corrupt,
-                "zstd size limit",
-            ));
-        }
-        Ok(out)
-    }
-}
-
-fn spool_opts(dir: &Path) -> spool::Options {
-    let mut opts = spool::default_options(dir.to_string_lossy().to_string());
-    opts.master_key = blake3::hash(KEY.as_bytes()).as_bytes().to_vec();
-    opts.codecs = vec![Arc::new(ZstdBlock(ZSTD_LEVEL))];
-    opts.reclaim_interval = None;
-    opts
-}
-
-fn read_identity(dir: &Path) -> StoreIdentity {
-    let opts = spool_opts(dir);
-    let mut raw: Option<Vec<u8>> = None;
-    let store = spool::open_and_load_ordered(&opts, &mut |records: &[spool::Record]| {
-        for r in records {
-            if !r.deleted && r.key.as_slice() == IDENTITY_KEY {
-                raw = Some(r.value.clone());
-            }
-        }
-        Ok(())
-    })
-    .unwrap_or_else(|e| panic!("spool open {}: {e}", dir.display()));
-    store
-        .close()
-        .unwrap_or_else(|e| panic!("spool close {}: {e}", dir.display()));
-    let raw = raw.unwrap_or_else(|| panic!("no 00/identity record in {}", dir.display()));
-    postcard::from_bytes(&raw).unwrap_or_else(|e| panic!("decode 00/identity: {e}"))
-}
-
-fn bump_identity_format(dir: &Path, current: &StoreIdentity) -> StoreIdentity {
-    let mut next = current.clone();
-    next.format = current.format.checked_add(1).expect("format + 1");
-    let bytes = postcard::to_allocvec(&next).expect("encode bumped identity");
-    let opts = spool_opts(dir);
-    let store = spool::open(&opts)
-        .unwrap_or_else(|e| panic!("spool open {} for format bump: {e}", dir.display()));
-    store
-        .commit(
-            &[Mutation::put(IDENTITY_KEY.to_vec(), bytes)],
-            Durability::Sync,
-        )
-        .unwrap_or_else(|e| panic!("commit bumped identity: {e}"));
-    store
-        .close()
-        .unwrap_or_else(|e| panic!("spool close {} after bump: {e}", dir.display()));
-    next
+/// The engine-owned test utility mutates only the stopped disposable copy.
+/// Database assertions below still go through SQL to a live Murmur-SQL server.
+fn bump_identity_format(dir: &Path, key_hex: &str) {
+    let binary = std::env::var_os("MURMUR_FORMAT_FIXTURE_BIN").expect(
+        "run tests-live/run.sh downgrade-guard to provision the engine-owned artifact injector",
+    );
+    let output = std::process::Command::new(binary)
+        .args([
+            "--ignored",
+            "--exact",
+            "storage::live_sql_format_fixture::write_future_format_to_copied_store",
+            "--nocapture",
+        ])
+        .env("MURMUR_FORMAT_FIXTURE_PATH", dir)
+        .env("MURMUR_FORMAT_FIXTURE_KEY_HEX", key_hex)
+        .output()
+        .expect("run engine-owned format injector");
+    assert!(
+        output.status.success(),
+        "format injector failed: {} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FUTURE_FORMAT_FIXTURE old="));
 }
 
 fn copy_dir_all(src: &Path, dst: &Path) {
@@ -155,6 +90,17 @@ async fn downgrade_guard_refuses_new_store() {
     .await
     .expect("start cluster");
 
+    let fixture_key = "22".repeat(32);
+    cluster
+        .node(0)
+        .simple(&format!(
+            "MURMUR ROTATE KEY {} {}",
+            murmur_live_harness::sql_literal(KEY),
+            murmur_live_harness::sql_literal(&fixture_key)
+        ))
+        .await
+        .unwrap();
+    cluster.set_key(0, &fixture_key);
     let client = cluster.node(0);
     client
         .simple("CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
@@ -165,11 +111,14 @@ async fn downgrade_guard_refuses_new_store() {
         let id = 3000 + i;
         let name = format!("row-{i:02}");
         client
-            .execute("INSERT INTO records(id, name) VALUES($1, $2)", &[&id, &name])
+            .execute(
+                "INSERT INTO records(id, name) VALUES($1, $2)",
+                &[&id, &name],
+            )
             .await
             .unwrap();
     }
-    client.flush().await.unwrap();
+    client.simple("MURMUR FLUSH").await.unwrap();
 
     let rows_before = client
         .simple("SELECT id, name FROM records ORDER BY id")
@@ -180,14 +129,10 @@ async fn downgrade_guard_refuses_new_store() {
     let pristine_data = cluster.node_info(0).data_dir.clone();
     cluster.stop_node(0);
 
-    // Read identity from pristine store
-    let current_id = read_identity(&pristine_data);
-
     // Copy to future store and bump format
     let future_data = cluster.node_info(0).dir.join("future-data");
     copy_dir_all(&pristine_data, &future_data);
-    let bumped_id = bump_identity_format(&future_data, &current_id);
-    assert_eq!(bumped_id.format, current_id.format + 1);
+    bump_identity_format(&future_data, &fixture_key);
 
     let before_refusal_tree = hash_tree(&future_data);
 

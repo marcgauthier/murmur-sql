@@ -71,7 +71,7 @@ async fn sql_and_quic_half_open_pressure_does_not_starve_honest_clients() {
             .unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -80,7 +80,7 @@ async fn sql_and_quic_half_open_pressure_does_not_starve_honest_clients() {
         .simple("INSERT INTO records(id,body) VALUES(0,'baseline')")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     let mut expected = vec![vec!["baseline".into()]];
     assert_rows(
         &cluster,
@@ -162,7 +162,7 @@ async fn sql_and_quic_half_open_pressure_does_not_starve_honest_clients() {
                     .node(node)
                     .execute("INSERT INTO records(id,body) VALUES($1,$2)", &[&id, &body])
                     .await?;
-                cluster.node(node).flush().await
+                cluster.node(node).simple("MURMUR FLUSH").await
             };
             tokio::time::timeout(Duration::from_secs(10), durable_write)
                 .await
@@ -229,7 +229,7 @@ async fn sql_and_quic_half_open_pressure_does_not_starve_honest_clients() {
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     expected.push(vec!["post-attack".into()]);
     assert_rows(
         &cluster,

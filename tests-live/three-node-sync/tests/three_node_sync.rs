@@ -19,8 +19,8 @@ async fn three_node_sync() {
             )
             .await
             .unwrap();
-        client.set_table_replicated("records", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
     let write = |i: usize| {
         let client = cluster.node(i);
@@ -36,7 +36,7 @@ async fn three_node_sync() {
                     1
                 );
             }
-            client.flush().await.unwrap();
+            client.simple("MURMUR FLUSH").await.unwrap();
         }
     };
     tokio::join!(write(0), write(1), write(2));

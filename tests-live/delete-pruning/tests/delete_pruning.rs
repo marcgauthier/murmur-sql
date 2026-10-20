@@ -88,8 +88,9 @@ async fn delete(cluster: &Cluster, node: usize, id: &str) -> Result<(), String> 
 async fn flush(cluster: &Cluster, node: usize) -> Result<(), String> {
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
+        .map(|_| ())
         .map_err(|e| format!("node{} flush: {e}", node + 1))
 }
 

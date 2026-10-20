@@ -190,7 +190,7 @@ async fn writer(cluster: &Cluster, w: usize) -> (Vec<Duration>, u64, Option<Stri
         // would sign as one capture past the 64 KiB replication budget
         // (Go captures per HTTP write; see the README deviation).
         if (i + 1) % 10 == 0 {
-            if let Err(e) = cluster.node(0).flush().await {
+            if let Err(e) = cluster.node(0).simple("MURMUR FLUSH").await {
                 failed += 1;
                 return (
                     lat,
@@ -223,7 +223,7 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
@@ -234,7 +234,7 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
     // past the transaction budget instead.)
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush before oversize: {e}"))?;
     let big = "V".repeat(TX_BUDGET + 1);
@@ -268,7 +268,7 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
     insert_retry(cluster, 0, format!("{:032x}", 3), "ok".into()).await?;
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush after post-rejection write: {e}"))?;
     wait_converged(cluster, 1, PROBE_TIMEOUT, "post-rejection probe").await?;

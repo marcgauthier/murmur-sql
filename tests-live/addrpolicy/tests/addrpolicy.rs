@@ -53,8 +53,8 @@ async fn address_policy_across_processes() {
             .simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .await
             .unwrap();
-        client.set_table_replicated("records", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Insert rows: Node 0, Node 1, Node 2
@@ -66,7 +66,7 @@ async fn address_policy_across_processes() {
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     cluster
         .node(1)
@@ -76,7 +76,7 @@ async fn address_policy_across_processes() {
         )
         .await
         .unwrap();
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
 
     cluster
         .node(2)
@@ -86,7 +86,7 @@ async fn address_policy_across_processes() {
         )
         .await
         .unwrap();
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
 
     // Admitted pair (Node 0 and Node 2) must converge on both rows
     let expected_admitted = vec![

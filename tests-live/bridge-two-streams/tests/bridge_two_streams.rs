@@ -88,7 +88,7 @@ async fn insert_row(cluster: &Cluster, id: &str, name: &str) -> Result<(), Strin
         .execute("INSERT INTO live_typed_contention(id, name) VALUES($1, $2)", &params)
         .await
         .map_err(|e| format!("insert {id:?}: {e}"))?;
-    cluster.node(0).flush().await.map_err(|e| format!("flush after {id:?}: {e}"))?;
+    cluster.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("flush after {id:?}: {e}"))?;
     Ok(())
 }
 
@@ -100,7 +100,7 @@ async fn update_name(cluster: &Cluster, id: &str, name: &str) -> Result<(), Stri
         .execute("UPDATE live_typed_contention SET name = $1 WHERE id = $2", &params)
         .await
         .map_err(|e| format!("update {id:?}: {e}"))?;
-    cluster.node(0).flush().await.map_err(|e| format!("flush after update {id:?}: {e}"))?;
+    cluster.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("flush after update {id:?}: {e}"))?;
     Ok(())
 }
 
@@ -242,7 +242,7 @@ async fn run_body(lanes: &Lanes, low_a: &Cluster, low_b: &Cluster, high: &Cluste
             .simple("MURMUR SET TABLE live_typed_contention REPLICATED true")
             .await
             .map_err(|e| format!("{label} SET TABLE REPLICATED: {e}"))?;
-        db.node(idx).flush().await.map_err(|e| format!("{label} flush after SET TABLE: {e}"))?;
+        db.node(idx).simple("MURMUR FLUSH").await.map_err(|e| format!("{label} flush after SET TABLE: {e}"))?;
     }
 
     // Round 1: disjoint rows from both domains land on both High nodes.

@@ -20,7 +20,7 @@ async fn plaintext_audit_markers_and_unlock_key_absent_on_disk() {
             .unwrap();
         cluster
             .node(i)
-            .set_table_replicated("secrets", true)
+            .simple("MURMUR SET TABLE secrets REPLICATED true")
             .await
             .unwrap();
     }
@@ -35,7 +35,7 @@ async fn plaintext_audit_markers_and_unlock_key_absent_on_disk() {
             )
             .await
             .unwrap();
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     let expected = vec![vec![marker.clone()], vec![marker.clone()]];
     assert_rows(
@@ -46,9 +46,9 @@ async fn plaintext_audit_markers_and_unlock_key_absent_on_disk() {
     )
     .await;
     // Backup archives are included in the byte-level audit.
-    cluster.node(0).backup_save().await.unwrap();
+    cluster.node(0).simple("MURMUR BACKUP SAVE").await.unwrap();
     for i in 0..2 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
     }
     assert_no_plaintext(cluster.runtime_dir(), &[marker.as_bytes(), KEY.as_bytes()]);

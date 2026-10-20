@@ -951,21 +951,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "murmur-client"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "rustls",
+ "rustls-pemfile",
+ "thiserror",
+ "tokio",
+ "tokio-postgres",
+ "tokio-postgres-rustls",
+]
+
+[[package]]
 name = "murmur-live-harness"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
  "ipnet",
  "libc",
+ "murmur-client",
  "murmur-replication",
  "quinn",
  "rand 0.8.8",
  "rcgen",
+ "serde_json",
  "sha2 0.10.9",
  "thiserror",
  "time",
  "tokio",
- "tokio-postgres",
  "zeroize",
 ]
 
@@ -974,6 +988,7 @@ name = "murmur-live-loadshare"
 version = "0.1.0"
 dependencies = [
  "murmur-live-harness",
+ "tokio",
 ]
 
 [[package]]
@@ -1454,6 +1469,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-pemfile"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dce314e5fee3f39953d46bb63bb8a46d40c2f8fb7cc5a3b6cab2bde9721d6e50"
+dependencies = [
+ "rustls-pki-types",
+]
+
+[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1828,6 +1852,21 @@ dependencies = [
  "tokio",
  "tokio-util",
  "whoami",
+]
+
+[[package]]
+name = "tokio-postgres-rustls"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27d684bad428a0f2481f42241f821db42c54e2dc81d8c00db8536c506b0a0144"
+dependencies = [
+ "const-oid 0.9.6",
+ "ring",
+ "rustls",
+ "tokio",
+ "tokio-postgres",
+ "tokio-rustls",
+ "x509-cert",
 ]
 
 [[package]]

@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -707,5 +708,24 @@ func TestMetrics(t *testing.T) {
 		t.Fatal("expected error for invalid scope")
 	} else if codeOf(err) != "42601" {
 		t.Fatalf("got code %q, want 42601", codeOf(err))
+	}
+}
+
+func TestDiagnosticStatusUsesOrdinarySQL(t *testing.T) {
+	server := servertest.Start(t, t.TempDir(), servertest.Options{})
+	db := open(t, testConfig(server))
+	ctx := context.Background()
+	var document string
+	if err := db.QueryRowContext(ctx, "MURMUR SHOW STATUS").Scan(&document); err != nil {
+		t.Fatal(err)
+	}
+	var snapshot map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(document), &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"committed", "durable", "scheduler", "spool"} {
+		if _, present := snapshot[field]; !present {
+			t.Fatalf("missing diagnostic field %s", field)
+		}
 	}
 }

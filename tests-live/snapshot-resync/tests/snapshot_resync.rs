@@ -103,7 +103,7 @@ async fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) -> Result<(
 async fn flush(cluster: &Cluster, node: usize, what: &str) -> Result<(), String> {
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush ({what}): {e}", node + 1))?;
     Ok(())

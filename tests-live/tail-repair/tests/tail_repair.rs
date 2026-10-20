@@ -87,7 +87,7 @@ async fn insert_marker(cluster: &Cluster, node: usize, id: i64, name: &str) -> R
         .map_err(|e| format!("node{} insert '{name}': {e}", node + 1))?;
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after '{name}': {e}", node + 1))?;
     Ok(())
@@ -244,7 +244,7 @@ async fn run_body(cluster: &Cluster, burst_rows: usize) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }

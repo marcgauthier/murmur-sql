@@ -36,23 +36,21 @@ async fn online_sql_backups_capture_atomic_commits_under_write_load() {
             ).await.unwrap();
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
-            writer.flush().await.unwrap();
+            writer.simple("MURMUR FLUSH").await.unwrap();
         };
     let backup = async {
         let mut archives = Vec::new();
         for i in 0..4 {
-            let saved = cluster.node(0).backup_save().await.unwrap();
+            let saved = cluster.node(0).simple("MURMUR BACKUP SAVE").await.unwrap();
             let mut bytes = Vec::new();
-            cluster
-                .node(0)
-                .backup_download(&saved.name, &mut bytes)
+            murmur_live_harness::transfers::download(cluster
+                .node(0), &format!("MURMUR BACKUP DOWNLOAD {}", murmur_live_harness::sql_literal(&saved[0][0])), &mut bytes)
                 .await
                 .unwrap();
-            assert_eq!(bytes.len() as i64, saved.size);
+            assert_eq!(bytes.len() as i64, saved[0][1].parse::<i64>().unwrap());
             let name = format!("under-fire-{i}.murmur-backup");
-            cluster
-                .node(0)
-                .backup_upload(&name, &bytes[..])
+            murmur_live_harness::transfers::upload(cluster
+                .node(0), &name, &bytes[..])
                 .await
                 .unwrap();
             archives.push(name);
@@ -72,7 +70,7 @@ async fn online_sql_backups_capture_atomic_commits_under_write_load() {
     let mut previous = 0usize;
     for name in archives {
         let admin = cluster.connect(0).await.unwrap();
-        admin.restore(&name, KEY).await.unwrap();
+        admin.simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal(&name),murmur_live_harness::sql_literal(KEY))).await.unwrap();
         let fresh = cluster.connect(0).await.unwrap();
         let rows = fresh
             .simple("SELECT id,batch FROM records ORDER BY id")

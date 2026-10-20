@@ -8,7 +8,7 @@ async fn insert(cluster: &Cluster, node: usize, id: i64, name: &str) {
         .execute("INSERT INTO records(id,name) VALUES($1,$2)", &[&id, &name])
         .await
         .unwrap();
-    cluster.node(node).flush().await.unwrap();
+    cluster.node(node).simple("MURMUR FLUSH").await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -31,7 +31,7 @@ async fn four_node_partition_isolation_and_healing() {
             .unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -45,7 +45,7 @@ async fn four_node_partition_isolation_and_healing() {
     .await;
     // Restart from persisted config to sever every cross-pair connection.
     for i in 0..4 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
     }
     for (i, peer) in [(0, 1), (1, 0), (2, 3), (3, 2)] {
@@ -86,7 +86,7 @@ async fn four_node_partition_isolation_and_healing() {
             .unwrap()
     );
     for i in 0..4 {
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
     }
     for i in 0..4 {

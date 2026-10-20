@@ -12,7 +12,7 @@ async fn sql_mtls_rejects_missing_and_untrusted_certificates_and_keeps_valid_cli
     .await
     .unwrap();
     cluster.node(0).simple("CREATE TABLE records(id INTEGER PRIMARY KEY,body TEXT); INSERT INTO records VALUES(1,'before-tls')").await.unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(0);
     let dir = cluster.node_info(0).dir.clone();
     let cert = dir.join("cert.pem").to_string_lossy().to_string();
@@ -93,7 +93,7 @@ async fn sql_mtls_rejects_missing_and_untrusted_certificates_and_keeps_valid_cli
         .simple("INSERT INTO records VALUES(2,'after-rejections')")
         .await
         .unwrap();
-    fresh.flush().await.unwrap();
+    fresh.simple("MURMUR FLUSH").await.unwrap();
     drop(fresh);
     cluster.stop_node(0);
     cluster.start_node(0).await.unwrap();

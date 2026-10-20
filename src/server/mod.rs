@@ -378,7 +378,18 @@ fn parse_id(hex: &str) -> Result<[u8; 16], murmur::Error> {
 /// Bind, accept connections through pgwire, and serve until shutdown.
 /// Exit codes: 0 ok, 1 startup error, 2 bind error.
 pub async fn serve(config_path: PathBuf, config: Config) -> std::process::ExitCode {
+    serve_managed(config_path, config, shutdown_signal(), crate::service::notify_ready).await
+}
+
+/// Service-host hooks share normal startup/shutdown; no engine is opened here.
+pub(crate) async fn serve_managed(
+    config_path: PathBuf,
+    config: Config,
+    shutdown: impl std::future::Future<Output = ()> + Send,
+    ready: impl FnOnce() -> Result<(), String>,
+) -> std::process::ExitCode {
     use std::process::ExitCode;
+    tokio::pin!(shutdown);
     // Fail fast on unreadable credentials before listening.
     let tls_acceptor = match tls::build_acceptor(&config.server.tls, config.server.production) {
         Ok(acceptor) => acceptor,
@@ -410,6 +421,10 @@ pub async fn serve(config_path: PathBuf, config: Config) -> std::process::ExitCo
     tracing::info!(bind = %bound, data = %config.storage.data_dir, "murmur-server listening");
     let production = config.server.production;
     let state = std::sync::Arc::new(ServerState::new(config_path, config));
+    if let Err(error) = ready() {
+        tracing::error!(%error, "service readiness reporting failed");
+        return ExitCode::from(1);
+    }
     let mut file_cleanup = tokio::time::interval(std::time::Duration::from_secs(30));
     loop {
         tokio::select! {
@@ -441,7 +456,7 @@ pub async fn serve(config_path: PathBuf, config: Config) -> std::process::ExitCo
                     }
                 }
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 tracing::info!("shutdown requested");
                 #[cfg(feature="replication")]
                 {let closing=state.clone();let _=tokio::task::spawn_blocking(move||closing.files.lock().unwrap().shutdown()).await;}

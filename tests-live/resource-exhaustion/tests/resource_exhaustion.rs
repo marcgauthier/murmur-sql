@@ -81,7 +81,7 @@ async fn migrate_all(cluster: &Cluster) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
@@ -121,7 +121,7 @@ async fn insert_row(cluster: &Cluster, idx: usize, id: String, name: String) -> 
         .map_err(|e| format!("node{} insert failed: {e}", idx + 1))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after insert failed: {e}", idx + 1))?;
     Ok(())
@@ -141,7 +141,7 @@ async fn insert_row_retry(cluster: &Cluster, idx: usize, id: String, name: Strin
         .map_err(|e| format!("node{} insert failed: {e}", idx + 1))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after insert failed: {e}", idx + 1))?;
     Ok(())
@@ -326,7 +326,7 @@ async fn run_compact(cluster: &mut Cluster, updates: usize) -> Result<(), String
         if (i + 1) % CHURN_FLUSH_EVERY == 0 || i + 1 == KEYS {
             cluster
                 .node(1)
-                .flush()
+                .simple("MURMUR FLUSH")
                 .await
                 .map_err(|e| format!("node2 flush after insert batch failed: {e}"))?;
         }
@@ -354,7 +354,7 @@ async fn run_compact(cluster: &mut Cluster, updates: usize) -> Result<(), String
         if (i + 1) % CHURN_FLUSH_EVERY == 0 || i + 1 == updates {
             cluster
                 .node(1)
-                .flush()
+                .simple("MURMUR FLUSH")
                 .await
                 .map_err(|e| format!("node2 flush after churn batch failed: {e}"))?;
             batches += 1;

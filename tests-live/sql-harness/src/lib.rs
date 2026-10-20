@@ -450,3 +450,8 @@ pub fn assert_no_plaintext(root: &Path, needles: &[&[u8]]) {
         }
     }
 }
+
+/// Escape a literal command argument; identifiers/keywords cannot be parameters.
+pub fn sql_literal(value: &str) -> String { format!("'{}'", value.replace('\'', "''")) }
+
+pub mod transfers;

@@ -65,7 +65,7 @@ async fn populate(cluster: &Cluster) -> Result<(), String> {
     }
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("populate: flush: {e}"))?;
     eprintln!("populate: {ROWS_PER_TABLE} rows x2 tables");
@@ -101,28 +101,14 @@ async fn verify_contents(cluster: &Cluster, name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Open a raw PG connection to the single node (mirrors the harness
-/// unlock dial so failure legs speak to a real server).
-async fn raw_connect(
-    cluster: &Cluster,
-) -> Result<murmur_live_harness::tokio_postgres::Client, String> {
+/// Connect through the Rust client's SQL unlock path.
+async fn connect_key(cluster: &Cluster, key: &str) -> murmur_live_harness::murmur_client::Result<murmur_live_harness::murmur_client::Client> {
     let addr = cluster.node_info(0).sql_addr;
-    let mut config = murmur_live_harness::tokio_postgres::Config::new();
-    config
-        .host(addr.ip().to_string())
-        .port(addr.port())
-        .user(PG_USER)
-        .password(PG_PASSWORD)
-        .dbname("murmur")
-        .connect_timeout(Duration::from_secs(5));
-    let (client, connection) = config
-        .connect(murmur_live_harness::tokio_postgres::NoTls)
-        .await
-        .map_err(|e| format!("raw connect to {addr}: {e}"))?;
-    tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    Ok(client)
+    let mut config = murmur_live_harness::murmur_client::Config::new(PG_USER, PG_PASSWORD, key);
+    config.host = addr.ip().to_string();
+    config.port = addr.port();
+    config.connect_timeout = Duration::from_secs(5);
+    murmur_live_harness::murmur_client::Client::connect(&config).await
 }
 
 /// Reload leg (Go: the `reload` role): stop + restart under the unlock
@@ -140,36 +126,20 @@ async fn reload_and_verify(cluster: &mut Cluster, name: &str) -> Result<(), Stri
 /// Open-failure leg (Go: the `open-failure` role): the unlock must fail,
 /// no usable handle is returned, and the correct key still works after.
 async fn open_failure_legs(cluster: &Cluster) -> Result<(), String> {
-    // Wrong 32-byte key: rejected, naming the cause.
-    let client = raw_connect(cluster).await?;
-    match client
-        .simple_query(&format!("MURMUR UNLOCK KEY '{}'", murmur_live_harness::hex(&WRONG_KEY)))
-        .await
-    {
-        Ok(_) => return Err("open-failure-wrong-key: expected unlock failure, got success".into()),
-        Err(e) => {
-            // `Display` is a bare `db error`; the cause-naming text lives
-            // in the source chain (`28000: incorrect key`).
-            let msg = murmur_live_harness::db_message(&e);
-            if !msg.contains("incorrect key") {
-                return Err(format!("open-failure-wrong-key: error {msg:?} does not name the cause"));
+    for key in [murmur_live_harness::hex(&WRONG_KEY), SHORT_KEY_HEX.into()] {
+        match connect_key(cluster, &key).await {
+            Ok(_) => return Err("wrong unlock key unexpectedly accepted".into()),
+            Err(error) => {
+                let message = murmur_live_harness::db_message(&error);
+                if error.code() != Some("28000") || !message.contains("incorrect key") {
+                    return Err(format!("unlock failure did not identify wrong key: {message}"));
+                }
             }
-            eprintln!("open-failure-wrong-key: unlock failed as expected: {msg}");
         }
     }
-    // Short key: rejected (passphrase-hash fallback never matches).
-    let client = raw_connect(cluster).await?;
-    match client.simple_query(&format!("MURMUR UNLOCK KEY '{SHORT_KEY_HEX}'")).await {
-        Ok(_) => return Err("open-failure-short-key: expected unlock failure, got success".into()),
-        Err(e) => eprintln!("open-failure-short-key: unlock failed as expected: {e}"),
-    }
-    // The failures left no usable handle, and the store still opens with
-    // the right key on a fresh connection.
-    let client = raw_connect(cluster).await?;
-    client
-        .simple_query(&format!("MURMUR UNLOCK KEY '{}'", murmur_live_harness::hex(&KEY)))
-        .await
-        .map_err(|e| format!("unlock with correct key after failures: {e}"))?;
+    let client = connect_key(cluster, &murmur_live_harness::hex(&KEY)).await
+        .map_err(|e| format!("correct key after failures: {e}"))?;
+    client.simple("SELECT 1").await.map_err(|e| e.to_string())?;
     eprintln!("PASS open-failure: wrong/short keys rejected, correct key accepted");
     Ok(())
 }

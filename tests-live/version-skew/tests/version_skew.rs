@@ -264,8 +264,8 @@ async fn unknown_protocol_version_refused() {
             .simple("CREATE TABLE records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .await
             .unwrap();
-        client.set_table_replicated("records", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Baseline: write 10 rows on node 0
@@ -279,7 +279,7 @@ async fn unknown_protocol_version_refused() {
             .unwrap();
         expected_pair.push(vec![name]);
     }
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     // Nodes 0 and 1 converge on the 10 rows
     assert_rows(&cluster, &[0, 1], "SELECT name FROM records ORDER BY id", &expected_pair).await;
@@ -370,7 +370,7 @@ async fn unknown_protocol_version_refused() {
             .await
             .unwrap();
     }
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
 
     // Verify node 0 and node 1 still hold exactly their 10 baseline rows
     assert_rows(&cluster, &[0, 1], "SELECT name FROM records ORDER BY id", &expected_pair).await;

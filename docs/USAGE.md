@@ -68,6 +68,89 @@ MURMUR FLUSH;
 `--validate-config` (load and validate, then exit without serving). Exit
 codes: 0 ok, 1 configuration error, 2 bind error.
 
+## Install as an operating-system service
+
+Use an elevated console on Windows, or root on Linux with a running systemd
+system manager. The installer is interactive; `/install` and `/uninstall` must
+be used alone. Other operating systems keep normal console operation but do
+not support service installation.
+
+```sh
+sudo ./murmur-server /install
+sudo ./murmur-server /uninstall
+```
+
+```powershell
+.\murmur-server.exe /install
+.\murmur-server.exe /uninstall
+```
+
+Each phase describes its actions and waits for **Enter**. Type `CANCEL` or close
+input to stop before the next phase. Installation prompts for dedicated,
+absolute installation and data/runtime directories, then a SQL listen address
+(default `127.0.0.1:5432`). Installation and runtime paths must not overlap;
+fresh installations require empty directories. On Linux, the selected directories
+and their ancestors must be root-owned and protected from other users' writes
+(root-owned sticky temporary parents are allowed). Filesystem roots, system
+locations, control characters, and symlinks/reparse points are rejected. Windows
+requires conventional local drive paths; network/UNC, extended `\\?\` paths,
+and ambiguous trailing-dot/space directory names are unsupported.
+
+Defaults are `/opt/murmur-sql` and `/var/lib/murmur-sql` on Linux, or
+`%ProgramFiles%\MurmurSQL` and `%ProgramData%\MurmurSQL` on Windows. The
+installation directory contains `murmur-server` and, when supplied alongside
+the installer, `murmur-admin`. The runtime directory contains
+`config/config.toml`, `data/`, `logs/`, and `backups/`. Paths written to a fresh
+configuration are absolute. Missing `murmur-admin` is reported and does not
+prevent server installation.
+
+The Linux service is `murmur-sql.service`. Installation creates a non-login
+`murmur` system account/group if absent, or reuses an existing account without
+changing its login settings. The Windows service is `MurmurSQL`, using the
+passwordless virtual identity `NT SERVICE\MurmurSQL`. Both enable automatic
+startup and restart-on-failure after 60 seconds; Windows uses delayed automatic
+startup. Binaries remain administrator-owned and read/execute-only for the
+service. Configured runtime folders are writable by the service, including the
+configuration directory because SQL settings updates replace the file
+atomically. Credential files receive read access; unrelated parent directories
+are not recursively granted access. Inaccessible credential paths fail setup
+and must be provisioned with the required traversal permissions separately.
+
+Installation deploys files, validates configuration, and registers the service.
+It never creates or opens a database, requests a database key, or performs
+lock/unlock operations. SQL authentication and TLS are configured separately;
+fresh configuration has no authenticated SQL users. See [Connecting](#connecting).
+No firewall rules are changed; required listener ports are reported. Windows
+also attempts to register an Application event-log source for startup failures.
+
+An upgrade preserves configuration byte-for-byte and keeps the existing paths;
+relocation/data migration is a separate manual operation. A running service
+requires an explicit `[y/N]` stop confirmation before replacing its binary and
+is restarted after a successful upgrade. Otherwise, the installer asks whether
+to start it. Service readiness is reported after binding the SQL listener, then
+checked by the installer. Startup/stop waits are bounded at 120 seconds.
+Failed upgrades attempt to restore previous binaries, service registration,
+and the prior running state. Recovery failures retain artifacts for manual
+repair. Prepared folders/configuration may remain after cancellation; installer
+metadata allows a retry.
+
+Uninstall requires confirmation to stop and remove the service. Application
+files and runtime/data folders are preserved by default; each deletion group
+requires its own typed `DELETE` confirmation after its paths are listed.
+Unrelated installation files, external runtime paths, and credentials are
+preserved. Runtime deletion is refused when configuration cannot be read or a
+credential file lies inside a deletion target. Running Windows installer-file
+deletion is deferred until exit. The Linux account is retained. Installer
+metadata is retained while files are preserved, allowing reinstall/uninstall
+retry; it is removed after both deletion groups are accepted.
+
+`installation.log` and `uninstallation.log` are appended in the launching
+working directory. Installer-owned metadata lives at `/etc/murmur-sql/install.json`
+or `%ProgramData%\MurmurSQL-Installer\install.json`, protected from service
+writes. An existing service without this metadata is treated as unmanaged and
+will not be replaced. Installer failures return exit code 1; a declined
+uninstall confirmation returns 0 without changes.
+
 ## Server configuration
 
 Everything lives in `config.toml`; see the commented
@@ -265,6 +348,7 @@ Commands are case-insensitive, take no parameters, and return a command tag
 | `MURMUR SHOW COLUMNS FTS` | List column declarations and local search-index status |
 | `MURMUR REFRESH INDEXES` | Collect pending writes and refresh local managed search indexes |
 | `MURMUR SHOW TABLES REPLICATION` | List tables with `table`, `replicated` columns |
+| `MURMUR SHOW STATUS` | Read the existing engine diagnostic snapshot as one JSON TEXT row |
 | `MURMUR SHOW METRICS [SQLITE\|SPOOL]` | List live engine metrics with `subsystem`, `metric`, `value` columns |
 | `MURMUR BACKUP SAVE` | Checkpoint into a datetime-named archive; returns `name`, `size` |
 | `MURMUR BACKUP LIST` | List backup files with `name`, `size`, `modified` |
@@ -1500,6 +1584,24 @@ Connections are not thread-safe. Embedded subscriptions and callbacks are not
 wire APIs. See the client catalog for the complete restrictions.
 
 ## Progress, metrics, and writer scheduling
+
+```sql
+MURMUR SHOW STATUS;
+```
+
+Returns one `status` TEXT column containing the engine's existing JSON diagnostic
+snapshot: committed/durable cursors, pending bytes, storage errors, Spool stats,
+scheduler counters, and (when enabled) replication status/counters. This is a
+read-only projection of `Database::status`, not a separate implementation of
+engine state. It requires an unlocked connection and works through both simple
+and extended protocols. Optional fields may be null; replication details are
+absent when the server is built without replication. Diagnostic fields may grow
+with engine releases, so consumers should tolerate unknown fields. The snapshot
+is for observation, not an atomic transaction or all-peer durability barrier.
+Live tests read it through SQL to verify fairness and maintenance without linking
+the embedded engine. Go callers use ordinary `QueryRowContext` and `encoding/json`;
+see the [metrics example](../clients/go/examples/metrics/main.go).
+
 
 Startup reconstructs authoritative rows from Spool and reports progress
 phases (`Opening`, `Rebuilding`, `Indexing`, `Finalizing`, `Ready`,

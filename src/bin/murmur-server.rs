@@ -13,6 +13,10 @@ const VERSION: &str = "0.1.0";
 fn usage() -> String {
     "usage: murmur-server [--config <path>] [--validate-config]\n\
      \n\
+     service commands (run elevated):\n\
+     \t/install\tinteractive service installation/upgrade\n\
+     \t/uninstall\tinteractive service removal\n\
+     \n\
      options:\n\
      \t--config <path>\tconfig.toml path (default: ./config.toml)\n\
      \t--validate-config\tload and validate the config, then exit\n\
@@ -22,6 +26,9 @@ fn usage() -> String {
 }
 
 fn main() -> ExitCode {
+    let arguments: Vec<_> = std::env::args_os().skip(1).collect();
+    if let Some(code) = murmur_sql::service::dispatch(&arguments) { return code; }
+    if let Some(code) = murmur_sql::service::dispatch_host(&arguments) { return code; }
     let mut config_path = "./config.toml".to_string();
     let mut validate_only = false;
     let mut args = std::env::args().skip(1);

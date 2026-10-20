@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -62,6 +63,24 @@ func main() {
 			if scope != "" && (len(found) != 1 || !found[strings.ToLower(scope)]) {
 				t.Fatalf("wrong scope: %v", found)
 			}
+		}
+		var diagnostic string
+		if err := db.QueryRowContext(ctx, "MURMUR SHOW STATUS").Scan(&diagnostic); err != nil {
+			t.Fatalf("status: %v", err)
+		}
+		var snapshot struct {
+			Scheduler *struct {
+				Local struct {
+					Acquisitions uint64 `json:"acquisitions"`
+				} `json:"local"`
+			} `json:"scheduler"`
+			PendingBytes uint64 `json:"pending_bytes"`
+		}
+		if err := json.Unmarshal([]byte(diagnostic), &snapshot); err != nil {
+			t.Fatalf("status JSON: %v", err)
+		}
+		if snapshot.Scheduler == nil || snapshot.Scheduler.Local.Acquisitions == 0 || snapshot.PendingBytes != 0 {
+			t.Fatalf("unexpected diagnostic snapshot: %+v", snapshot)
 		}
 		fmt.Printf("metrics: verified %d metric rows\n", count)
 	})

@@ -24,8 +24,8 @@ Reviewed 2026-10-20.
 
 ## Rust crates
 
-No publishing company is declared in the Cargo metadata used for these entries;
-where applicable, the maintaining project is listed instead.
+Company attribution follows package metadata; where no company is declared,
+the maintaining project or author is listed instead.
 
 | Package | Required version(s) | Direct use | Company / project | Author(s) / maintainers | Country / origin evidence |
 | --- | --- | --- | --- | --- | --- |
@@ -53,6 +53,7 @@ where applicable, the maintaining project is listed instead.
 | [`tracing`](https://github.com/tokio-rs/tracing) | `0.1` | server | Tokio project | Eliza Weisman; Tokio Contributors | Not established |
 | [`tracing-appender`](https://github.com/tokio-rs/tracing) | `0.2` | server | Tokio project | Zeki Sherif; Tokio Contributors | Not established |
 | [`tracing-subscriber`](https://github.com/tokio-rs/tracing) | `0.3` | server | Tokio project | Eliza Weisman; David Barsky; Tokio Contributors | Not established |
+| [`windows-service`](https://github.com/mullvad/windows-service-rs) | `0.8` | server, Windows only | Mullvad VPN AB | Mullvad VPN and contributors | [Sweden (company)](https://mullvad.net/en/about) |
 | [`zeroize`](https://github.com/RustCrypto/utils/tree/master/zeroize) | `1` | server | RustCrypto project | The RustCrypto Project Developers | Not established |
 
 ## Go modules

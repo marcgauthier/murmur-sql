@@ -13,6 +13,11 @@ Clients connect using any PostgreSQL wire protocol client or driver and speak th
 SQLite SQL dialect. The server provides authentication, TLS/mTLS, per-connection
 database unlocking, and database administration directly over SQL.
 
+For interactive Windows/Linux service installation, run `murmur-server /install`
+in an elevated console (`sudo ./murmur-server /install` on Linux/systemd).
+Use `/uninstall` to remove the service, with separate confirmations for file
+and data deletion. See [service installation](docs/USAGE.md#install-as-an-operating-system-service).
+
 ## Features
 
 - **PostgreSQL Wire Compatibility**: Connect with standard PostgreSQL clients and drivers (`psql`, Go, Python, Node.js, Rust, etc.) using the SQLite SQL dialect and `$N` parameter binding.
@@ -101,6 +106,7 @@ Administration happens over SQL sessions and the local `murmur-admin` tool:
 | `MURMUR RESTORE FROM '<name>' KEY '<key>'` | Live-restore an archive |
 | `MURMUR ROTATE KEY '<previous>' '<new>'` | Rotate the master key |
 | `MURMUR FLUSH` | Wait for a durable checkpoint |
+| `MURMUR SHOW STATUS` | Read the engine diagnostic snapshot as JSON |
 | `MURMUR PEER ADD\|REMOVE\|RETIRE\|SYNC` | Peer membership administration (needs `replication`) |
 | `MURMUR SHOW PEERS\|REPLICATION\|RETENTION` | Peer list, local summary, retention state |
 | `MURMUR RETENTION COLLECT` | Run one bounded retention pass |
@@ -147,7 +153,7 @@ File listing, LIKE search, uploads, and downloads are available through `MURMUR 
 - [DESIGN.md](docs/DESIGN.md) — engine and persistence architecture.
 - [SCALABILITY.md](docs/SCALABILITY.md) — scaling properties and resource limits.
 - [TESTING.md](docs/TESTING.md) — test suites and commands.
-- [VENDORS.md](VENDORS.md) — external dependency inventory.
+- [VENDORS.md](docs/VENDORS.md) — external dependency inventory.
 - [TODO.md](docs/TODO.md) — roadmap notes.
 
 ## Building and testing

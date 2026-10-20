@@ -171,7 +171,7 @@ async fn run_body(
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
@@ -184,7 +184,7 @@ async fn run_body(
         }
         cluster
             .node(0)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("flush baseline: {e}"))?;
     }
@@ -225,7 +225,7 @@ async fn run_body(
         .map_err(|e| format!("re-set replicated node1 on tmpfs: {e}"))?;
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush node1 on tmpfs: {e}"))?;
     cluster
@@ -263,7 +263,7 @@ async fn run_body(
     for i in 0.. {
         let name = format!("fill-{i:08}");
         if try_insert(cluster, 0, name.clone(), value.clone()).await {
-            let _ = cluster.node(0).flush().await;
+            let _ = cluster.node(0).simple("MURMUR FLUSH").await;
             acked.insert(name);
         } else {
             errored.insert(name);
@@ -285,7 +285,7 @@ async fn run_body(
     let _ = names(cluster, 0).await?;
     let probe = "liveness-probe".to_owned();
     if try_insert(cluster, 0, probe.clone(), "probe".into()).await {
-        let _ = cluster.node(0).flush().await;
+        let _ = cluster.node(0).simple("MURMUR FLUSH").await;
         acked.insert(probe);
     }
 
@@ -304,7 +304,7 @@ async fn run_body(
         .map_err(|e| format!("re-set replicated node1 after recovery: {e}"))?;
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush node1 after recovery: {e}"))?;
     cluster
@@ -342,7 +342,7 @@ async fn run_body(
         }
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("flush post-recovery: {e}"))?;
     }

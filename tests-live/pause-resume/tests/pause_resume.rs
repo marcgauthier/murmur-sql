@@ -306,7 +306,7 @@ async fn run_body(cluster: &Cluster, stop_secs: u64) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
@@ -321,7 +321,7 @@ async fn run_body(cluster: &Cluster, stop_secs: u64) -> Result<(), String> {
         }
         cluster
             .node(0)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("flush baseline: {e}"))?;
     }
@@ -460,7 +460,7 @@ async fn run_body(cluster: &Cluster, stop_secs: u64) -> Result<(), String> {
     }
     cluster
         .node(FROZEN)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush post-resume: {e}"))?;
     acknowledged.lock().expect("acked lock").insert("post-resume".into());

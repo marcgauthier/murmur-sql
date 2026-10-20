@@ -84,8 +84,8 @@ maximum_offline = "5s"
     for i in 0..cluster.len() {
         let client = cluster.node(i);
         client.simple(TABLE_DDL).await.unwrap();
-        client.set_table_replicated("contention", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE contention REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Baseline: 5 rows converge across all 3 nodes before any shutdown
@@ -105,7 +105,7 @@ maximum_offline = "5s"
         acknowledged.insert(name.clone());
         expected_baseline.push(vec![name]);
     }
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     expected_baseline.sort();
 
     assert_rows(
@@ -166,7 +166,7 @@ maximum_offline = "5s"
     // Pause Node 0 writer and drain pending writes
     paused[0].store(true, Ordering::Relaxed);
     tokio::time::sleep(Duration::from_millis(100)).await;
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     // Send SIGTERM to Node 0 for graceful shutdown
     #[cfg(unix)]
@@ -219,9 +219,9 @@ maximum_offline = "5s"
     }
 
     // Flush all nodes
-    cluster.node(0).flush().await.unwrap();
-    cluster.node(1).flush().await.unwrap();
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
 
     // Verify all 3 nodes converge with identical contents, and every acknowledged write is present
     let acked_snapshot = acked_writes.lock().await.clone();
@@ -262,8 +262,8 @@ maximum_offline = "5s"
         phase_b_acked.insert(name);
     }
 
-    cluster.node(0).flush().await.unwrap();
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
 
     let mut expected_survivors: Vec<Vec<String>> =
         phase_b_acked.iter().map(|n| vec![n.clone()]).collect();
@@ -315,7 +315,7 @@ maximum_offline = "5s"
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     let mut expected_final = expected_survivors;
     expected_final.push(vec![post_name.clone()]);

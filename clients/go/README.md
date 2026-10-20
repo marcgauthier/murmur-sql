@@ -126,6 +126,7 @@ Execute these statements using `database/sql`; server setup and restrictions
 are in the [SQL reference](../../docs/USAGE.md#murmur-commands).
 
 ```sql
+MURMUR SHOW STATUS;
 MURMUR SHOW METRICS;
 MURMUR SHOW METRICS SQLITE;
 MURMUR BACKUP SAVE;

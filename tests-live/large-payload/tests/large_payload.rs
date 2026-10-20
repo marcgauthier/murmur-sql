@@ -15,7 +15,7 @@ async fn large_payload() {
         cluster.node(i).simple("CREATE TABLE IF NOT EXISTS records(id TEXT PRIMARY KEY NOT NULL, phone TEXT NOT NULL)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -43,7 +43,7 @@ async fn large_payload() {
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let count = cluster

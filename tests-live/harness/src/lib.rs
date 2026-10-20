@@ -8,7 +8,8 @@
 //! the product wire implementation. See `tests-live/README.md` for the
 //! full design.
 
-pub use tokio_postgres;
+pub use murmur_client;
+pub use murmur_client::tokio_postgres;
 // Product wire-format/crypto implementation, re-exported so hostile-peer
 // scenarios use it through the harness instead of forking it (see
 // `attacker`; no scenario may depend on `murmur-replication` directly).
@@ -21,6 +22,8 @@ pub mod cluster;
 pub mod forensics;
 pub mod ports;
 pub mod unlock;
+pub mod sql;
+pub use tokio;
 
 pub use cluster::{
     BridgeNodeConfig, BridgeOptions, Cluster, ClusterOptions, Dissemination, FilesOptions,
@@ -28,7 +31,7 @@ pub use cluster::{
 };
 
 /// Harness error. Wire errors surface as [`Error::Db`]; match on
-/// `tokio_postgres::Error::code()` for SQLSTATEs.
+/// `murmur_client::Error::code()` for SQLSTATEs.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("harness setup: {0}")]
@@ -40,7 +43,7 @@ pub enum Error {
     #[error("open timed out after {0:?} ({1})")]
     UnlockTimeout(std::time::Duration, &'static str),
     #[error(transparent)]
-    Db(#[from] tokio_postgres::Error),
+    Db(#[from] murmur_client::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -58,7 +61,8 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// (or the client-side parameter cause) lives in the source chain, so
 /// `to_string()` never matches error text. Returns `CODE: message` for
 /// server errors, else the display plus the full cause chain.
-pub fn db_message(e: &tokio_postgres::Error) -> String {
+pub fn db_message(error: &murmur_client::Error) -> String {
+    let murmur_client::Error::Db(e) = error else { return error.to_string(); };
     use std::error::Error as _;
     if let Some(db) = e.as_db_error() {
         let mut msg = format!("{}: {}", db.code().code(), db.message());
@@ -131,3 +135,6 @@ where
         tokio::time::sleep(poll).await;
     }
 }
+
+/// Escape a literal command argument; identifiers/keywords cannot be parameters.
+pub fn sql_literal(value: &str) -> String { format!("'{}'", value.replace('\'', "''")) }

@@ -22,7 +22,7 @@ async fn encrypted_sql_rows_survive_restart_and_reject_wrong_key() {
         .execute("INSERT INTO records(name) VALUES($1)", &[&SECRET])
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     let expected = vec![vec![SECRET.to_string()]];
     assert_eq!(
         cluster

@@ -139,8 +139,8 @@ async fn quic_floor_rejects_below_tls13() {
             .simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .await
             .unwrap();
-        client.set_table_replicated("records", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Mesh positive control: a marker converges over QUIC (TLS 1.3)
@@ -152,7 +152,7 @@ async fn quic_floor_rejects_below_tls13() {
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
 
     let expected = vec![vec!["tls-version-floor-marker".into()]];
     assert_rows(&cluster, &[0, 1], "SELECT name FROM records ORDER BY id", &expected).await;
@@ -202,7 +202,7 @@ async fn quic_floor_rejects_below_tls13() {
         )
         .await
         .unwrap();
-    cluster.node(1).flush().await.unwrap();
+    cluster.node(1).simple("MURMUR FLUSH").await.unwrap();
 
     let expected_both = vec![
         vec!["tls-version-floor-marker".into()],

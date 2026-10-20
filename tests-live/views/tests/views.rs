@@ -36,7 +36,7 @@ async fn sql_projection_tracks_replicated_rows_and_rebuilds() {
         cluster.node(i).simple("CREATE TABLE IF NOT EXISTS contacts(name TEXT PRIMARY KEY NOT NULL, score INTEGER NOT NULL)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("contacts", true)
+            .simple("MURMUR SET TABLE contacts REPLICATED true")
             .await
             .unwrap();
     }
@@ -56,10 +56,10 @@ async fn sql_projection_tracks_replicated_rows_and_rebuilds() {
                 1
             );
         }
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     enabled(&cluster, &[0, 1, 2]).await;
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(2);
     cluster.start_node(2).await.unwrap();
     enabled(&cluster, &[2]).await;

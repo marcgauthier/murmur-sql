@@ -34,8 +34,8 @@ async fn allowed_node_ids_across_processes() {
             .simple("CREATE TABLE IF NOT EXISTS records(id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
             .await
             .unwrap();
-        client.set_table_replicated("records", true).await.unwrap();
-        client.flush().await.unwrap();
+        client.simple("MURMUR SET TABLE records REPLICATED true").await.unwrap();
+        client.simple("MURMUR FLUSH").await.unwrap();
     }
 
     // Concurrent writers on all three nodes
@@ -51,7 +51,7 @@ async fn allowed_node_ids_across_processes() {
                     .await
                     .unwrap();
             }
-            client.flush().await.unwrap();
+            client.simple("MURMUR FLUSH").await.unwrap();
         }
     };
 

@@ -57,7 +57,7 @@ async fn insert_row(cluster: &Cluster, idx: usize, name: &str) -> Result<(), Str
         .map_err(|e| format!("node{} insert failed: {e}", idx + 1))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after insert failed: {e}", idx + 1))?;
     Ok(())
@@ -78,7 +78,7 @@ async fn set_note(cluster: &Cluster, idx: usize, name: &str, note: &str) -> Resu
     }
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after set note failed: {e}", idx + 1))?;
     Ok(())
@@ -141,7 +141,7 @@ async fn migrate_unless_adopted(cluster: &Cluster, idx: usize) -> Result<(), Str
         .map_err(|e| format!("migrate node{}: {e:?}", idx + 1))?;
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush migration on node{}: {e:?}", idx + 1))?;
     Ok(())
@@ -244,7 +244,7 @@ async fn run_body(
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }

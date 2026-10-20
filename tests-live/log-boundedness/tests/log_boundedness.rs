@@ -64,10 +64,10 @@ async fn retained_sql_logs_and_disk_growth_stay_bounded_under_sustained_writes()
         cluster.node(i).simple("CREATE TABLE IF NOT EXISTS contention(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,phone TEXT NOT NULL,score INTEGER NOT NULL)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("contention", true)
+            .simple("MURMUR SET TABLE contention REPLICATED true")
             .await
             .unwrap();
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
     }
     // Establish one intentional session only after both servers are unlocked.
     // This excludes startup bootstrap retries and duplicate-dial closes from
@@ -94,7 +94,7 @@ async fn retained_sql_logs_and_disk_growth_stay_bounded_under_sustained_writes()
         )
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &[0, 1],
@@ -125,7 +125,7 @@ async fn retained_sql_logs_and_disk_growth_stay_bounded_under_sustained_writes()
             )
             .await
             .unwrap();
-        cluster.node(seq % 2).flush().await.unwrap();
+        cluster.node(seq % 2).simple("MURMUR FLUSH").await.unwrap();
         expected.push(vec![id, body, "".into(), "0".into()]);
         if mid.is_none() && end.saturating_duration_since(Instant::now()) < duration / 2 {
             mid = Some(vec![sample(&cluster, 0).await, sample(&cluster, 1).await]);

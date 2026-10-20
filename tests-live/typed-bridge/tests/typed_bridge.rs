@@ -80,7 +80,7 @@ async fn insert_row(low: &Cluster) -> Result<(), String> {
         .await
         .map_err(|e| format!("low typed insert failed: {e}"))?;
     low.node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("low flush after typed insert failed: {e}"))?;
     Ok(())
@@ -99,7 +99,7 @@ async fn update_title(cluster: &Cluster, label: &str, title: &str) -> Result<(),
         .map_err(|e| format!("{label} title update failed: {e}"))?;
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("{label} flush after title update failed: {e}"))?;
     Ok(())
@@ -207,7 +207,7 @@ async fn run_body(
             .map_err(|e| format!("{label} SET TABLE REPLICATED: {e}"))?;
         cluster
             .node(0)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("{label} flush after SET TABLE failed: {e}"))?;
     }

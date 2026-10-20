@@ -57,7 +57,7 @@ async fn migrate_all(cluster: &Cluster) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
@@ -76,7 +76,7 @@ async fn insert_names(cluster: &Cluster, idx: usize, prefix: &str, count: usize)
     }
     cluster
         .node(idx)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after inserts: {e}", idx + 1))?;
     Ok(())

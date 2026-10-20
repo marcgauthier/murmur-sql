@@ -356,3 +356,31 @@ async fn engine_created_tables_remain_local_on_first_unlock() {
     let config = murmur_sql::config::Config::load(dir.path().join("config.toml")).unwrap();
     assert!(config.replication.tables.is_empty());
 }
+
+#[tokio::test]
+async fn diagnostic_status_is_read_only_typed_json_over_both_protocols() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(&dir, free_port());
+    let client = connect(&server, "admin", PASSWORD).await.unwrap();
+    let locked = client.simple_query("MURMUR SHOW STATUS").await.unwrap_err();
+    assert_eq!(code(&locked), "28000");
+    client.simple_query(&format!("MURMUR UNLOCK KEY '{KEY}'")).await.unwrap();
+    client.simple_query("CREATE TABLE status_rows(id INTEGER PRIMARY KEY); INSERT INTO status_rows VALUES(1); MURMUR FLUSH").await.unwrap();
+    let statement = client.prepare("MURMUR SHOW STATUS").await.unwrap();
+    assert_eq!(statement.columns()[0].name(), "status");
+    assert_eq!(statement.columns()[0].type_(), &tokio_postgres::types::Type::TEXT);
+    let rows = client.query(&statement, &[]).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    let snapshot: serde_json::Value = serde_json::from_str(rows[0].get::<_, &str>(0)).unwrap();
+    assert_eq!(snapshot["closed"], false);
+    assert_eq!(snapshot["pending_bytes"], 0);
+    assert!(snapshot["scheduler"]["local"]["acquisitions"].is_u64());
+    assert!(snapshot["spool"]["disk_bytes"].is_u64());
+    let simple = client.simple_query("MURMUR SHOW STATUS").await.unwrap();
+    let row = simple.iter().find_map(|message| match message { tokio_postgres::SimpleQueryMessage::Row(row) => Some(row), _ => None }).unwrap();
+    let _: serde_json::Value = serde_json::from_str(row.get(0).unwrap()).unwrap();
+    let invalid = client.simple_query("MURMUR SHOW STATUS extra").await.unwrap_err();
+    assert_eq!(code(&invalid), "42601");
+    let count: i64 = client.query_one("SELECT count(*) FROM status_rows", &[]).await.unwrap().get(0);
+    assert_eq!(count, 1);
+}

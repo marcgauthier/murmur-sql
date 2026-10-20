@@ -1,8 +1,8 @@
 # Usage documentation maintenance
 
-Documentation layout: every Markdown file other than `AGENTS.md`, `README.md`, and `VENDORS.md`
-(`USAGE.md`, `DESIGN.md`, `SCALABILITY.md`, `TESTING.md`, `TODO.md`)
-lives in the `./docs` folder. Those three stay at the repository root.
+Documentation layout: every Markdown file other than `AGENTS.md` and `README.md`
+(`USAGE.md`, `DESIGN.md`, `SCALABILITY.md`, `TESTING.md`, `TODO.md`, `VENDORS.md`)
+lives in the `./docs` folder. Only those two stay at the repository root.
 Keep relative links valid when editing or moving them.
 
 Keep `./docs/USAGE.md` accurate after code changes. Any change to public APIs, SQL
@@ -27,7 +27,7 @@ the Go client, its README, examples, and docs/USAGE.md in the same change.
 Keep the Go example catalog and `clients/go/examples/coverage.json` aligned
 with the client feature table. New capabilities need a runnable example with
 result checks and documented setup/restrictions. Run the Go suite, `go vet`,
-and the race detector; preserve Linux, macOS, and Windows CI. Keep `VENDORS.md`
+and the race detector; preserve Linux, macOS, and Windows CI. Keep `docs/VENDORS.md`
 synchronized with the root Rust dependencies and the Go module requirements.
 Avoid duplicating Rust conflict, crypto, wire-format, or persistence
 implementations in Go.
@@ -60,4 +60,11 @@ API (or `murmur::host::` helper) in `../MURMUR` instead. Wire-visible behavior
 changes need a `tests/` pgwire test and a `docs/USAGE.md` example in the same
 change.
 
-Maintain a root VENDORS.md listing only direct external package/crate dependencies required to build or run the server and clients. Exclude test-only, benchmark-only, and transitive dependencies.  I want to see the name of the company and author and country of orgin for the company if there is one otherwise the author.
+Live database scenarios under `tests-live/` must use `clients/rust` with real
+`murmur-server` child processes and explicit SQL statements. Do not import
+embedded database APIs, use transaction closures, or inspect engine objects in
+the harness. Engine diagnostic snapshots must be read over SQL. Fault injection
+may manipulate processes, networks, configs, or durable artifacts; hostile QUIC
+fixtures must reuse the existing protocol implementation rather than fork it.
+
+Maintain docs/VENDORS.md listing only direct external package/crate dependencies required to build or run the server and clients. Exclude test-only, benchmark-only, and transitive dependencies.  I want to see the name of the company and author and country of orgin for the company if there is one otherwise the author.

@@ -644,7 +644,7 @@ async fn write_one(
                 )
                 .await
                 .map_err(|e| e.to_string())?;
-            guard.node(target).flush().await.map_err(|e| e.to_string())
+            guard.node(target).simple("MURMUR FLUSH").await.map(|_| ()).map_err(|e| e.to_string())
         }
         .await;
         drop(guard);
@@ -681,7 +681,7 @@ async fn write_one(
             if changed != 1 {
                 return Err(format!("update hit {changed} rows"));
             }
-            guard.node(target).flush().await.map_err(|e| e.to_string())
+            guard.node(target).simple("MURMUR FLUSH").await.map(|_| ()).map_err(|e| e.to_string())
         }
         .await;
         drop(guard);
@@ -707,7 +707,7 @@ async fn write_one(
                 .execute("DELETE FROM contention WHERE id = $1", &[&row_id])
                 .await
                 .map_err(|e| e.to_string())?;
-            guard.node(target).flush().await.map_err(|e| e.to_string())
+            guard.node(target).simple("MURMUR FLUSH").await.map(|_| ()).map_err(|e| e.to_string())
         }
         .await;
         drop(guard);
@@ -1579,7 +1579,7 @@ async fn run_body(cluster: &Shared, cfg: &Config, runtime_dir: &Path, initial_ke
             .simple("MURMUR SET TABLE contention REPLICATED true")
             .await
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
-        guard.node(i).flush().await.map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
+        guard.node(i).simple("MURMUR FLUSH").await.map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }
 
     // Baseline: one row everywhere before chaos starts.
@@ -1593,7 +1593,7 @@ async fn run_body(cluster: &Shared, cfg: &Config, runtime_dir: &Path, initial_ke
             )
             .await
             .map_err(|e| format!("baseline insert: {e}"))?;
-        guard.node(0).flush().await.map_err(|e| format!("flush baseline: {e}"))?;
+        guard.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("flush baseline: {e}"))?;
     }
     wait_agreement(cluster, cfg.nodes, 1, BASELINE_TIMEOUT).await?;
     rep.log(format!("baseline row converged on all {} nodes", cfg.nodes));
@@ -1815,7 +1815,7 @@ async fn run_body(cluster: &Shared, cfg: &Config, runtime_dir: &Path, initial_ke
             rep.verdict(false, &report_path, "post-chaos write rejected");
             return Err(format!("post-chaos write: {e}"));
         }
-        guard.node(0).flush().await.map_err(|e| format!("flush post-chaos write: {e}"))?;
+        guard.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("flush post-chaos write: {e}"))?;
     }
     if let Err(e) = wait_agreement(cluster, cfg.nodes, counts[0] as usize + 1, cfg.settle).await {
         rep.verdict(false, &report_path, "post-chaos write did not converge");

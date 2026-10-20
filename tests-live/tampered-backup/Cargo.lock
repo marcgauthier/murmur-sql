@@ -483,6 +483,7 @@ dependencies = [
 name = "murmur-live-sql-harness"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "ed25519-dalek",
  "murmur-client",
  "rand 0.8.8",

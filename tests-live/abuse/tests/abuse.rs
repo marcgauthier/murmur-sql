@@ -40,7 +40,7 @@ async fn stop(cluster: &mut Cluster, slots: &Slots, nodes: &[usize]) {
         // lock drains acknowledged writes before killing that server only.
         let mut slot = slots[i].write().await;
         slot.take();
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
     }
 }
@@ -88,7 +88,7 @@ async fn abuse_mesh_preserves_acknowledged_sql_writes_through_all_four_phases() 
         cluster.node(i).simple("CREATE TABLE contention(id TEXT PRIMARY KEY NOT NULL,name TEXT NOT NULL,phone TEXT NOT NULL,score INTEGER NOT NULL)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("contention", true)
+            .simple("MURMUR SET TABLE contention REPLICATED true")
             .await
             .unwrap();
         let mut donors = toml_edit::Array::new();
@@ -97,7 +97,7 @@ async fn abuse_mesh_preserves_acknowledged_sql_writes_through_all_four_phases() 
                 donors.push(cluster.node_info(j).node_id.clone());
             }
         }
-        cluster.node(i).flush().await.unwrap();
+        cluster.node(i).simple("MURMUR FLUSH").await.unwrap();
         cluster.stop_node(i);
         cluster
             .edit_config(i, |d| {
@@ -112,7 +112,7 @@ async fn abuse_mesh_preserves_acknowledged_sql_writes_through_all_four_phases() 
         .simple("INSERT INTO contention(id,name,phone,score) VALUES('baseline','baseline','',0)")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &all,
@@ -158,7 +158,7 @@ async fn abuse_mesh_preserves_acknowledged_sql_writes_through_all_four_phases() 
                         )
                         .await
                         .unwrap();
-                    client.flush().await.unwrap();
+                    client.simple("MURMUR FLUSH").await.unwrap();
                     acked.lock().await.insert(id, name);
                 }
                 drop(slot);

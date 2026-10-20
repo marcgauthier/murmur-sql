@@ -12,7 +12,7 @@ async fn bad_credentials_and_unlock_keys_do_not_disclose_secrets_or_damage_sql()
     .await
     .unwrap();
     cluster.node(0).simple("CREATE TABLE records(id INTEGER PRIMARY KEY, body TEXT); INSERT INTO records VALUES(1,'kept')").await.unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     for attempt in 0..12 {
         let mut config = cluster.config(0);
         let secret = format!("unlock-attack-secret-{attempt}");

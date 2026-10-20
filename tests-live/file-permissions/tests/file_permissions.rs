@@ -56,19 +56,17 @@ async fn sql_storage_and_backup_permissions_remain_private_after_restore() {
             .unwrap();
         expected.push(vec![name]);
     }
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     private_tree(&data);
-    let backup = cluster.node(0).backup_save().await.unwrap();
-    private_tree(&cluster.node_info(0).dir.join("backups").join(&backup.name));
+    let backup = cluster.node(0).simple("MURMUR BACKUP SAVE").await.unwrap();
+    private_tree(&cluster.node_info(0).dir.join("backups").join(&backup[0][0]));
     let mut archive_bytes = Vec::new();
-    cluster
-        .node(0)
-        .backup_download(&backup.name, &mut archive_bytes)
+    murmur_live_harness::transfers::download(cluster
+        .node(0), &format!("MURMUR BACKUP DOWNLOAD {}", murmur_live_harness::sql_literal(&backup[0][0])), &mut archive_bytes)
         .await
         .unwrap();
-    cluster
-        .node(0)
-        .backup_upload("permissions-copy.murmur-backup", &archive_bytes[..])
+    murmur_live_harness::transfers::upload(cluster
+        .node(0), "permissions-copy.murmur-backup", &archive_bytes[..])
         .await
         .unwrap();
     private_tree(
@@ -81,7 +79,7 @@ async fn sql_storage_and_backup_permissions_remain_private_after_restore() {
     cluster.node(0).simple("DELETE FROM records").await.unwrap();
     cluster
         .node(0)
-        .restore("permissions-copy.murmur-backup", KEY)
+        .simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal("permissions-copy.murmur-backup"),murmur_live_harness::sql_literal(KEY)))
         .await
         .unwrap();
     let fresh = cluster.connect(0).await.unwrap();
@@ -92,7 +90,7 @@ async fn sql_storage_and_backup_permissions_remain_private_after_restore() {
             .unwrap(),
         expected
     );
-    fresh.flush().await.unwrap();
+    fresh.simple("MURMUR FLUSH").await.unwrap();
     drop(fresh);
     private_tree(&data);
     cluster.stop_node(0);

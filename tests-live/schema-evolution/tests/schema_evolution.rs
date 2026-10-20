@@ -14,7 +14,7 @@ async fn additive_sql_schema_migration_preserves_rows_and_replication_settings()
         cluster.node(i).simple("CREATE TABLE IF NOT EXISTS records(name TEXT PRIMARY KEY NOT NULL, score INTEGER NOT NULL)").await.unwrap();
         cluster
             .node(i)
-            .set_table_replicated("records", true)
+            .simple("MURMUR SET TABLE records REPLICATED true")
             .await
             .unwrap();
     }
@@ -23,7 +23,7 @@ async fn additive_sql_schema_migration_preserves_rows_and_replication_settings()
         .simple("INSERT INTO records(name,score) VALUES('seed',1)")
         .await
         .unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     assert_rows(
         &cluster,
         &[0, 1, 2],
@@ -31,7 +31,7 @@ async fn additive_sql_schema_migration_preserves_rows_and_replication_settings()
         &[vec!["seed".into(), "1".into()]],
     )
     .await;
-    cluster.node(2).flush().await.unwrap();
+    cluster.node(2).simple("MURMUR FLUSH").await.unwrap();
     cluster.stop_node(2);
     cluster
         .node(0)
@@ -39,7 +39,7 @@ async fn additive_sql_schema_migration_preserves_rows_and_replication_settings()
         .await
         .unwrap();
     cluster.node(0).simple("UPDATE records SET note='new-field' WHERE name='seed'; INSERT INTO records(name,score,note) VALUES('new',2,'written-after-ddl')").await.unwrap();
-    cluster.node(0).flush().await.unwrap();
+    cluster.node(0).simple("MURMUR FLUSH").await.unwrap();
     let expected = vec![
         vec!["new".into(), "2".into(), "written-after-ddl".into()],
         vec!["seed".into(), "1".into(), "new-field".into()],
@@ -67,11 +67,11 @@ async fn additive_sql_schema_migration_preserves_rows_and_replication_settings()
     for i in 0..3 {
         assert!(cluster
             .node(i)
-            .table_replication()
+            .simple("MURMUR SHOW TABLES REPLICATION")
             .await
             .unwrap()
             .iter()
-            .any(|f| f.table == "records" && f.replicated));
+            .any(|f| f[0] == "records" && f[1] == "true"));
     }
     cluster.node(0).simple("CREATE TABLE local_only(id INTEGER PRIMARY KEY, old TEXT); ALTER TABLE local_only RENAME COLUMN old TO renamed; ALTER TABLE local_only RENAME TO renamed_local; DROP TABLE renamed_local").await.unwrap();
     assert_rows(

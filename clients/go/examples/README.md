@@ -33,7 +33,7 @@ go run ./examples/bridge
 | json         | JSON extraction, updates, arrays, bound strings, validation and JSONB |
 | vectors      | Vector declarations, KNN neighbors, numeric distances and disable |
 | search       | Column FTS, parameterized MATCH, refresh and disable |
-| metrics      | SQLite and Spool operational metrics            |
+| metrics      | SQLite/Spool metrics and JSON engine diagnostics            |
 | files        | Encrypted binary upload/download and LIKE cursor search |
 | replication  | Two-node peer mesh, retention, CRDT policy ops, retire |
 | bridge       | High-receiver field release, re-release, row form |

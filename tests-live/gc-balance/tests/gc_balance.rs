@@ -78,7 +78,7 @@ async fn insert_seed(cluster: &Cluster, id: String, name: String) -> Result<(), 
         .map_err(|e| format!("seed insert failed: {e}"))?;
     cluster
         .node(0)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("flush after seed insert: {e}"))?;
     Ok(())
@@ -96,7 +96,7 @@ async fn try_update_name(cluster: &Cluster, id: &str, name: String) -> Result<()
     if changed != 1 {
         return Err(format!("update hit {changed} rows"));
     }
-    cluster.node(0).flush().await.map_err(|e| e.to_string())?;
+    cluster.node(0).simple("MURMUR FLUSH").await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -344,7 +344,7 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }

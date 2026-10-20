@@ -412,7 +412,7 @@ async fn commit_big_tx(
         .map_err(|e| format!("node{} big-tx COMMIT ({prefix}): {e}", node + 1))?;
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after big-tx ({prefix}): {e}", node + 1))?;
     Ok(())
@@ -615,7 +615,7 @@ async fn run_body(cluster: &mut Cluster, rows_per_tx: usize, value_bytes: usize,
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }

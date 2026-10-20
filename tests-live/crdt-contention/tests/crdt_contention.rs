@@ -81,7 +81,7 @@ async fn insert_row(
         .map_err(|e| format!("node{} baseline insert: {e}", node + 1))?;
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after baseline: {e}", node + 1))?;
     Ok(())
@@ -103,7 +103,7 @@ async fn update_text(cluster: &Cluster, node: usize, field: &str, value: &str) -
         .map_err(|e| format!("node{} update {field}={value:?}: {e}", node + 1))?;
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after {field} update: {e}", node + 1))?;
     Ok(())
@@ -120,7 +120,7 @@ async fn update_score(cluster: &Cluster, node: usize, value: i64) -> Result<(), 
         .map_err(|e| format!("node{} update score={value}: {e}", node + 1))?;
     cluster
         .node(node)
-        .flush()
+        .simple("MURMUR FLUSH")
         .await
         .map_err(|e| format!("node{} flush after score update: {e}", node + 1))?;
     Ok(())
@@ -290,7 +290,7 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
             .map_err(|e| format!("node{} SET TABLE REPLICATED: {e}", i + 1))?;
         cluster
             .node(i)
-            .flush()
+            .simple("MURMUR FLUSH")
             .await
             .map_err(|e| format!("node{} flush after SET TABLE: {e}", i + 1))?;
     }

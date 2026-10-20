@@ -1,70 +1,22 @@
-# three-way-heal (Rust port)
+# Three-way healing through live SQL
 
-Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/three-way-heal/`
-(`README.md` + `three_way_heal_test.go`:
-`TestHealOrderDoesNotAffectFinalDigest`).
+Four live Murmur-SQL processes split into isolated pairs. Each pair performs
+its own SQL inserts and conflicting updates to shared baseline rows. Exact row
+counts and differing row values prove the partition held. Links heal one at a
+time in two different orders, with SQL peer/row checks after each link; all
+nodes must converge to the same exact rows and the same later conflict winner.
 
-## What it proves
-
-Four fully meshed nodes split into isolated pairs (0,1) and (2,3),
-diverge with deterministic writes (disjoint inserts plus conflicting
-updates to the same base rows), then heal link-by-link in a
-caller-supplied order. Two different heal orders must reach the
-identical final digest: heal order must not affect the converged
-state, including LWW conflict winners.
-
-## Pass criteria
-
-- `Cluster::new` opens 4 meshed nodes under
-  `tests-live/runtime/three-way-heal-a/` (then `-b` for the second
-  order).
-- 10 baseline inserts on node 0 converge on all 4 nodes within 150 s
-  (honest-path control).
-- After removing the 4 cross links in both directions, side A (node 1)
-  and side B (node 3) each write 10 disjoint inserts plus 10
-  conflicting updates to the base rows; each pair converges
-  internally on 20 rows within 150 s, with divergent digests (split
-  proof).
-- Each of the 4 links heals in the prescribed order (default
-  `0,1,2,3` then `3,2,1,0`); after every heal, real cross-side
-  traffic must appear on the new link within 30 s.
-- After the final heal, all 4 nodes converge on exactly 30 rows with
-  equal digests within 150 s.
-- The final digests of both orders are identical (the assertion); the
-  LWW winner on row 1000 is logged for forensics.
-
-## Env knobs
-
-- `MURMUR_THREE_WAY_HEAL_ORDER` (default `0,1,2,3`): first heal order,
-  a permutation of the 4 cross-link indexes.
-- `MURMUR_THREE_WAY_HEAL_ORDER_B` (default `3,2,1,0`): second heal order.
-- Harness knobs apply: `MURMUR_LIVE_RUNTIME`,
-  `MURMUR_LIVE_FAILURES`, `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`.
-
-## Deviations from the Go original
-
-- In-process multi-`Database` cluster (QUIC mesh, ephemeral `127.0.0.1:0`)
-  instead of `testnode` daemon processes over HTTPS+mTLS (per design).
-- Plain SQL (`records(id INTEGER PRIMARY KEY, name TEXT)`) instead of the
-  managed typed-records HTTP API (`TypedContentionInsert` /
-  `TypedContentionUpdate` / `TypedContentionRows`); integer ids 1000+i /
-  2000+i / 3000+i replace the formatted typed UUIDs. The Go
-  `AwaitUnlock` / `TypedRecords` / `TypedContention` cluster options
-  have no Rust equivalents (no unlock endpoint; SQL schema instead of
-  typed fixtures).
-- Digest is FNV-1a 64 (hex) over the canonical `id\0name\0` row
-  encoding instead of sha256: std-only, no new dependency. The test
-  only asserts digest equality across heal orders, which this
-  preserves; rows arrive ordered via `ORDER BY id`.
-- The two heal orders run as sequential clusters inside one `#[test]`
-  (each with its own runtime dir, forensics, and `finish`), matching
-  Go's sequential `runHealOrder` calls; a failure in either order
-  dumps forensics, retains artifacts, and re-panics.
-- Directory logging shows label/dir/repl-addr (no PIDs exist in-process).
-
-## Compile check (only gate; never run here)
+`MURMUR_THREE_WAY_HEAL_ORDER` defaults to `0,1,2,3` and
+`MURMUR_THREE_WAY_HEAL_ORDER_B` to `3,2,1,0`. Both must be permutations of the
+four cross-pair links. Database work and diagnostics use SQL through
+`clients/rust`; process and peer fault controls belong to the live harness.
+No embedded database is linked or opened by this scenario.
 
 ```sh
-cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/three-way-heal/Cargo.toml
+tests-live/run.sh three-way-heal
 ```
+
+Use prebuilt replication-enabled server/admin binaries through
+`MURMUR_SERVER_BIN` / `MURMUR_ADMIN_BIN`, or let the runner build them.
+Failures preserve runtime artifacts. Passing a compile check does not replace
+executing both healing orders against live servers.

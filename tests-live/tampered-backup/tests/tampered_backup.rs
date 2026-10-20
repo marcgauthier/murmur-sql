@@ -31,11 +31,10 @@ async fn tampered_backup_streams_leave_live_database_untouched() {
         .simple("SELECT id,name FROM records ORDER BY id")
         .await
         .unwrap();
-    let saved = cluster.node(0).backup_save().await.unwrap();
+    let saved = cluster.node(0).simple("MURMUR BACKUP SAVE").await.unwrap();
     let mut original = Vec::new();
-    cluster
-        .node(0)
-        .backup_download(&saved.name, &mut original)
+    murmur_live_harness::transfers::download(cluster
+        .node(0), &format!("MURMUR BACKUP DOWNLOAD {}", murmur_live_harness::sql_literal(&saved[0][0])), &mut original)
         .await
         .unwrap();
     assert!(original.len() > 100);
@@ -51,9 +50,9 @@ async fn tampered_backup_streams_leave_live_database_untouched() {
         ("truncated.murmur-backup", truncated),
     ] {
         // Upload may reject a malformed envelope; otherwise restore must reject it.
-        if cluster.node(0).backup_upload(name, &data[..]).await.is_ok() {
+        if murmur_live_harness::transfers::upload(cluster.node(0), name, &data[..]).await.is_ok() {
             assert!(
-                cluster.node(0).restore(name, KEY).await.is_err(),
+                cluster.node(0).simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal(name),murmur_live_harness::sql_literal(KEY))).await.is_err(),
                 "accepted corrupt archive {name}"
             );
         }
@@ -68,7 +67,7 @@ async fn tampered_backup_streams_leave_live_database_untouched() {
         );
     }
     cluster.node(0).simple("DELETE FROM records").await.unwrap();
-    cluster.node(0).restore(&saved.name, KEY).await.unwrap();
+    cluster.node(0).simple(&format!("MURMUR RESTORE FROM {} KEY {}",murmur_live_harness::sql_literal(&saved[0][0]),murmur_live_harness::sql_literal(KEY))).await.unwrap();
     assert_eq!(
         cluster
             .connect(0)

@@ -254,7 +254,7 @@ async fn run_cell(profile: &Profile, level: i32, scale: usize) -> Result<CellRes
     let body = async {
         match cluster.node(0).simple("CREATE TABLE cells(id TEXT NOT NULL PRIMARY KEY, code TEXT NOT NULL, qty INTEGER NOT NULL, price REAL NOT NULL, title TEXT NOT NULL, body TEXT NOT NULL, tags TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, data BLOB NOT NULL)").await {
             Ok(_) => {
-                if let Err(e) = cluster.node(0).flush().await {
+                if let Err(e) = cluster.node(0).simple("MURMUR FLUSH").await {
                     return Err(format!("flush error: {e:#?}"));
                 }
             }
@@ -308,7 +308,7 @@ async fn run_cell(profile: &Profile, level: i32, scale: usize) -> Result<CellRes
                 .execute(&sql, &refs)
                 .await
                 .map_err(|e| format!("batch insert at {base}: {e}"))?;
-            cluster.node(0).flush().await.map_err(|e| format!("flush batch at {base}: {e}"))?;
+            cluster.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("flush batch at {base}: {e}"))?;
         }
         // Churn pass: update every 10th row like live traffic would.
         let mut churned = 0;
@@ -319,11 +319,11 @@ async fn run_cell(profile: &Profile, level: i32, scale: usize) -> Result<CellRes
             if churn(&cluster, profile, id).await? {
                 churned += 1;
                 if churned % CHURN_FLUSH_STRIDE == 0 {
-                    cluster.node(0).flush().await.map_err(|e| format!("flush churn: {e}"))?;
+                    cluster.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("flush churn: {e}"))?;
                 }
             }
         }
-        cluster.node(0).flush().await.map_err(|e| format!("final flush: {e}"))?;
+        cluster.node(0).simple("MURMUR FLUSH").await.map_err(|e| format!("final flush: {e}"))?;
         let write_dur = start.elapsed();
 
         let count_rows = cluster
