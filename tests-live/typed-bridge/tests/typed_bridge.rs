@@ -106,7 +106,8 @@ async fn update_title(cluster: &Cluster, label: &str, title: &str) -> Result<(),
 }
 
 /// Release High ownership of one field (Go: `Cluster.BridgeRelease`).
-/// Retries while the engine reports busy (`released` = false).
+/// Retries while the engine reports busy (`released` = false). Callers
+/// pass the column in mixed case to cover case-insensitive resolution.
 async fn release_title(high: &Cluster, column: &str) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + WAIT;
     loop {
@@ -236,7 +237,7 @@ async fn run_body(
     }
     // Release High ownership of `title`: the next Low update flows
     // through and replaces the High-owned value.
-    release_title(high, "title").await?;
+    release_title(high, "TITLE").await?;
     update_title(low, "low", "low-update-after-release").await?;
     wait_title(high, "low-update-after-release", 1).await?;
     if title_count(high, "high-owned-record").await? != 0 {

@@ -27,7 +27,7 @@ Therefore Rust ports are **multi-process integration tests**:
 - Stop/restart/kill act on the child directly (`stop_node`, `start_node`,
   `kill_node`); unix-only `suspend_node`/`resume_node` (SIGSTOP/SIGCONT)
   cover pause legs on the classic harness. No fixture binary is needed.
-- All 73 scenario packages use `clients/rust` against live `murmur-server`
+- All 74 scenario packages use `clients/rust` against live `murmur-server`
   processes. Application data, DDL, settings, diagnostics, backups, and files
   are exercised with explicit SQL statements, including `MURMUR ...` commands.
 - Two fixture packages remain: `harness/` wraps a Rust client connection with
@@ -365,7 +365,8 @@ abuse, endurance-chaos, resource-exhaustion, diskfull-live (env-gated),
 impaired-network (env-gated), graceful-shutdown (`stop_node` losslessness;
 SIGTERM is the default stop path), unlock-abuse (`MURMUR UNLOCK` key
 auth), tls-floor (PG-wire TLS versions), api-mtls (PG-wire mTLS;
-production mode), dos-client (PG-wire + QUIC flood legs).
+production mode), dos-client (PG-wire + QUIC flood legs), search-mesh
+(managed FTS/vector/JSON over the mesh; node 0 is schema master).
 
 Needs product-interface decisions (HTTP legs have no Rust equivalent; port
 the wire-level intent instead):

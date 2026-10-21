@@ -15,8 +15,12 @@ func main() {
 	run.Main(func(t servertest.TB, dir string) {
 		ctx := context.Background()
 		pki := servertest.IssuePKI(t)
+		// Dev TLS verifies the server only; the server rejects ca_file
+		// outside production, where it would falsely imply mTLS.
+		tlsFiles := pki.WriteServerFiles(t, dir)
+		tlsFiles.CA = ""
 		server := servertest.Start(t, dir, servertest.Options{
-			TLSFiles: pki.WriteServerFiles(t, dir),
+			TLSFiles: tlsFiles,
 		})
 		db, err := murmur.Open(ctx, murmur.Config{
 			Host: "127.0.0.1", Port: server.Port,

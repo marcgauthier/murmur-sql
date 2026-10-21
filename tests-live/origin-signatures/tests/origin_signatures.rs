@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use murmur_live_harness::attacker::Attacker;
 use murmur_live_harness::replication::protocol::{self, Chunk, Message, Transaction};
 use murmur_live_harness::replication::{retention, snapshot};
-use murmur_live_harness::{wait_until_async, Cluster, ClusterOptions};
+use murmur_live_harness::{tokio, wait_until_async, Cluster, ClusterOptions};
 
 const A: usize = 0;
 const B: usize = 1;
@@ -150,6 +150,41 @@ async fn counters(cluster: &Cluster, idx: usize) -> Result<Counters, String> {
         .parse::<u64>()
         .map_err(|e| format!("node{} applied {:?}: {e}", idx + 1, row[5]))?;
     Ok(Counters { received, applied })
+}
+
+/// Wait until no batch is staged and the applied cursor holds still:
+/// `staged` is a gauge, so a baseline sampled mid-flight would demand
+/// in-flight verified data never apply. A timeout means the node never
+/// quiesced (a liveness bug), not a slow test.
+async fn wait_counters_quiet(
+    cluster: &Cluster,
+    idx: usize,
+    what: &str,
+) -> Result<Counters, String> {
+    let start = Instant::now();
+    let mut last = counters(cluster, idx).await?;
+    let mut stable = 0u32;
+    loop {
+        let current = counters(cluster, idx).await?;
+        if current.received == 0 && current.applied == last.applied {
+            stable += 1;
+            if stable >= 3 {
+                return Ok(current);
+            }
+        } else {
+            stable = 0;
+        }
+        last = current;
+        if start.elapsed() >= Duration::from_secs(30) {
+            return Err(format!(
+                "{what}: node{} counters never quiesced (staged={}, applied={})",
+                idx + 1,
+                last.received,
+                last.applied
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn assert_counters(cluster: &Cluster, idx: usize, base: &Counters, ctx: &str) -> Result<(), String> {
@@ -473,16 +508,31 @@ async fn run_body(cluster: &mut Cluster) -> Result<(), String> {
 
     // Honest baseline on C (Go: `before := status` + honest receipt).
     // The applied row is the receipt proof: receipts commit atomically
-    // with the apply, and there is no public receipt read API.
+    // with the apply, and there is no public receipt read API. Drain
+    // first: `staged` is a gauge, and a baseline sampled mid-flight
+    // would demand in-flight verified data never apply.
+    wait_counters_quiet(cluster, C, "honest convergence").await?;
     let base = counters(cluster, C).await?;
     if names(cluster, C).await? != vec!["from-A".to_string()] {
         return Err("honest transaction missing on C".into());
     }
 
-    // B stops; from here C is alone with its forwarded state.
+    // B stops; from here C is alone with its forwarded state. Batches
+    // B sent before dying still apply afterwards (verified data must
+    // never be dropped), so drain to quiescence and require only that
+    // the applied cursor never moves backwards; the attack legs below
+    // re-baseline and assert exact stillness instead.
     cluster.stop_node(B).await;
     wait_quiet(cluster, C, "B shutdown").await?;
-    assert_counters(cluster, C, &base, "after B shutdown").await?;
+    let drained = wait_counters_quiet(cluster, C, "B shutdown drain").await?;
+    if drained.applied < base.applied {
+        return Err(format!(
+            "node{} applied cursor moved backwards after B shutdown: {} -> {}",
+            C + 1,
+            base.applied,
+            drained.applied
+        ));
+    }
     let relay_base = baseline(cluster, C).await?;
 
     // Hostile relay, authenticated as B (fresh TLS leaf for B's id, B's

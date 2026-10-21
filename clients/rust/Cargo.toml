@@ -1,6 +1,6 @@
 [package]
 name = "murmur-client"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 description = "Pure-Rust async client for the Murmur in-memory SQLite server (PostgreSQL wire protocol)"
 publish = false

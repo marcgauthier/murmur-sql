@@ -97,8 +97,12 @@ fn parse_level(level: &str) -> Result<tracing::level_filters::LevelFilter> {
 
 /// Delete `<prefix>.YYYY-MM-DD` files in `dir` older than `retention_days`.
 /// Returns the number of files removed. Files that do not match the pattern
-/// are left untouched.
+/// are left untouched. A zero retention keeps everything; one undeletable
+/// file never fails the whole pass (and must never fail server startup).
 pub fn enforce_retention(dir: impl AsRef<Path>, prefix: &str, retention_days: u32) -> Result<usize> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
     let today = unix_days(std::time::SystemTime::now());
     let mut removed = 0;
     let entries = std::fs::read_dir(dir.as_ref())
@@ -113,9 +117,10 @@ pub fn enforce_retention(dir: impl AsRef<Path>, prefix: &str, retention_days: u3
             continue;
         };
         if today.saturating_sub(days) > retention_days as u64 {
-            std::fs::remove_file(entry.path())
-                .map_err(|e| Error::Invalid(format!("cannot remove old log {name:?}: {e}")))?;
-            removed += 1;
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) => tracing::warn!("cannot remove old log {name:?}: {e}"),
+            }
         }
     }
     Ok(removed)
@@ -141,15 +146,17 @@ fn parse_log_date(date: &str) -> Option<(i64, u32, u32)> {
     Some((y, m, d))
 }
 
-/// Days since 1970-01-01 (Howard Hinnant's days-from-civil).
+/// Days since 1970-01-01 (Howard Hinnant's days-from-civil), clamped at
+/// zero so ancient dates (e.g. year 0000 in a crafted filename) delete as
+/// old instead of overflowing the era multiplication.
 fn civil_to_days((y, m, d): (i64, u32, u32)) -> u64 {
     let y = if m <= 2 { y - 1 } else { y };
-    let era = y.div_euclid(400);
-    let yoe = y.rem_euclid(400) as u64;
-    let mp = ((m as i64 + 9) % 12) as u64;
-    let doy = (153 * mp + 2) / 5 + (d as u64 - 1);
+    let era = y.div_euclid(400) as i128;
+    let yoe = y.rem_euclid(400) as i128;
+    let mp = ((m as i64 + 9) % 12) as i128;
+    let doy = (153 * mp + 2) / 5 + (d as i128 - 1);
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    (era as u64 * 146097 + doe).saturating_sub(719468)
+    (era * 146097 + doe - 719468).max(0) as u64
 }
 
 struct VictoriaLogsGuard {
@@ -346,6 +353,10 @@ mod tests {
         // civil_to_days must agree with unix time for known dates.
         assert_eq!(civil_to_days((1970, 1, 1)), 0);
         assert_eq!(civil_to_days((2026, 10, 16)), 20742);
+        // Ancient dates clamp to zero (old, hence deleted) instead of
+        // overflowing the era multiplication.
+        assert_eq!(civil_to_days((0, 1, 1)), 0);
+        assert_eq!(civil_to_days((0, 2, 29)), 0);
         for name in ["murmur.2020-01-01", "murmur.2030-13-40", "other.2020-01-01", "murmur.notes"] {
             std::fs::write(dir.path().join(name), "x").unwrap();
         }
@@ -357,6 +368,34 @@ mod tests {
         assert!(dir.path().join("murmur.2030-13-40").exists());
         assert!(dir.path().join("other.2020-01-01").exists());
         assert!(dir.path().join("murmur.notes").exists());
+    }
+
+    #[test]
+    fn retention_zero_keeps_everything_and_year_zero_deletes() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["murmur.2020-01-01", "murmur.0000-01-01"] {
+            std::fs::write(dir.path().join(name), "x").unwrap();
+        }
+        // Zero retention disables deletion entirely.
+        assert_eq!(enforce_retention(dir.path(), "murmur", 0).unwrap(), 0);
+        assert!(dir.path().join("murmur.2020-01-01").exists());
+        // Year 0000 parses but must not panic; it counts as ancient.
+        assert_eq!(enforce_retention(dir.path(), "murmur", 14).unwrap(), 2);
+        assert!(!dir.path().join("murmur.0000-01-01").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retention_survives_undeletable_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("murmur.2020-01-01"), "x").unwrap();
+        // Read-only directory: listing works, removal fails.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let removed = enforce_retention(dir.path(), "murmur", 14).unwrap();
+        assert_eq!(removed, 0);
+        assert!(dir.path().join("murmur.2020-01-01").exists());
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]

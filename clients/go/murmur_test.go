@@ -308,7 +308,11 @@ func TestConcurrentUse(t *testing.T) {
 func TestTLSModes(t *testing.T) {
 	dir := t.TempDir()
 	pki := servertest.IssuePKI(t)
-	server := servertest.Start(t, dir, servertest.Options{TLSFiles: pki.WriteServerFiles(t, dir)})
+	// Dev TLS verifies the server only; the server rejects ca_file
+	// outside production, where it would falsely imply mTLS.
+	tlsFiles := pki.WriteServerFiles(t, dir)
+	tlsFiles.CA = ""
+	server := servertest.Start(t, dir, servertest.Options{TLSFiles: tlsFiles})
 
 	// Verified TLS against the test CA.
 	cfg := testConfig(server)

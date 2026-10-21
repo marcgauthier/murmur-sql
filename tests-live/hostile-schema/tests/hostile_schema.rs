@@ -591,7 +591,7 @@ max_transaction_bytes = "1MiB"
     assert_stream_dead(&mut bad_digest, 71, "digest-forged manifest").await;
     assert!(
         recorder
-            .check_or_query(cluster.node(0), since_s1, "signature error")
+            .check_or_query(cluster.node(0), since_s1, "invalid Ed25519 signature")
             .await,
         "node never latched the signature refusal for the digest forgery"
     );

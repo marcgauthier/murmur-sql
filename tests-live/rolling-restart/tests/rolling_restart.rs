@@ -1,5 +1,5 @@
 //! Live Murmur-SQL scenario: real server children, Rust wire client, SQL only.
-use murmur_live_harness::sql::{converge, fixture, peers};
+use murmur_live_harness::sql::{converge, fixture};
 use murmur_live_harness::{tokio, Cluster, ClusterOptions};
 use std::time::Duration;
 const WAIT: Duration = Duration::from_secs(120);

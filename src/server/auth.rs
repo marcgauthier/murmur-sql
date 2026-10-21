@@ -45,8 +45,16 @@ pub fn verify_password(hash: &str, password: &[u8]) -> bool {
         .is_ok()
 }
 
+/// Valid Argon2id hash of an unusable dummy value, generated with the
+/// same default parameters as `hash_password`. Unknown users verify
+/// against it so the password round-trip costs the same as a real
+/// check instead of leaking user existence through timing.
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$RjLO/Gm4xHJYqxTHnHPWAw$kDfb0vmRLziIILEYgJ7IXsy2PQ6u0dCzBn0y42PPZIE";
+
 /// Startup handler requesting a cleartext password and verifying it with
-/// Argon2. Unknown users are rejected before the password round-trip.
+/// Argon2. Every login completes the password round-trip, including
+/// unknown users, so rejected logins reveal nothing about which names
+/// exist.
 pub struct Argon2StartupHandler<P> {
     state: Arc<ServerState>,
     parameter_provider: P,
@@ -105,8 +113,10 @@ where
                 let login = LoginInfo::from_client_info(client);
                 let user = login.user().unwrap_or_default();
                 if self.state.user_hash(user).is_none() {
-                    tracing::warn!(user = %user, peer = %client.socket_addr(), "wire login rejected: unknown user");
-                    return Err(PgWireError::InvalidPassword(user.to_owned()));
+                    // Do not reject yet: the password round-trip below runs
+                    // a dummy Argon2 check so unknown users are
+                    // indistinguishable from wrong passwords.
+                    tracing::debug!(user = %user, peer = %client.socket_addr(), "wire login for unknown user");
                 }
                 client.set_state(PgWireConnectionState::AuthenticationInProgress);
                 client
@@ -122,8 +132,11 @@ where
                 let expected = self.state.user_hash(&user);
                 let candidate = message.password.as_bytes().to_vec();
                 // Argon2 is CPU-heavy; keep it off the async worker.
+                // Unknown users pay for a dummy check with the same
+                // parameters, so timing reveals nothing about user names.
                 let verified = tokio::task::spawn_blocking(move || {
-                    expected.is_some_and(|hash| verify_password(&hash, &candidate))
+                    let hash = expected.as_deref().unwrap_or(DUMMY_HASH);
+                    verify_password(hash, &candidate) && expected.is_some()
                 })
                 .await
                 .unwrap_or(false);
@@ -181,5 +194,14 @@ mod tests {
         assert!(!verify_password(&hash, b"wrong"));
         assert!(!verify_password("not-a-hash", b"correct horse"));
         assert!(!verify_password("", b""));
+    }
+
+    #[test]
+    fn dummy_hash_is_valid_and_rejects() {
+        // The unknown-user stand-in must stay a working Argon2 hash with
+        // default parameters, or the timing equalization silently dies.
+        assert!(verify_password(DUMMY_HASH, b"murmur-dummy-unusable-login-value"));
+        assert!(!verify_password(DUMMY_HASH, b"anything else"));
+        assert!(DUMMY_HASH.contains("$argon2id$v=19$m=19456,t=2,p=1$"));
     }
 }

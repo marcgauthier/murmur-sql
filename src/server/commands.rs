@@ -602,6 +602,18 @@ fn backup_download(
             offset = parsed;
             seen_offset = true;
         } else if keyword.eq_ignore_ascii_case("LIMIT") && !seen_limit {
+            if parsed == 0 {
+                return Err(user_error(
+                    "22023",
+                    "LIMIT takes a positive byte count".to_string(),
+                ));
+            }
+            if parsed > backup::DOWNLOAD_CHUNK_MAX {
+                return Err(user_error(
+                    "22023",
+                    format!("LIMIT exceeds the {}-byte chunk maximum", backup::DOWNLOAD_CHUNK_MAX),
+                ));
+            }
             limit = parsed;
             seen_limit = true;
         } else {
@@ -1259,13 +1271,18 @@ fn bridge_release(
     let resolved = schema
         .tables
         .iter()
-        .find(|t| t.name == table)
+        .find(|t| t.name.eq_ignore_ascii_case(table))
         .ok_or_else(|| user_error("22023", format!("unknown table: {table}")))?;
-    if let Some(name) = column {
-        if !resolved.columns.iter().any(|c| c.name == name) {
-            return Err(user_error("22023", format!("unknown column: {table}.{name}")));
-        }
-    }
+    let column = if let Some(name) = column {
+        let found = resolved
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| user_error("22023", format!("unknown column: {table}.{name}")))?;
+        Some(found.name.clone())
+    } else {
+        None
+    };
     let keys = murmur::host::application_columns(resolved);
     if keys.len() != 1 || !keys[0].declared_type.eq_ignore_ascii_case("TEXT") {
         return Err(user_error(
@@ -1274,8 +1291,10 @@ fn bridge_release(
         ));
     }
     let encoded = murmur::host::encode(&vec![Value::Text(key.to_owned())]).map_err(crate::server::query::engine_error)?;
+    // Pass canonical schema spellings: the engine resolves names
+    // case-insensitively everywhere else, and ownership records key on ids.
     let released = bridge
-        .release(table.to_owned(), encoded, column.map(str::to_owned))
+        .release(resolved.name.clone(), encoded, column)
         .map_err(replication_error)?;
     Ok(CommandOutput::Rows {
         columns: vec![ColInfo { name: "released".into(), decltype: Some("TEXT".into()) }],

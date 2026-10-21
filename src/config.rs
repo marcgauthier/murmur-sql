@@ -184,7 +184,34 @@ pub(crate) mod units {
         pub fn deserialize<'d, D: serde::Deserializer<'d>>(
             d: D,
         ) -> std::result::Result<Option<Duration>, D::Error> {
-            Ok(Some(super::duration::deserialize(d)?))
+            // Explicit arms (not a delegation): TOML null arrives here
+            // as a unit value and must map to None.
+            struct V;
+            impl Visitor<'_> for V {
+                type Value = Option<Duration>;
+                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    f.write_str("a duration like 1 or \"500ms\", or null")
+                }
+                fn visit_none<E: de::Error>(self) -> std::result::Result<Option<Duration>, E> {
+                    Ok(None)
+                }
+                fn visit_unit<E: de::Error>(self) -> std::result::Result<Option<Duration>, E> {
+                    Ok(None)
+                }
+                fn visit_i64<E: de::Error>(self, v: i64) -> std::result::Result<Option<Duration>, E> {
+                    if v < 0 {
+                        return Err(E::custom(format!("negative duration {v}")));
+                    }
+                    Ok(Some(Duration::from_secs(v as u64)))
+                }
+                fn visit_u64<E: de::Error>(self, v: u64) -> std::result::Result<Option<Duration>, E> {
+                    Ok(Some(Duration::from_secs(v)))
+                }
+                fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<Option<Duration>, E> {
+                    parse_duration(v).map(Some).map_err(E::custom)
+                }
+            }
+            d.deserialize_any(V)
         }
     }
 }
@@ -228,6 +255,10 @@ impl Default for Config {
     }
 }
 
+fn default_max_connections() -> u32 {
+    256
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
@@ -237,6 +268,11 @@ pub struct ServerConfig {
     #[serde(default, skip_serializing_if = "is_false")]
     pub production: bool,
     pub tls: TlsConfig,
+    /// Cap on concurrent Postgres-wire connections. Overflow connections
+    /// are refused before the handshake so a flood cannot exhaust tasks
+    /// and file descriptors.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: u32,
 }
 
 impl Default for ServerConfig {
@@ -245,6 +281,7 @@ impl Default for ServerConfig {
             bind: default_bind(),
             production: false,
             tls: TlsConfig::default(),
+            max_connections: default_max_connections(),
         }
     }
 }
@@ -725,8 +762,22 @@ impl Config {
     /// the server builds its runtime state, not here.
     pub fn validate(&self) -> Result<()> {
         parse_socket(&self.server.bind, "server.bind")?;
+        if self.server.max_connections == 0 {
+            return Err(Error::Invalid("server.max_connections must be at least 1".into()));
+        }
         if self.storage.data_dir.trim().is_empty() {
             return Err(Error::Invalid("storage.data_dir must not be empty".into()));
+        }
+        // Restore swaps the live directory aside with rename(2), which
+        // cannot move "." or a filesystem root; fail fast instead of
+        // breaking restore after the database is already open.
+        if std::path::Path::new(self.storage.data_dir.trim())
+            .file_name()
+            .is_none()
+        {
+            return Err(Error::Invalid(
+                "storage.data_dir must end with a directory name".into(),
+            ));
         }
         if self.backups.dir.trim().is_empty() {
             return Err(Error::Invalid("backups.dir must not be empty".into()));
@@ -753,6 +804,15 @@ impl Config {
                     "server.production requires tls cert_file, key_file and ca_file (mTLS)".into(),
                 ));
             }
+        }
+        // A non-production server never verifies clients, so accepting a
+        // ca_file there would let operators believe mTLS is on.
+        if !self.server.production
+            && self.server.tls.ca_file.as_deref().is_some_and(|s| !s.trim().is_empty())
+        {
+            return Err(Error::Invalid(
+                "server.tls.ca_file only takes effect with server.production (mTLS)".into(),
+            ));
         }
         if self.server.tls.enabled
             && (self.server.tls.cert_file.is_none() || self.server.tls.key_file.is_none())
@@ -1038,17 +1098,23 @@ impl LoggingConfig {
 }
 
 /// Set one `[replication.tables]` flag inside `config.toml`, preserving the
-/// rest of the file (comments, formatting, other sections). The write is
-/// atomic: a temporary file in the same directory is fsynced and renamed.
+/// rest of the file (comments, formatting, other sections) and merging with
+/// the flags already present. The write is atomic: a temporary file in the
+/// same directory is fsynced and renamed.
 pub fn save_table_flag(path: impl AsRef<Path>, table: &str, replicated: bool) -> Result<()> {
     let table = table.trim();
     if table.is_empty() {
         return Err(Error::Invalid("table name must not be empty".into()));
     }
-    save_table_flags(path, &BTreeMap::from([(table.to_owned(), replicated)]))
+    let mut flags = Config::load(path.as_ref()).map(|c| c.replication.tables)?;
+    flags.insert(table.to_owned(), replicated);
+    save_table_flags(path, &flags)
 }
 
-/// Set several `[replication.tables]` flags in one atomic rewrite.
+/// Persist the full `[replication.tables]` map in one atomic rewrite,
+/// replacing the previous subtable: entries absent from `flags` are
+/// removed so the file matches the engine-side map exactly (a merge
+/// would resurrect dropped tables as zombies on the next restart).
 pub fn save_table_flags(path: impl AsRef<Path>, flags: &BTreeMap<String, bool>) -> Result<()> {
     for table in flags.keys() {
         if table.trim().is_empty() {
@@ -1061,6 +1127,24 @@ pub fn save_table_flags(path: impl AsRef<Path>, flags: &BTreeMap<String, bool>) 
     let mut doc = text
         .parse::<toml_edit::DocumentMut>()
         .map_err(|e| Error::Invalid(format!("cannot parse {}: {e}", path.display())))?;
+    // Drop the previous subtable (standard or inline form) so entries
+    // absent from `flags` vanish instead of lingering. A non-table
+    // `[replication]` node is rejected instead of panicking inside
+    // toml_edit's index assignment.
+    if let Some(replication) = doc.as_table_mut().get_mut("replication") {
+        match replication {
+            toml_edit::Item::Table(table) => {
+                table.remove("tables");
+            }
+            toml_edit::Item::Value(value) if value.is_inline_table() => {
+                if let Some(table) = value.as_inline_table_mut() {
+                    table.remove("tables");
+                }
+            }
+            toml_edit::Item::None => {}
+            _ => return Err(Error::Invalid("[replication] is not a table".into())),
+        }
+    }
     for (table, replicated) in flags {
         doc["replication"]["tables"][table] = toml_edit::value(*replicated);
     }
@@ -1075,21 +1159,49 @@ pub fn save_table_flags(path: impl AsRef<Path>, flags: &BTreeMap<String, bool>) 
 }
 
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    // Unique temp per call: a fixed per-process name lets concurrent
+    // writers interleave into one file (lost update/corruption).
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let mut temp = path.as_os_str().to_owned();
-    temp.push(format!(".tmp-{}", std::process::id()));
-    let temp = Path::new(&temp);
-    std::fs::write(temp, bytes)
-        .and_then(|_| {
-            std::fs::File::open(temp)?.sync_all()?;
-            std::fs::rename(temp, path)?;
-            #[cfg(unix)]
-            if let Some(dir) = dir {
-                std::fs::File::open(dir)?.sync_all()?;
-            }
-            Ok(())
-        })
-        .map_err(|e| Error::Invalid(format!("cannot write {}: {e}", path.display())))
+    temp.push(format!(".tmp-{}-{nanos}-{unique}", std::process::id()));
+    let temp = std::path::PathBuf::from(temp);
+    let result = (|| -> std::io::Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        // Rename preserves the temp inode, so the temp must carry the
+        // destination's mode: otherwise a 0600 config holding password
+        // hashes and signing keys silently becomes world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            let mode = std::fs::metadata(path)
+                .map(|m| m.permissions().mode() & 0o777)
+                .unwrap_or(0o600);
+            options.mode(mode);
+        }
+        let mut file = options.open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)?;
+        #[cfg(unix)]
+        if let Some(dir) = dir {
+            std::fs::File::open(dir)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        // Never leave a secret-bearing temp behind on failure.
+        let _ = std::fs::remove_file(&temp);
+    }
+    result.map_err(|e| Error::Invalid(format!("cannot write {}: {e}", path.display())))
 }
 
 #[cfg(feature = "replication")]
@@ -1364,6 +1476,24 @@ mod tests {
     }
 
     #[test]
+    fn optional_durations_accept_null_and_values() {
+        // TOML has no null literal, so the nullable contract is pinned
+        // through JSON (same serde visitor either way).
+        let parse = |json: &str| serde_json::from_str::<EngineConfig>(json);
+        assert_eq!(parse(r#"{"data_key_max_age": null}"#).unwrap().data_key_max_age, None);
+        assert_eq!(
+            parse(r#"{"data_key_max_age": "7d"}"#).unwrap().data_key_max_age,
+            Some(Duration::from_secs(7 * 86400))
+        );
+        assert_eq!(
+            parse(r#"{"data_key_max_age": 5}"#).unwrap().data_key_max_age,
+            Some(Duration::from_secs(5))
+        );
+        assert!(parse(r#"{"data_key_max_age": -1}"#).is_err());
+        assert!(parse(r#"{}"#).unwrap().data_key_max_age.is_none());
+    }
+
+    #[test]
     fn defaults_mirror_engine_options() {
         let options = Config::default().engine.to_options().unwrap();
         let expected = murmur::Options::default();
@@ -1405,6 +1535,13 @@ mod tests {
         let mut config = Config::default();
         config.server.production = true;
         assert!(config.validate().is_err());
+        // A CA file without production would silently disable mTLS.
+        let mut config = Config::default();
+        config.server.tls.ca_file = Some("/etc/murmur/ca.crt".into());
+        assert!(config.validate().is_err());
+        let mut config = Config::default();
+        config.server.max_connections = 0;
+        assert!(config.validate().is_err());
         let mut config = Config::default();
         config.logging.rotation = "hourly".into();
         assert!(config.validate().is_err());
@@ -1435,5 +1572,104 @@ mod tests {
         let loaded = Config::load(&path).unwrap();
         assert_eq!(loaded.replication.tables.get("scratch"), Some(&true));
         assert!(save_table_flag(&path, "  ", true).is_err());
+    }
+
+    #[test]
+    fn table_flag_map_save_replaces_removed_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[server]\nbind = \"127.0.0.1:5432\"\n").unwrap();
+        // The single-flag helper merges with neighbors.
+        save_table_flag(&path, "keep", true).unwrap();
+        save_table_flag(&path, "drop", true).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.replication.tables.len(), 2);
+        // The full-map save (engine sink path) replaces: the removed
+        // entry must vanish from the file, not linger as a zombie.
+        save_table_flags(&path, &BTreeMap::from([("keep".to_owned(), true)])).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.replication.tables.len(), 1);
+        assert_eq!(loaded.replication.tables.get("keep"), Some(&true));
+        // An empty map clears the subtable entirely.
+        save_table_flags(&path, &BTreeMap::new()).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert!(loaded.replication.tables.is_empty());
+    }
+
+    #[test]
+    fn atomic_write_preserves_mode_and_leaves_no_temp_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, b"[server]\n").unwrap();
+        // Rename preserves the temp inode: the rewrite must not loosen
+        // a secret-bearing 0600 config to world-readable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            save_table_flag(&path, "a", true).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+            save_table_flag(&path, "b", false).unwrap();
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        // A failed write (missing directory) leaves no temp litter behind.
+        let missing = dir.path().join("no-such-dir").join("config.toml");
+        assert!(atomic_write(&missing, b"x").is_err());
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name().into_string().unwrap();
+            assert!(!name.contains(".tmp-"), "temp litter: {name}");
+        }
+    }
+
+    #[test]
+    fn ca_file_requires_production() {
+        // Accepting a client CA without client verification would let
+        // operators believe mTLS is on; fail closed instead.
+        let mut config = Config::default();
+        config.server.tls.enabled = true;
+        config.server.tls.ca_file = Some("ca.crt".into());
+        let err = config.validate().unwrap_err().to_string();
+        assert!(err.contains("ca_file"), "{err}");
+        // Production with a full mTLS bundle passes the TLS checks.
+        config.server.production = true;
+        config.server.tls.cert_file = Some("server.crt".into());
+        config.server.tls.key_file = Some("server.key".into());
+        match config.validate() {
+            Ok(()) => {}
+            Err(e) => assert!(
+                !e.to_string().contains("ca_file") && !e.to_string().contains("mTLS"),
+                "unexpected {e}"
+            ),
+        }
+    }
+
+    #[test]
+    fn data_dir_requires_a_final_component() {
+        // Restore renames the live directory aside, which cannot move
+        // "." or a root; those fail fast here instead of mid-restore.
+        for bad in [".", "..", "/"] {
+            let mut config = Config::default();
+            config.storage.data_dir = bad.into();
+            let err = config.validate().unwrap_err().to_string();
+            assert!(err.contains("data_dir"), "{bad}: {err}");
+        }
+        for ok in ["./data", "data", "data/", "/var/lib/murmur"] {
+            let mut config = Config::default();
+            config.storage.data_dir = ok.into();
+            match config.validate() {
+                Ok(()) => {}
+                Err(e) => assert!(
+                    !e.to_string().contains("data_dir"),
+                    "{ok}: unexpected {e}"
+                ),
+            }
+        }
     }
 }

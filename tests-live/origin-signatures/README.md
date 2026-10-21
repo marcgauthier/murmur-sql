@@ -23,7 +23,10 @@ untrusted snapshot manifest checks donor trust.
 - C converges on A's row while A is stopped (forwarded through B only);
   B's and C's row sets are equal.
 - Counters (`staged_transactions`, `applied_transactions` from
-  `MURMUR SHOW REPLICATION`) do not move on C after B shuts down.
+  `MURMUR SHOW REPLICATION`) quiesce on C after B shuts down:
+  in-flight honest batches may still apply (verified data is never
+  dropped), then `staged` holds at 0, `applied` holds still, and the
+  cursor never moves backwards.
 - The relay captures A's batches from C over a `Need` session; every
   served batch verifies under A's origin key.
 - Each attack (modified, unsigned, cross-DBID, fabricated,

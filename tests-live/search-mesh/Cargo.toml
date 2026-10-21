@@ -1,0 +1,10 @@
+[package]
+name = "murmur-live-search-mesh"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+murmur-live-harness = { package = "murmur-live-sql-harness", path = "../sql-harness" }
+murmur-client = { path = "../../clients/rust" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+toml_edit = "0.22"

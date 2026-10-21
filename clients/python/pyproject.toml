@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "murmur-client"
-version = "0.1.0"
+version = "1.0.0"
 description = "Pure-Python client for the Murmur in-memory SQLite server (PostgreSQL wire protocol)"
 readme = "README.md"
 requires-python = ">=3.9"

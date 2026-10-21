@@ -4,7 +4,7 @@
 
 Murmur-SQL is a thin shell over the embedded Murmur database, accessible
 over the PostgreSQL wire protocol. The server speaks PostgreSQL wire and the
-SQLite SQL dialect; the embedded Murmur engine (`../MURMUR`) executes queries
+SQLite SQL dialect; the embedded Murmur engine (`github.com/marcgauthier/murmur`) executes queries
 against its in-memory SQLite core, while background workers handle encrypted,
 compressed persistence in Murmur Spool and masterless peer-to-peer data
 replication. Replication and settings live in `config.toml`.

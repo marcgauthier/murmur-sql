@@ -13,7 +13,11 @@ Both restarts are clean and fast, lose zero acknowledged writes, and the cluster
 - 5-row baseline converges across all nodes within 30 s.
 - Phase A stops Node 1 with writes in flight under load via SIGTERM; restarts under 60 s; cluster converges with every acknowledged write present.
 - 50 survivor rows + 8 fat (~64 KB) rows converge on both survivors while Node 3 is offline.
-- Maximum-offline window (5 s) expires, and on-demand `MURMUR RETENTION COLLECT` collects log batches on survivors.
+- Node 3's session drops from the survivors' `MURMUR SHOW PEERS`
+  (SIGKILL is noticed via QUIC idle timeout; lingering sessions stay
+  protected past the 5 s maximum-offline window by design), then
+  on-demand `MURMUR RETENTION COLLECT` collects log batches on
+  survivors.
 - Node 3 restarts and is interrupted mid-transfer during snapshot resync.
 - Node 3 restarts again and all nodes reconverge with all rows intact.
 - A `post-recovery` write converges across all 3 nodes.

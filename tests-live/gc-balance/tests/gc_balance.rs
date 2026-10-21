@@ -386,7 +386,7 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
             "window commits={} over the measurement period",
             after.commits - before.commits
         );
-        Ok::<(GcSnapshot, GcSnapshot), String>((before, after))
+        Ok::<(GcSnapshot, GcSnapshot, Duration), String>((before, after, elapsed))
     };
     let ((), (), (), (), (), (), (), (), driver_result) = tokio::join!(
         updater(cluster, 0, &stopped, &update_errs, &updates, &sweeps[0]),
@@ -403,8 +403,8 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
             result
         },
     );
-    let (before, mut after) = match driver_result {
-        Ok(pair) => pair,
+    let (before, mut after, elapsed) = match driver_result {
+        Ok(triple) => triple,
         Err(e) => return Err(e),
     };
 
@@ -415,7 +415,15 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
     wait_digests_agreed(cluster, DIGEST_TIMEOUT).await?;
     let _ = cluster.sync_all().await;
 
-    let drain_deadline = tokio::time::Instant::now() + DRAIN_CAP;
+    // The drain budget scales with the window's observed slowdown:
+    // collection and ack application suffer the same load the window
+    // stretched for, so a fixed cap would fail slow boxes that a quiet
+    // box passes with the drain breaking in a handful of polls. A
+    // 30-second stall with backlog outstanding is not slowness, though
+    // (collection runs at least every second): fail fast and say so.
+    let slowdown = (elapsed.as_secs_f64() / WINDOW.as_secs_f64()).max(1.0);
+    let drain_cap = DRAIN_CAP.mul_f64(slowdown);
+    let drain_deadline = tokio::time::Instant::now() + drain_cap;
     let mut stable = 0;
     while tokio::time::Instant::now() < drain_deadline {
         let _ = cluster.node(0).simple("MURMUR RETENTION COLLECT").await;
@@ -431,6 +439,11 @@ async fn run_body(cluster: &Cluster) -> Result<(), String> {
         after = next;
         if commits.saturating_sub(collected) <= commits / 10 && stable >= DRAIN_STABLE_POLLS {
             break;
+        }
+        if stable >= 60 {
+            return Err(format!(
+                "collection stalled: {collected}/{commits} collected with no progress for 30s"
+            ));
         }
     }
 

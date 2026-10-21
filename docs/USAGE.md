@@ -164,21 +164,24 @@ units (`64KiB`, `256MiB`, `1GiB`) or bare bytes.
 | Key | Default | Purpose |
 | --- | --- | --- |
 | `bind` | `127.0.0.1:5432` | Postgres-wire listen address |
+| `max_connections` | `256` | Cap on concurrent wire connections; overflow is refused before the handshake |
 | `production` | `false` | Require TLS with client certificates (mTLS) |
 | `tls.enabled` | `false` | Enable TLS on the wire listener |
 | `tls.cert_file` | — | PEM server certificate chain |
 | `tls.key_file` | — | PEM server private key |
-| `tls.ca_file` | — | PEM CA bundle verifying client certificates |
+| `tls.ca_file` | — | PEM CA bundle verifying client certificates (production only; rejected otherwise) |
 
 Production mode fails to start without TLS credentials and a CA file, and
-rejects plaintext or unverified connections. See
+rejects plaintext or unverified connections. Outside production the server
+never verifies clients, so setting `tls.ca_file` there fails validation
+instead of pretending mTLS is on. See
 [TLS and production mode](#tls-and-production-mode).
 
 ### `[storage]`
 
 | Key | Default | Purpose |
 | --- | --- | --- |
-| `data_dir` | `./data` | Spool storage directory (created on first unlock) |
+| `data_dir` | `./data` | Spool storage directory (created on first unlock; must end with a directory name, so `.` and `/` are rejected — restore swaps this directory aside) |
 | `database_id` | generated | 16-byte hex identity; peers share it |
 | `node_id` | generated | 16-byte hex identity; must differ per replica |
 
@@ -224,8 +227,10 @@ password_hash = "$argon2id$v=19$m=19456,t=2,p=1$..."
 Passwords are Argon2 hashes, never plaintext; generate one with
 `murmur-admin hash-password` (reads stdin without `--password`). The server
 sends a cleartext-password request like PostgreSQL `password` authentication,
-so use TLS outside trusted loopback. Unknown users and wrong passwords fail
-with `28000`.
+so use TLS outside trusted loopback. Unknown users and wrong passwords both
+complete the password round-trip (unknown names verify against a dummy
+Argon2 hash so timing reveals nothing) and fail with PostgreSQL
+invalid-password `28P01`.
 
 ### `[replication]`
 
@@ -280,7 +285,7 @@ reads it without creating anything. See
 | `dir` | `./logs` | Log folder (created when missing) |
 | `level` | `info` | `trace`, `debug`, `info`, `warn`, or `error` |
 | `file_prefix` | `murmur` | Log file name prefix |
-| `rotation` | `daily` | `daily` or `never` |
+| `rotation` | `daily` | Only `daily` is supported |
 | `retention_days` | `14` | Delete rotated files older than this; 0 keeps all |
 | `console` | `false` | Also emit logs to stderr |
 | `victorialogs.enabled` | `false` | Push batches to a Loki-compatible endpoint |
@@ -1087,7 +1092,8 @@ Failures carry SQLSTATE codes. In Go, use `errors.As` with
 
 | Code | Meaning | Typical response |
 | --- | --- | --- |
-| `28000` | Locked connection, bad credentials, wrong key, TLS/production rejection | Unlock, fix login, supply the correct key, use TLS |
+| `28000` | Locked connection, wrong key, TLS/production rejection | Unlock, supply the correct key, use TLS |
+| `28P01` | Unknown SQL user or wrong password | Fix the login |
 | `42P01` | No such table or index | Fix the name or migrate first |
 | `42703` | No such column | Fix the name |
 | `42883` | No such function | Fix the name |
@@ -1137,9 +1143,10 @@ generation; provision certificates with your own PKI.
 
 ## Logging
 
-The server logs to daily-rotated files (`<dir>/<prefix>.YYYY-MM-DD.log` by
+The server logs to daily-rotated files (`<dir>/<prefix>.YYYY-MM-DD` by
 default) and deletes rotated files older than `retention_days` at startup
-(0 keeps everything). Set `console = true` to also log to stderr, and
+(0 keeps everything; one undeletable file is skipped with a warning and
+never fails startup). Set `console = true` to also log to stderr, and
 `level` to control verbosity. With `victorialogs.enabled`, batches are also
 pushed as Loki JSON to `<url>/loki/api/v1/push` with the configured labels
 and credentials; push failures are logged and dropped without affecting
@@ -1504,7 +1511,8 @@ regular, non-hidden file in the folder, sorted by name.
 
 `DOWNLOAD` returns one row (`offset`, `total`, `chunk` as BLOB) per call;
 loop with increasing offsets until `offset + len == total`. LIMIT defaults
-to 1 MiB. `UPLOAD` streams base64 chunks into a hidden partial file that
+to 1 MiB, must be positive, and is capped at 16 MiB per call (`22023`
+otherwise). `UPLOAD` streams base64 chunks into a hidden partial file that
 `LIST` never shows; `FINISH` publishes it atomically and refuses to
 overwrite an existing file (`23505`), while `ABORT` discards partial state.
 The [Go backup example](../clients/go/examples/backup/main.go) implements
@@ -1524,8 +1532,10 @@ Backup rotation is deployment-managed: remove old archives according to
 your retention policy. The server creates archives, upload staging files,
 and restore staging files and directories owner-only (`0600` files,
 `0700` directories on unix, set at creation regardless of umask); other
-platforms use default permissions. Restrict the backup folder like the
-data directory as defense in depth.
+platforms use default permissions. Uploads, packed archives, and unpacked
+restore entries refuse to write through a symlink at the destination path:
+the operation fails with `58000` instead of following the link. Restrict
+the backup folder like the data directory as defense in depth.
 
 
 ### Go client coverage

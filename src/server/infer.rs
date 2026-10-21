@@ -441,6 +441,12 @@ fn assign_position(
 ) {
     let [Token::Param(index)] = item else { return };
     let index = *index;
+    // This lexer also accepts `?N`, which the placeholder rewriter does
+    // not count, so an index can exceed the result slots. Clamp instead
+    // of panicking; unknown slots stay UNKNOWN.
+    if index < 1 || index > inferred.len() {
+        return;
+    }
     let Some(table) = table else { return };
     let column = if columns.is_empty() {
         table.columns.get(position)
@@ -694,5 +700,31 @@ mod tests {
             infer("SELECT * FROM items LIMIT 10", 0),
             Vec::new()
         );
+    }
+
+    #[test]
+    fn out_of_range_params_never_panic() {
+        let schema = schema();
+        let infer = |sql: &str, max: usize| infer_param_types(&schema, sql, max);
+        // `?N` is lexed but not counted by the placeholder rewriter, so it
+        // can exceed the slot count; it must be ignored, not index past
+        // the end (INSERT VALUES, comparisons, and LIMIT forms).
+        assert_eq!(
+            infer("INSERT INTO items VALUES ($1, ?999)", 1),
+            [Some(Type::INT8)]
+        );
+        assert_eq!(
+            infer("INSERT INTO items VALUES (?999, $1)", 1),
+            [Some(Type::TEXT)]
+        );
+        assert_eq!(
+            infer("SELECT * FROM items WHERE id = ?999", 0),
+            Vec::new()
+        );
+        assert_eq!(
+            infer("SELECT * FROM items WHERE id = $1 AND score > ?999", 1),
+            [Some(Type::INT8)]
+        );
+        assert_eq!(infer("SELECT * FROM items LIMIT ?999", 0), Vec::new());
     }
 }

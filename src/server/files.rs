@@ -521,7 +521,8 @@ mod enabled {
             "DOWNLOAD" => {
                 let download = objects.download(text(0)).map_err(storage)?;
                 let name = download.meta.name.clone();
-                let size = download.meta.bytes as i64;
+                let size = i64::try_from(download.meta.bytes)
+                    .map_err(|_| user_error("22003", "file size overflow".into()))?;
                 let id = handles.insert(addr, user, Handle::Download(download))?;
                 Ok(rows(
                     &req,
@@ -538,15 +539,21 @@ mod enabled {
                 };
                 let total = download.meta.bytes;
                 match download.next(req.limit) {
-                    Ok((offset, chunk, eof)) => Ok(rows(
-                        &req,
-                        vec![vec![
-                            Value::Integer(offset as i64),
-                            Value::Integer(total as i64),
-                            Value::Blob(chunk),
-                            Value::Integer(eof as i64),
-                        ]],
-                    )),
+                    Ok((offset, chunk, eof)) => {
+                        let offset = i64::try_from(offset)
+                            .map_err(|_| user_error("22003", "file offset overflow".into()))?;
+                        let total = i64::try_from(total)
+                            .map_err(|_| user_error("22003", "file size overflow".into()))?;
+                        Ok(rows(
+                            &req,
+                            vec![vec![
+                                Value::Integer(offset),
+                                Value::Integer(total),
+                                Value::Blob(chunk),
+                                Value::Integer(eof as i64),
+                            ]],
+                        ))
+                    }
                     Err(e) => {
                         handles.entries.remove(text(0));
                         Err(storage(e))

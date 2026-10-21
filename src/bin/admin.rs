@@ -28,7 +28,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::UNIX_EPOCH;
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_KEY: &[u8; 32] = b"0123456789abcdef0123456789abcdef";
 
 #[derive(Debug, Clone, Default)]
@@ -56,6 +56,9 @@ impl GlobalOpts {
         if let Some(ref pass) = self.passphrase {
             return Ok(*blake3::hash(pass.as_bytes()).as_bytes());
         }
+        eprintln!(
+            "warning: no --key-hex or --passphrase given; using the built-in development key"
+        );
         Ok(*DEFAULT_KEY)
     }
 }
@@ -64,6 +67,11 @@ fn hex_decode(s: &str) -> Result<Vec<u8>, String> {
     let s = s.trim();
     if s.len() % 2 != 0 {
         return Err("invalid hex string length".into());
+    }
+    // Byte-slicing below is only safe on ASCII: a multi-byte character
+    // with even total length (e.g. "€€") would panic on a non-boundary.
+    if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("invalid hex string: expected hex digits".into());
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);
     for i in (0..s.len()).step_by(2) {
@@ -721,7 +729,17 @@ fn cmd_hash_password(opts: &GlobalOpts) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().collect();
+    // `args()` panics on non-UTF8 argv; fail cleanly instead.
+    let mut args = Vec::new();
+    for arg in env::args_os() {
+        match arg.into_string() {
+            Ok(s) => args.push(s),
+            Err(_) => {
+                eprintln!("Error: argument is not valid UTF-8");
+                return ExitCode::from(1);
+            }
+        }
+    }
     if args.len() < 2 {
         print_usage();
         return ExitCode::from(0);
@@ -758,6 +776,11 @@ fn main() -> ExitCode {
         } else if arg == "--password" && i + 1 < args.len() {
             i += 1;
             global_opts.password = Some(args[i].clone());
+        } else if arg == "--passphrase" || arg == "--key-hex" || arg == "--password" {
+            // The valued forms above matched when a value followed, so
+            // reaching here means the flag was left dangling last.
+            eprintln!("Error: {arg} needs a value");
+            return ExitCode::from(1);
         } else if arg == "--fresh-node-id" {
             global_opts.fresh_node_id = Some(rand::random());
         } else if arg.starts_with("--fresh-node-id=") {
@@ -859,5 +882,38 @@ fn main() -> ExitCode {
             }
             ExitCode::from(1)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hex_decode_accepts_valid_and_rejects_the_rest_without_panicking() {
+        assert_eq!(hex_decode("00ffAB").unwrap(), vec![0x00, 0xff, 0xab]);
+        assert_eq!(hex_decode("  12  ").unwrap(), vec![0x12]);
+        assert!(hex_decode("abc").is_err());
+        assert!(hex_decode("zz").is_err());
+        assert!(hex_decode("0g").is_err());
+        // Even-length non-ASCII used to panic slicing mid-character.
+        assert!(hex_decode("€€").is_err());
+        assert!(hex_decode("ab€!").is_err());
+    }
+
+    #[test]
+    fn resolve_key_prefers_explicit_key_material() {
+        let hex = "ab".repeat(32);
+        let opts = GlobalOpts { key_hex: Some(hex), ..Default::default() };
+        assert_eq!(opts.resolve_key().unwrap(), [0xab; 32]);
+        let short = GlobalOpts { key_hex: Some("ab".into()), ..Default::default() };
+        assert!(short.resolve_key().is_err());
+        let pass = GlobalOpts { passphrase: Some("pw".into()), ..Default::default() };
+        assert_eq!(
+            pass.resolve_key().unwrap(),
+            *blake3::hash(b"pw").as_bytes()
+        );
+        let fallback = GlobalOpts::default();
+        assert_eq!(fallback.resolve_key().unwrap(), *DEFAULT_KEY);
     }
 }

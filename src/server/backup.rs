@@ -19,6 +19,9 @@ use std::time::SystemTime;
 pub(crate) const ARCHIVE_SUFFIX: &str = ".murmur-backup";
 /// Default `DOWNLOAD` chunk when the client omits LIMIT.
 pub(crate) const DOWNLOAD_CHUNK_DEFAULT: u64 = 1 << 20;
+/// Largest explicit `DOWNLOAD` LIMIT. Chunks are buffered server-side, so
+/// an unbounded LIMIT reads a whole multi-gigabyte archive into memory.
+pub(crate) const DOWNLOAD_CHUNK_MAX: u64 = 16 << 20;
 /// Refuse to unpack entries beyond these bounds (corrupt length prefixes).
 const MAX_NAME_LEN: u64 = 4096;
 const MAX_ENTRIES: u64 = 1 << 20;
@@ -92,17 +95,27 @@ pub(crate) fn utc_compact(now: SystemTime) -> String {
 
 /// Create a file for backup data, readable only by the owner on unix. The
 /// mode is set at creation and tightened right after, so archives and
-/// staging files never depend on the process umask.
+/// staging files never depend on the process umask. A symlink at `path`
+/// is refused, never truncated through: upload partials, packed archives
+/// and unpacked entries all land on client-influenced names.
 pub(crate) fn create_private_file(path: &Path) -> std::io::Result<std::fs::File> {
+    if std::fs::symlink_metadata(path)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("refusing to open symlink: {}", path.display()),
+        ));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(path)?;
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true).mode(0o600);
+        #[cfg(target_os = "linux")]
+        options.custom_flags(0x20000); // O_NOFOLLOW on Linux
+        let file = options.open(path)?;
         let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
         Ok(file)
     }
@@ -370,9 +383,14 @@ fn collect_files(
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let path = entry.path();
-        // Follow symlinks: same-filesystem engine checkpoints use hardlinks,
-        // which already read as regular files.
-        let meta = std::fs::metadata(&path)?;
+        // Never follow symlinks: same-filesystem engine checkpoints use
+        // hardlinks (already regular files), while a symlink could point
+        // outside the data directory (exfiltration into the archive) or
+        // loop back (unbounded recursion).
+        let meta = std::fs::symlink_metadata(&path)?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
         if meta.is_dir() {
             collect_files(root, &path, files)?;
         } else if meta.is_file() {
@@ -433,18 +451,26 @@ pub(crate) fn unpack_archive(file: &Path, dest: &Path) -> Result<(), BackupError
 
 /// Read one u64, or `Ok(None)` on clean EOF before any byte.
 fn read_u64(input: &mut impl Read) -> Result<Option<u64>, BackupError> {
+    // Count bytes explicitly: `read_exact` leaves a partially filled
+    // buffer behind on EOF, and a zero-filled prefix is
+    // indistinguishable from "no bytes read" without the count.
     let mut buf = [0u8; 8];
-    match input.read_exact(&mut buf) {
-        Ok(()) => Ok(Some(u64::from_be_bytes(buf))),
-        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-            if buf == [0u8; 8] {
-                Ok(None)
-            } else {
-                Err(BackupError::Corrupt("truncated length prefix".to_string()))
-            }
+    let mut read = 0;
+    while read < 8 {
+        match input.read(&mut buf[read..]) {
+            Ok(0) => break,
+            Ok(n) => read += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(BackupError::Io(e)),
         }
-        Err(e) => Err(BackupError::Io(e)),
     }
+    if read == 0 {
+        return Ok(None);
+    }
+    if read < 8 {
+        return Err(BackupError::Corrupt("truncated length prefix".to_string()));
+    }
+    Ok(Some(u64::from_be_bytes(buf)))
 }
 
 /// Reject absolute paths, parent escapes, and non-UTF8 entry names.
@@ -474,6 +500,37 @@ fn checked_relative(raw: &[u8]) -> Result<PathBuf, BackupError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_files_skips_symlinks_and_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        // A symlink to an outside file must not be archived (its target
+        // is outside the tree), and a cycle must not recurse forever.
+        std::os::unix::fs::symlink("/etc/hostname", src.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&src, src.join("sub").join("loop")).unwrap();
+        let mut files = Vec::new();
+        collect_files(&src, &src, &mut files).unwrap();
+        assert_eq!(files, vec![std::path::PathBuf::from("a.txt")]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_creation_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.txt");
+        std::fs::write(&target, b"precious").unwrap();
+        let link = dir.path().join("link.txt");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let err = create_private_file(&link).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+        // Regular creation still works.
+        assert!(create_private_file(&dir.path().join("fresh.txt")).is_ok());
+    }
 
     #[test]
     fn utc_dates_cover_epoch_day_and_leap_day() {
@@ -548,6 +605,20 @@ mod tests {
             unpack_archive(&bad, &dir.join("o2")),
             Err(BackupError::Corrupt(_))
         ));
+        // A trailing run of 1-7 zero bytes is truncation, not clean
+        // EOF: a zero-filled short read must not pass as "no bytes".
+        for tail in [1usize, 3, 7] {
+            let mut zero_tail = MAGIC.to_vec();
+            zero_tail.extend(std::iter::repeat_n(0u8, tail));
+            std::fs::write(&bad, &zero_tail).unwrap();
+            assert!(
+                matches!(
+                    unpack_archive(&bad, &dir.join(format!("o-zero-{tail}"))),
+                    Err(BackupError::Corrupt(_))
+                ),
+                "{tail} trailing zero bytes accepted as clean EOF"
+            );
+        }
         // Parent escape.
         let mut escape = MAGIC.to_vec();
         escape.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 6, b'.', b'.', b'/', b'.', b'.', b'/', b'x']);

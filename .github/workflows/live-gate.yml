@@ -1,0 +1,44 @@
+name: Live gate
+on:
+  push:
+    paths: ['tests-live/**', 'src/**', 'clients/rust/**', 'Cargo.*', '.github/workflows/live-gate.yml']
+  pull_request:
+    paths: ['tests-live/**', 'src/**', 'clients/rust/**', 'Cargo.*', '.github/workflows/live-gate.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  gate:
+    runs-on: ubuntu-24.04
+    # 54 scenarios take 60-120 minutes; some legs are unix-only.
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: murmur-sql
+      # Sibling checkout for the `murmur` path dependency (`../MURMUR`).
+      - uses: actions/checkout@v4
+        with:
+          repository: marcgauthier/murmur
+          path: MURMUR
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux compiler dependencies
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev build-essential
+      - name: Build server binaries
+        working-directory: murmur-sql
+        shell: bash
+        # No --locked: the sibling murmur checkout floats on its default
+        # branch. The snapshot path keeps scenario runs from rebuilding.
+        run: |
+          cargo build --features replication --bin murmur-server --bin murmur-admin
+          echo "MURMUR_SERVER_BIN=${{ github.workspace }}/murmur-sql/target/debug/murmur-server" >> $GITHUB_ENV
+      - name: Release gate
+        working-directory: murmur-sql/tests-live
+        shell: bash
+        run: ./run.sh gate
+      - name: Failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-gate-failures
+          path: murmur-sql/tests-live/failures/

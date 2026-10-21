@@ -8,7 +8,7 @@
 use murmur_sql::config::Config;
 use std::process::ExitCode;
 
-const VERSION: &str = "0.1.0";
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn usage() -> String {
     "usage: murmur-server [--config <path>] [--validate-config]\n\
@@ -31,7 +31,18 @@ fn main() -> ExitCode {
     if let Some(code) = murmur_sql::service::dispatch_host(&arguments) { return code; }
     let mut config_path = "./config.toml".to_string();
     let mut validate_only = false;
-    let mut args = std::env::args().skip(1);
+    // Reuse the OsString pass: `args()` panics on non-UTF8 argv.
+    let mut rest = Vec::with_capacity(arguments.len());
+    for arg in &arguments {
+        match arg.clone().into_string() {
+            Ok(s) => rest.push(s),
+            Err(_) => {
+                eprintln!("invalid argument: not valid UTF-8\n{}", usage());
+                return ExitCode::from(1);
+            }
+        }
+    }
+    let mut args = rest.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--config" => {

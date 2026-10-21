@@ -4,6 +4,7 @@
 use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_postgres::{Client, NoTls};
 
 const PASSWORD: &str = "s3cret-password";
@@ -100,8 +101,12 @@ async fn auth_accepts_user_and_rejects_others() {
     let dir = tempfile::tempdir().unwrap();
     let server = start_server(&dir, free_port());
     assert!(connect(&server, "admin", PASSWORD).await.is_ok());
-    assert!(connect(&server, "admin", "wrong").await.is_err());
-    assert!(connect(&server, "nobody", PASSWORD).await.is_err());
+    // Wrong passwords and unknown users are indistinguishable: both run
+    // the Argon2 round-trip and fail with PostgreSQL invalid-password.
+    let wrong = connect(&server, "admin", "wrong").await.unwrap_err();
+    assert_eq!(code(&wrong), "28P01");
+    let unknown = connect(&server, "nobody", PASSWORD).await.unwrap_err();
+    assert_eq!(code(&unknown), "28P01");
 }
 
 #[tokio::test]
@@ -383,4 +388,199 @@ async fn diagnostic_status_is_read_only_typed_json_over_both_protocols() {
     assert_eq!(code(&invalid), "42601");
     let count: i64 = client.query_one("SELECT count(*) FROM status_rows", &[]).await.unwrap().get(0);
     assert_eq!(count, 1);
+}
+
+#[tokio::test]
+async fn bool_columns_coerce_numbers_and_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(&dir, free_port());
+    let client = connect(&server, "admin", PASSWORD).await.unwrap();
+    client.simple_query(&format!("MURMUR UNLOCK KEY '{KEY}'")).await.unwrap();
+    client.simple_query("CREATE TABLE flags(id INTEGER PRIMARY KEY, on_off MURMUR_BOOL)").await.unwrap();
+    client.simple_query("INSERT INTO flags VALUES (1, 1), (2, 0), (3, 1.0), (4, 'true'), (5, 'off')").await.unwrap();
+    let rows = client.query("SELECT on_off FROM flags ORDER BY id", &[]).await.unwrap();
+    let got: Vec<bool> = rows.iter().map(|row| row.get(0)).collect();
+    assert_eq!(got, vec![true, false, true, true, false]);
+    client.simple_query("INSERT INTO flags VALUES (6, 'bogus')").await.unwrap();
+    let error = client.query("SELECT on_off FROM flags WHERE id = 6", &[]).await.unwrap_err();
+    assert_eq!(code(&error), "42846", "{error}");
+}
+
+#[tokio::test]
+async fn connection_cap_refuses_overflow_and_releases_on_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let config = write_fresh_config(&dir, port);
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replacen("[server]\n", "[server]\nmax_connections = 3\n", 1)).unwrap();
+    let server = spawn_server(&config, port);
+    let c1 = connect(&server, "admin", PASSWORD).await.unwrap();
+    let c2 = connect(&server, "admin", PASSWORD).await.unwrap();
+    let c3 = connect(&server, "admin", PASSWORD).await.unwrap();
+    assert!(connect(&server, "admin", PASSWORD).await.is_err());
+    // Held connections stay healthy under the cap.
+    c1.simple_query(&format!("MURMUR UNLOCK KEY '{KEY}'")).await.unwrap();
+    assert_eq!(c1.query_one("SELECT 1", &[]).await.unwrap().get::<_, i64>(0), 1);
+    drop(c1);
+    drop(c2);
+    drop(c3);
+    // A freed permit admits again.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if connect(&server, "admin", PASSWORD).await.is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "permit never released");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Minimal extended-protocol driver: named statements are re-parsed and
+/// executed without a fresh Describe, which high-level clients never do.
+struct Raw {
+    stream: tokio::net::TcpStream,
+}
+
+impl Raw {
+    async fn connect(port: u16) -> Self {
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut raw = Self { stream };
+        let mut body = vec![];
+        body.extend_from_slice(b"user\0admin\0database\0murmur\0\0");
+        let mut startup = (8 + body.len() as u32).to_be_bytes().to_vec();
+        startup.extend_from_slice(&196608u32.to_be_bytes());
+        startup.extend_from_slice(&body);
+        raw.stream.write_all(&startup).await.unwrap();
+        loop {
+            let (tag, body) = raw.message().await;
+            match tag {
+                // Cleartext-password request.
+                b'R' if u32::from_be_bytes(body[0..4].try_into().unwrap()) == 3 => {
+                    let mut msg = vec![b'p'];
+                    let len = 4 + PASSWORD.len() as u32 + 1;
+                    msg.extend_from_slice(&len.to_be_bytes());
+                    msg.extend_from_slice(PASSWORD.as_bytes());
+                    msg.push(0);
+                    raw.stream.write_all(&msg).await.unwrap();
+                }
+                b'Z' => break,
+                b'E' => panic!("startup error: {body:?}"),
+                _ => {}
+            }
+        }
+        raw
+    }
+
+    async fn message(&mut self) -> (u8, Vec<u8>) {
+        let tag = self.stream.read_u8().await.unwrap();
+        let len = self.stream.read_u32().await.unwrap() as usize;
+        let mut body = vec![0u8; len - 4];
+        self.stream.read_exact(&mut body).await.unwrap();
+        (tag, body)
+    }
+
+    async fn send(&mut self, tag: u8, body: &[u8]) {
+        self.stream.write_u8(tag).await.unwrap();
+        self.stream
+            .write_u32(4 + body.len() as u32)
+            .await
+            .unwrap();
+        self.stream.write_all(body).await.unwrap();
+    }
+
+    fn cstr(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(s.as_bytes());
+        out.push(0);
+    }
+
+    /// Simple-protocol query; fails on any server error.
+    async fn simple(&mut self, sql: &str) {
+        let mut body = vec![];
+        Self::cstr(&mut body, sql);
+        self.send(b'Q', &body).await;
+        loop {
+            let (tag, body) = self.message().await;
+            match tag {
+                b'Z' => break,
+                b'E' => panic!("simple query failed: {body:?}"),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn redefined_statement_without_describe_encodes_fresh_types() {
+    let dir = tempfile::tempdir().unwrap();
+    let server = start_server(&dir, free_port());
+    let mut raw = Raw::connect(server.port).await;
+    raw.simple(&format!("MURMUR UNLOCK KEY '{KEY}'")).await;
+
+    // Describe under one SQL text: the server stashes INT8 for "S".
+    let mut parse = vec![];
+    Raw::cstr(&mut parse, "S");
+    Raw::cstr(&mut parse, "SELECT 1");
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    raw.send(b'P', &parse).await;
+    raw.send(b'D', b"SS\0").await;
+    raw.send(b'S', &[]).await;
+    let mut saw_int8_description = false;
+    loop {
+        let (tag, body) = raw.message().await;
+        match tag {
+            b'Z' => break,
+            b'E' => panic!("describe failed: {body:?}"),
+            // RowDescription: one field, INT8 (OID 20).
+            b'T' => {
+                assert_eq!(u16::from_be_bytes(body[0..2].try_into().unwrap()), 1);
+                let end = body[2..].iter().position(|b| *b == 0).unwrap() + 2;
+                let oid = u32::from_be_bytes(body[end + 1 + 4 + 2..end + 1 + 4 + 2 + 4].try_into().unwrap());
+                assert_eq!(oid, 20, "SELECT 1 must describe as INT8, got OID {oid}");
+                saw_int8_description = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_int8_description);
+
+    // Re-parse the same name with different SQL and execute WITHOUT a
+    // fresh Describe: rows must encode as the new statement's TEXT.
+    let mut parse = vec![];
+    Raw::cstr(&mut parse, "S");
+    Raw::cstr(&mut parse, "SELECT 'x'");
+    parse.extend_from_slice(&0i16.to_be_bytes());
+    raw.send(b'P', &parse).await;
+    let mut bind = vec![];
+    Raw::cstr(&mut bind, "");
+    Raw::cstr(&mut bind, "S");
+    bind.extend_from_slice(&0i16.to_be_bytes()); // no parameters
+    bind.extend_from_slice(&0i16.to_be_bytes());
+    bind.extend_from_slice(&1i16.to_be_bytes()); // one binary result column
+    bind.extend_from_slice(&1i16.to_be_bytes());
+    raw.send(b'B', &bind).await;
+    let mut execute = vec![];
+    Raw::cstr(&mut execute, "");
+    execute.extend_from_slice(&0i32.to_be_bytes());
+    raw.send(b'E', &execute).await;
+    raw.send(b'S', &[]).await;
+    let mut rows: Vec<Vec<u8>> = vec![];
+    loop {
+        let (tag, body) = raw.message().await;
+        match tag {
+            b'Z' => break,
+            b'E' => panic!("execute failed: {body:?}"),
+            b'T' => panic!("unexpected RowDescription without Describe"),
+            b'D' => {
+                assert_eq!(u16::from_be_bytes(body[0..2].try_into().unwrap()), 1);
+                let len = i32::from_be_bytes(body[2..6].try_into().unwrap());
+                assert!(len >= 0);
+                rows.push(body[6..6 + len as usize].to_vec());
+            }
+            _ => {}
+        }
+    }
+    // TEXT 'x' is one byte; a stale INT8 stash would emit 8 zero bytes.
+    assert_eq!(rows, vec![b"x".to_vec()]);
 }

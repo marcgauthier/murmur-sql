@@ -57,7 +57,7 @@ on the child processes directly. See `../tests-live/README.md` for the full
 topology, harness API, and per-scenario layout, and
 `../tests-live/run.sh` for the runner.
 
-All 73 scenarios now use the Rust client and explicit SQL for database work;
+All 74 scenarios now use the Rust client and explicit SQL for database work;
 none opens an embedded database. Read-only diagnostic assertions use
 `MURMUR SHOW STATUS`; fault injection acts on child processes, networks,
 configuration, or durable artifacts. The hostile-QUIC fixtures reuse the engine's
@@ -136,11 +136,14 @@ codes. Live scenarios issue those statements through the Rust client's
 `execute`, `query`, and `simple` methods. Each scenario's `README.md`
 records its environment options and pass criteria.
 
-The SQL conversion compiles all 73 scenario packages. Runtime validation
-currently exposes a failure in `write-priority`: the measured dual-contention
-service exceeded its 25% remote-share limit. The assertion remains enabled;
-the cause requires investigation. Compile success does not establish a passing
-release gate, and shortened soak runs do not qualify full-duration profiles.
+The SQL conversion compiles all 74 scenario packages. `write-priority`
+measures total local-vs-remote writer *service* (remote share at most
+25% over at least one second, with nonzero replication work), a
+documented deviation from the Go original's contested-grant counts:
+burst-applying replication stays below its share and wins every
+contested grant while behind, so grant counts cannot express the
+policy here. Compile success does not establish a passing release
+gate, and shortened soak runs do not qualify full-duration profiles.
 
 
 ## Service installer validation

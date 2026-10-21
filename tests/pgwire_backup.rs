@@ -164,6 +164,16 @@ async fn backup_save_list_download_roundtrip() {
         .unwrap();
     assert!(rows[0].get::<_, Vec<u8>>("chunk").is_empty());
 
+    // LIMIT 0 would stall chunk loops (no progress possible) and huge
+    // LIMITs would buffer whole archives; both are rejected.
+    for bad in ["LIMIT 0", "LIMIT 16777217", "LIMIT 18446744073709551615"] {
+        let error = client
+            .query(&format!("MURMUR BACKUP DOWNLOAD '{name}' OFFSET 0 {bad}"), &[])
+            .await
+            .unwrap_err();
+        assert_eq!(code(&error), "22023", "{bad}: {error}");
+    }
+
     // Missing files fail loudly; the name is echoed but nothing leaks.
     let error = client
         .query("MURMUR BACKUP DOWNLOAD 'absent.murmur-backup'", &[])

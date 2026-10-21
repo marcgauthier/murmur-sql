@@ -42,24 +42,58 @@ type CacheKey = (std::net::SocketAddr, u8, String);
 
 #[derive(Default)]
 struct DescribeCache {
-    map: std::collections::HashMap<CacheKey, Vec<Type>>,
+    map: std::collections::HashMap<CacheKey, StashEntry>,
+}
+
+struct StashEntry {
+    sql_hash: u64,
+    generation: u64,
+    types: Vec<Type>,
+}
+
+fn sql_hash(sql: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
 }
 
 impl DescribeCache {
     /// Stash describe types, bounding memory by dropping everything on
     /// overflow (describes are cheap to redo and clients cache them).
-    fn store(&mut self, key: CacheKey, types: Vec<Type>) {
+    /// Entries are validated against the statement SQL and schema
+    /// generation on fetch: without that, re-parsing a prepared
+    /// statement name (or DDL between describe and execute) would
+    /// encode rows with stale types.
+    fn store(&mut self, key: CacheKey, sql: &str, generation: u64, types: Vec<Type>) {
         if self.map.len() >= 4096 {
             self.map.clear();
         }
-        self.map.insert(key, types);
+        self.map.insert(
+            key,
+            StashEntry {
+                sql_hash: sql_hash(sql),
+                generation,
+                types,
+            },
+        );
     }
 
-    fn fetch(&self, key: &CacheKey, columns: usize) -> Option<Vec<Type>> {
+    fn fetch(
+        &self,
+        key: &CacheKey,
+        sql: &str,
+        generation: u64,
+        columns: usize,
+    ) -> Option<Vec<Type>> {
         self.map
             .get(key)
-            .filter(|types| types.len() == columns)
-            .cloned()
+            .filter(|entry| {
+                entry.sql_hash == sql_hash(sql)
+                    && entry.generation == generation
+                    && entry.types.len() == columns
+            })
+            .map(|entry| entry.types.clone())
     }
 }
 
@@ -71,23 +105,33 @@ impl QueryBackend {
         }
     }
 
-    fn stash(&self, key: CacheKey, types: &[Type]) {
+    fn stash(&self, key: CacheKey, sql: &str, types: &[Type]) {
+        let generation = self.state.schema_generation();
         self.describe_cache
             .lock()
             .unwrap()
-            .store(key, types.to_vec());
+            .store(key, sql, generation, types.to_vec());
     }
 
     fn stashed(
         &self,
         addr: std::net::SocketAddr,
         portal: &Portal<String>,
+        sql: &str,
         columns: usize,
     ) -> Option<Vec<Type>> {
         let cache = self.describe_cache.lock().unwrap();
+        let generation = self.state.schema_generation();
         cache
-            .fetch(&(addr, b'P', portal.name.clone()), columns)
-            .or_else(|| cache.fetch(&(addr, b'S', portal.statement.id.clone()), columns))
+            .fetch(&(addr, b'P', portal.name.clone()), sql, generation, columns)
+            .or_else(|| {
+                cache.fetch(
+                    &(addr, b'S', portal.statement.id.clone()),
+                    sql,
+                    generation,
+                    columns,
+                )
+            })
     }
 
     fn addr<C: ClientInfo>(client: &C) -> std::net::SocketAddr {
@@ -200,7 +244,9 @@ impl ExtendedQueryHandler for QueryBackend {
         .await
         .map_err(|e| PgWireError::ApiError(Box::new(e)))??;
         let stashed = match &output {
-            StmtOutput::Rows { columns, .. } => self.stashed(addr, portal, columns.len()),
+            StmtOutput::Rows { columns, .. } => {
+                self.stashed(addr, portal, &portal.statement.statement, columns.len())
+            }
             _ => None,
         };
         response_for(output, &portal.result_column_format, stashed.as_deref())
@@ -229,7 +275,7 @@ impl ExtendedQueryHandler for QueryBackend {
             &Format::UnifiedBinary,
         )
         .await?;
-        self.stash((addr, b'S', stmt.id.clone()), &types);
+        self.stash((addr, b'S', stmt.id.clone()), &stmt.statement, &types);
         Ok(DescribeStatementResponse::new(param_types, fields))
     }
 
@@ -257,7 +303,11 @@ impl ExtendedQueryHandler for QueryBackend {
             &portal.result_column_format,
         )
         .await?;
-        self.stash((addr, b'P', portal.name.clone()), &types);
+        self.stash(
+            (addr, b'P', portal.name.clone()),
+            &portal.statement.statement,
+            &types,
+        );
         Ok(DescribePortalResponse::new(fields))
     }
 }
@@ -628,6 +678,11 @@ fn execute_one(
             let db = state.require_db()?;
             db.migrate(murmur::Migration::new(sql.to_owned()))
                 .map_err(engine_error)?;
+            // Local DDL changes column types; invalidate describe stashes
+            // so a later Execute re-infers instead of encoding stale.
+            // (Peer-replicated schema changes are not covered: clients
+            // must re-describe after out-of-band migrations.)
+            state.bump_schema_generation();
             Ok(StmtOutput::BareTag(tag))
         }
         Route::Sql => {
@@ -1046,6 +1101,12 @@ fn push_segment(out: &mut Vec<String>, current: &str) {
     }
 }
 
+/// Highest `$N` parameter index accepted. Describe pads parameter types,
+/// execute pre-sizes bindings, and inference allocates per-index slots
+/// from this number, so an uncapped index is a remote OOM from a short
+/// query. PostgreSQL draws the same line at 65535 parameters.
+pub(crate) const MAX_PARAMETERS: usize = 65535;
+
 /// Rewrite `$N` placeholders to SQLite `?N`, skipping quoted regions.
 /// Returns the rewritten SQL and the highest parameter index seen.
 fn rewrite_placeholders(sql: &str) -> PgWireResult<(String, usize)> {
@@ -1125,6 +1186,14 @@ fn rewrite_placeholders(sql: &str) -> PgWireResult<(String, usize)> {
                         return Err(user_error(
                             "42601",
                             "parameter numbers start at $1".to_string(),
+                        ));
+                    }
+                    if index > MAX_PARAMETERS {
+                        return Err(user_error(
+                            "54000",
+                            format!(
+                                "too many parameters: ${index} exceeds the {MAX_PARAMETERS} limit"
+                            ),
                         ));
                     }
                     max_param = max_param.max(index);
@@ -1422,7 +1491,19 @@ fn encode_value(encoder: &mut DataRowEncoder, ty: &Type, value: &Value) -> PgWir
     }
     match *ty {
         Type::BOOL => {
-            let b = matches!(value,Value::Integer(n) if *n!=0);
+            // Mirror the parameter vocabulary: numerics by zero-ness,
+            // text by the accepted bool words, anything else an error.
+            let b = match value {
+                Value::Integer(n) => *n != 0,
+                Value::Real(f) => *f != 0.0,
+                Value::Text(s) => match s.trim().to_ascii_lowercase().as_str() {
+                    "t" | "true" | "1" | "yes" | "on" => true,
+                    "f" | "false" | "0" | "no" | "off" => false,
+                    _ => return Err(encode_failed(ty, value)),
+                },
+                Value::Blob(_) => return Err(encode_failed(ty, value)),
+                Value::Null => unreachable!(),
+            };
             encoder.encode_field(&b)
         }
         Type::INT8 => {
@@ -1646,6 +1727,27 @@ mod tests {
     }
 
     #[test]
+    fn placeholders_reject_indexes_above_the_cap() {
+        // The cap is enforced before any caller allocates per-index slots,
+        // so a short hostile query cannot OOM the server.
+        let (_, max) = rewrite_placeholders("SELECT $65535").unwrap();
+        assert_eq!(max, MAX_PARAMETERS);
+        let err = rewrite_placeholders("SELECT $65536").unwrap_err();
+        match err {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "54000");
+                assert!(info.message.contains("65536"));
+            }
+            other => panic!("expected a 54000 user error, got {other:?}"),
+        }
+        let err = rewrite_placeholders("SELECT $999999999").unwrap_err();
+        match err {
+            PgWireError::UserError(info) => assert_eq!(info.code, "54000"),
+            other => panic!("expected a 54000 user error, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn routing_covers_statements() {
         assert!(matches!(route_statement("select 1"), Route::Sql));
         assert!(matches!(
@@ -1744,5 +1846,21 @@ mod tests {
         assert_eq!(days_to_iso(10957), "2000-01-01");
         assert_eq!(sqlite_atoi("  -12x"), -12);
         assert_eq!(sqlite_atoi("abc"), 0);
+    }
+
+    #[test]
+    fn describe_stash_validates_sql_and_generation() {
+        let addr: std::net::SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        let mut cache = DescribeCache::default();
+        let key = (addr, b'S', "s".to_owned());
+        cache.store(key.clone(), "SELECT 1", 7, vec![Type::INT8]);
+        // Exact match hits.
+        assert_eq!(cache.fetch(&key, "SELECT 1", 7, 1), Some(vec![Type::INT8]));
+        // Re-parsed statement SQL misses: the stash belongs to the old text.
+        assert_eq!(cache.fetch(&key, "SELECT 'x'", 7, 1), None);
+        // Schema changed between describe and execute: miss and re-infer.
+        assert_eq!(cache.fetch(&key, "SELECT 1", 8, 1), None);
+        // Arity changed: miss.
+        assert_eq!(cache.fetch(&key, "SELECT 1", 7, 2), None);
     }
 }

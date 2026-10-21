@@ -46,11 +46,18 @@ pub struct ServerState {
     config: std::sync::Arc<std::sync::RwLock<Config>>,
     sessions: std::sync::Mutex<SessionTable>,
     slot: std::sync::Mutex<DbSlot>,
+    /// Bumped on every locally executed DDL statement so describe-time
+    /// type stashes can detect schema changes (see DescribeCache).
+    schema_generation: std::sync::atomic::AtomicU64,
 }
 
 struct SessionTable {
     order: VecDeque<SocketAddr>,
     map: HashMap<SocketAddr, Session>,
+    /// Live connection tasks per address. Cleanup decrements and only
+    /// drops the session (and file handles) at zero, so a delayed
+    /// disconnect can never delete a fresh session on a reused port.
+    live: HashMap<SocketAddr, u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,16 +79,41 @@ impl ServerState {
             sessions: std::sync::Mutex::new(SessionTable {
                 order: VecDeque::new(),
                 map: HashMap::new(),
+                live: HashMap::new(),
             }),
             slot: std::sync::Mutex::new(DbSlot {
                 db: None,
                 key_hash: None,
             }),
+            schema_generation: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    pub(crate) fn schema_generation(&self) -> u64 {
+        self.schema_generation
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn bump_schema_generation(&self) {
+        self.schema_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn connection_opened(&self, addr: SocketAddr) {
+        let mut sessions = self.sessions.lock().unwrap();
+        *sessions.live.entry(addr).or_insert(0) += 1;
     }
 
     pub(crate) fn disconnect(&self, addr: SocketAddr) {
         let mut sessions = self.sessions.lock().unwrap();
+        let live = sessions.live.entry(addr).or_insert(0);
+        *live = live.saturating_sub(1);
+        if *live > 0 {
+            // A newer connection already reused this address; its session
+            // and file handles belong to it now.
+            return;
+        }
+        sessions.live.remove(&addr);
         sessions.map.remove(&addr);
         sessions.order.retain(|a| *a != addr);
         #[cfg(feature = "replication")]
@@ -420,6 +452,9 @@ pub(crate) async fn serve_managed(
     println!("listening on {bound}");
     tracing::info!(bind = %bound, data = %config.storage.data_dir, "murmur-server listening");
     let production = config.server.production;
+    let permits = std::sync::Arc::new(tokio::sync::Semaphore::new(
+        config.server.max_connections.max(1) as usize,
+    ));
     let state = std::sync::Arc::new(ServerState::new(config_path, config));
     if let Err(error) = ready() {
         tracing::error!(%error, "service readiness reporting failed");
@@ -435,7 +470,12 @@ pub(crate) async fn serve_managed(
             accepted = listener.accept() => {
                 match accepted {
                     Ok((socket, peer)) => {
+                        let Ok(permit) = permits.clone().try_acquire_owned() else {
+                            tracing::warn!(%peer, "connection refused: too many connections");
+                            continue;
+                        };
                         tracing::info!(%peer, "connection accepted");
+                        state.connection_opened(peer);
                         let factory = std::sync::Arc::new(auth::HandlerFactory {
                             state: state.clone(),
                             production,
@@ -443,6 +483,7 @@ pub(crate) async fn serve_managed(
                         let tls_acceptor = tls_acceptor.clone();
                         let connection_state=state.clone();
                         tokio::spawn(async move {
+                            let _permit = permit;
                             if let Err(e) =
                                 pgwire::tokio::process_socket(socket, tls_acceptor, factory).await
                             {
@@ -481,5 +522,40 @@ async fn shutdown_signal() {
     #[cfg(not(unix))]
     {
         let _ = ctrl_c.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> ServerState {
+        ServerState::new(PathBuf::from("config.toml"), Config::default())
+    }
+
+    #[test]
+    fn delayed_disconnect_never_deletes_a_reused_address_session() {
+        let state = state();
+        let addr: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        // First connection unlocks, then its cleanup is delayed past a
+        // reconnect on the same (reused) port.
+        state.connection_opened(addr);
+        state.mark_unlocked(addr, "admin");
+        state.connection_opened(addr);
+        state.mark_unlocked(addr, "admin");
+        // The stale cleanup must not disturb the fresh session.
+        state.disconnect(addr);
+        assert!(!state.is_locked(addr, "admin"));
+        // The fresh connection's own cleanup removes it.
+        state.disconnect(addr);
+        assert!(state.is_locked(addr, "admin"));
+    }
+
+    #[test]
+    fn disconnect_without_open_is_harmless() {
+        let state = state();
+        let addr: SocketAddr = "127.0.0.1:54322".parse().unwrap();
+        state.disconnect(addr);
+        assert!(state.is_locked(addr, "admin"));
     }
 }

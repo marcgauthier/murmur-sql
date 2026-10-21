@@ -37,6 +37,37 @@ async fn wait_converged(cluster: &Cluster, timeout: Duration) -> Vec<String> {
     }
 }
 
+/// Wait until none of `watchers` lists `gone_id` in `MURMUR SHOW PEERS`.
+/// SIGKILLed nodes are noticed via QUIC idle timeout (30s), and a
+/// lingering session keeps the dead peer's unacked range protected past
+/// `maximum_offline` by design (connected peers can always catch up
+/// from the log instead of wedging on a snapshot). Pruning assertions
+/// must await teardown, not just record staleness.
+async fn wait_peer_gone(cluster: &Cluster, watchers: &[usize], gone_id: &str, timeout: Duration) {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let mut present = false;
+        for &i in watchers {
+            if let Ok(rows) = cluster.node(i).simple("MURMUR SHOW PEERS").await {
+                if rows
+                    .iter()
+                    .any(|row| row.first().is_some_and(|id| id.as_str() == gone_id))
+                {
+                    present = true;
+                }
+            }
+        }
+        if !present {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "peer {gone_id} session never dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 fn assert_acknowledged_present(present: &[String], acknowledged: &HashSet<String>) {
     let set: HashSet<_> = present.iter().cloned().collect();
     for ack in acknowledged {
@@ -277,8 +308,12 @@ maximum_offline = "5s"
     )
     .await;
 
-    // Sleep 6 seconds to exceed maximum_offline (5s) so Node 2's unacknowledged logs are unpinned
-    tokio::time::sleep(Duration::from_millis(6000)).await;
+    // Node 2's session must drop before its unacknowledged logs unpin:
+    // lingering sessions stay protected past maximum_offline (5s) by
+    // design, and SIGKILL is noticed via QUIC idle timeout. Teardown
+    // takes longer than maximum_offline, so no extra sleep is needed.
+    let node2_id = cluster.node_info(2).node_id.clone();
+    wait_peer_gone(&cluster, &[0, 1], &node2_id, Duration::from_secs(60)).await;
 
     // Run retention collection passes on both survivors to prune log history
     let c0 = cluster.node(0).simple("MURMUR RETENTION COLLECT").await.unwrap();
