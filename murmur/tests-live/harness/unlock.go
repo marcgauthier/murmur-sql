@@ -17,7 +17,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur"
 )
 
 // progressSnapshot is a comparable progress snapshot (clocks and error

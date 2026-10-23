@@ -33,10 +33,10 @@ import (
 
 	"net/netip"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // tableDDL is the mesh-leg DDL: plain replicated rows. Each write inserts a

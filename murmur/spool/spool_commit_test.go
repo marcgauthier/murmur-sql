@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // TestCommitAtomicRoundTrip commits mixed puts, deletes and repeated

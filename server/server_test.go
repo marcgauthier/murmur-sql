@@ -24,9 +24,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/auth"
-	"github.com/marcgauthier/murmur-sql-go/config"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/auth"
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 // fixtureEngine is a protocol fixture, not a database implementation. Each SQL

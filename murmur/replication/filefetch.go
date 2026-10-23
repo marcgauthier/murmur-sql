@@ -6,7 +6,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // Independent file-fetch endpoint; metadata is replicated by the

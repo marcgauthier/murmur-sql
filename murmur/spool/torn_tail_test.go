@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 func writeSeededStore(t *testing.T, dir string, n int) int64 {

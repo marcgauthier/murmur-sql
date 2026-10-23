@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // notCodec is a trivial custom codec (bitwise NOT) with a call counter so

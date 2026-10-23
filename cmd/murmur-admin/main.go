@@ -4,8 +4,8 @@ import (
 	"context"
 	"os"
 
-	"github.com/marcgauthier/murmur-sql-go/engine/native"
-	"github.com/marcgauthier/murmur-sql-go/internal/cli"
+	"github.com/marcgauthier/murmur-sql/engine/native"
+	"github.com/marcgauthier/murmur-sql/internal/cli"
 )
 
 func main() {

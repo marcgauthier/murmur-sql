@@ -3,7 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
-	"github.com/marcgauthier/murmur-sql-go/auth"
+	"github.com/marcgauthier/murmur-sql/auth"
 	"strings"
 	"testing"
 )

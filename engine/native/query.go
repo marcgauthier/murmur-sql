@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 func first(sql string) string {

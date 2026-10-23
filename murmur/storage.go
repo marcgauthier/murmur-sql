@@ -13,11 +13,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // Storage format version.

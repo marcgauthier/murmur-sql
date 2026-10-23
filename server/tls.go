@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 )
 
 func TLSConfig(c config.Config) (*tls.Config, error) {

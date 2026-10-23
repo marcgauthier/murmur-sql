@@ -9,8 +9,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // countingCodec is a user codec (id 128) that counts decompressions.

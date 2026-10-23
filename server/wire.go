@@ -12,7 +12,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 const maxMessage = 32 << 20

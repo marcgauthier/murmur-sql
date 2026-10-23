@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // failHooks arms every hook with a distinct error.

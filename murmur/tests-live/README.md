@@ -49,10 +49,10 @@ tests-live/
 
 ## 3. Harness public API
 
-Package `github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness`.
+Package `github.com/marcgauthier/murmur-sql/murmur/tests-live/harness`.
 
 ```go
-import "github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+import "github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 ```
 
 - `NewCluster(ClusterOptions{ Name, NumNodes: 3, DatabaseID?,
@@ -120,7 +120,7 @@ package scenario_test
 import (
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 func TestScenario(t *testing.T) {

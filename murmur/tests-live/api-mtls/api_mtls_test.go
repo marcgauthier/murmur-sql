@@ -22,8 +22,8 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // dialTimeout is the per-dial timeout (Rust: 10 s).

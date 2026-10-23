@@ -18,10 +18,10 @@ import (
 
 	"github.com/quic-go/quic-go"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // tableDDL is the marker table (Rust: typed records marker).

@@ -14,9 +14,9 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 func (d *database) Command(ctx context.Context, id uint64, c engine.Command) (engine.Result, error) {

@@ -20,8 +20,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
 )
 
 // NodeID is a 16-byte node identity.

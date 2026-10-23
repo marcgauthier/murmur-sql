@@ -42,11 +42,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/auth"
-	"github.com/marcgauthier/murmur-sql-go/config"
-	"github.com/marcgauthier/murmur-sql-go/engine/native"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
-	"github.com/marcgauthier/murmur-sql-go/server"
+	"github.com/marcgauthier/murmur-sql/auth"
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/engine/native"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/server"
 )
 
 const (
@@ -288,6 +288,7 @@ func (w *wireConn) run(sql string) ([][]string, error) {
 		return nil, err
 	}
 	var rows [][]string
+	var cmdErr *wireErr
 	for {
 		kind, msg, err := w.readMessage()
 		if err != nil {
@@ -319,8 +320,16 @@ func (w *wireConn) run(sql string) ([][]string, error) {
 			}
 			rows = append(rows, row)
 		case 'E':
-			return nil, parseError(msg)
+			// Record the error but keep draining until Ready: the
+			// trailing Z belongs to this command, and leaving it
+			// unread would make the next command look successful.
+			if cmdErr == nil {
+				cmdErr = parseError(msg)
+			}
 		case 'Z':
+			if cmdErr != nil {
+				return nil, cmdErr
+			}
 			return rows, nil
 		default:
 			// T (description), C (tag), S, N: skip.

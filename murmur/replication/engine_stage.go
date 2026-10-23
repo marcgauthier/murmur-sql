@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // Disposable per-push working set; Spool remains authoritative. Separate byte

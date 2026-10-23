@@ -1,7 +1,7 @@
 package murmur
 
 import (
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // Top-level postcard encode/decode helpers. Decode failures report

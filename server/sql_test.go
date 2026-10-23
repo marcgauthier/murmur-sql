@@ -1,7 +1,7 @@
 package server
 
 import (
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/engine"
 	"reflect"
 	"testing"
 )

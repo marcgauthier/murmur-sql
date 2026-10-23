@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // DefaultRestoreOptions returns default restore options.

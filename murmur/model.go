@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // Version is a hybrid logical clock. Total order: physical

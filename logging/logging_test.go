@@ -2,7 +2,7 @@ package logging
 
 import (
 	"encoding/json"
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 	"io"
 	"net/http"
 	"net/http/httptest"

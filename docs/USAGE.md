@@ -2,14 +2,19 @@
 
 ## Current availability
 
-Both binaries select `engine/native.Factory`, which uses the public MURMUR-GO
-APIs. The adapter covers database creation/opening, query preparation/execution,
-migrations, configuration callbacks, diagnostics, peer administration, policies,
-search, file transfers, backups/restores, key rotation, and offline administration.
-The integration is source-ported and untested. No builds or tests were run for
-these changes; earlier protocol-fixture results do not validate the native engine.
+Both binaries select `engine/native.Factory`, which uses the public
+MURMUR-GO APIs. The adapter covers database creation/opening, query
+preparation/execution, migrations, configuration callbacks, diagnostics,
+peer administration, policies, search, file transfers, backups/restores,
+key rotation, and offline administration. Coverage comes from the Go unit
+suites (`go test -race ./...`), the multi-node fault-injection scenarios
+under `murmur/tests-live/` (see `murmur/tests-live/run.sh`), and the
+Go/Python/Rust client suites.
 
-The embedded engine and vendored C dependencies (SQLite amalgamation and DataDog/Meta zstd) are fully contained within this repository under `murmur/` (including `murmur/third_party/`). A C compiler and cgo are required for the engine, in addition to Go 1.24+.
+The embedded engine and vendored C dependencies (SQLite amalgamation and
+DataDog/Meta zstd) are fully contained within this repository under
+`murmur/` (including `murmur/third_party/`). A C compiler and cgo are
+required for the engine, in addition to Go 1.24+.
 
 ## Build and launch
 
@@ -64,6 +69,22 @@ publishing a change. Updates use a same-directory temporary file, file sync,
 rename, and directory sync on Unix. The YAML AST node update preserves unrelated
 formatting and comments.
 
+## Embedded Go library
+
+The engine also embeds directly in Go programs with no server process:
+
+```go
+import "github.com/marcgauthier/murmur-sql/murmur"
+```
+
+See [murmur/README.md](../murmur/README.md) for the embedded guide (open,
+migrations, transactions, replication, search, backup) and
+[example_test.go](../murmur/example_test.go) for runnable snippets:
+
+```sh
+go test -run Example ./murmur/
+```
+
 ## SQL and wire interface
 
 Connect with a PostgreSQL client and use the SQLite SQL dialect:
@@ -104,7 +125,7 @@ Messages are limited to 32 MiB. Sessions permit at most 1024 prepared statements
 results. Engine results are buffered. The engine must enforce its own admission
 and result budgets before allocating large query results.
 
-## Administration commands
+## MURMUR commands
 
 These command families are parsed and executed through the native adapter:
 
@@ -128,6 +149,8 @@ Vector dimensions are 1–8192, with `l2`, `cosine`, or `l1` distances. Flags ac
 true/false, on/off, yes/no, or 1/0. Non-file administration commands do not accept
 bound parameters; quote literal secrets/names with SQL single-quote escaping.
 
+## Files over PostgreSQL SQL
+
 File commands accept quoted text or bound parameters, including binary BYTEA:
 
 ```sql
@@ -147,6 +170,41 @@ chunks are limited to 1 MiB. The native adapter implements connection ownership,
 16 handles per connection, 1024 globally, 16 MiB cursor budgets per connection,
 and a 128 MiB global cursor budget. The engine owns encrypted staging budgets.
 See the [engine adapter](ENGINE.md).
+
+## Error codes
+
+Engine failures surface as PostgreSQL `SQLSTATE` codes. The embedded
+`murmur.Error` kind maps as follows:
+
+| Code | Meaning | Typical cause |
+| --- | --- | --- |
+| `02000` | No data | Policy operation on a missing row |
+| `08003` | Connection does not exist | Database closed |
+| `08006` | Connection failure | Replication transport error |
+| `22023` | Invalid parameter value | Bad argument, malformed address or command |
+| `23000` | Integrity constraint violation | Generic constraint failure |
+| `23502` | Not null violation | NULL in a `NOT NULL` column |
+| `23503` | Foreign key violation | Dangling reference |
+| `23505` | Unique violation | Duplicate key, or file already exists |
+| `23514` | Check violation | Failing `CHECK` constraint |
+| `28000` | Invalid authorization | Wrong data key, replication auth failure |
+| `40001` | Serialization failure | Database busy, retry |
+| `42501` | Insufficient privilege | Operation not authorized |
+| `42601` | Syntax error | Malformed SQL |
+| `42804` | Datatype mismatch | Incompatible column types |
+| `42846` | Cannot coerce | Binary NUMERIC parameter (send text) |
+| `42703` | Undefined column | Unknown column name |
+| `42P01` | Undefined table | Unknown table name |
+| `42883` | Undefined function | Unknown function |
+| `53400` | Limit exceeded | Engine overloaded, back off and retry |
+| `54000` | Program limit exceeded | Engine-side limit hit |
+| `55000` | Object not in prerequisite state | Schema mismatch, unavailable object |
+| `55P03` | Lock not available | Lock acquisition failed |
+| `57014` | Query canceled | Client cancellation or deadline |
+| `58000` | System error | Storage or IO failure |
+| `58P01` | Undefined file | Backup or file not found |
+| `XX001` | Data corrupted | Checksum or integrity failure |
+| `XX000` | Internal error | Unclassified engine failure |
 
 ## Backup transfers
 
@@ -195,7 +253,7 @@ Logs use `log/slog` JSON in `<prefix>.YYYY-MM-DD` files with UTC daily rotation.
 Retention deletes only matching dated regular files; zero days retains all logs.
 Optional console output writes to stderr. VictoriaLogs uses Loki JSON pushes to
 `<url>/loki/api/v1/push`, a bounded 1000-line queue, batches of 100 or every two
-seconds, and optional Basic/Bearer authentication. Remote delivery is best effort;
+seconds, and optional Basic/Bearer [REDACTED] Remote delivery is best effort;
 local file logs remain primary.
 
 From an elevated console, run `murmur-server /install` or `/uninstall` alone.

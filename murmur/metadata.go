@@ -7,9 +7,9 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // Conflict versions live in Spool. These types are transient record

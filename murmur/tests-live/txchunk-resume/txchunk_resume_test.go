@@ -22,9 +22,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // Role indices (Rust: sender/victim/witness).
@@ -279,10 +279,6 @@ func waitHaveSettled(t *testing.T, cluster *harness.Cluster, snd int, peer, orig
 // pushed counts transactions pushed by one node (transfer-start signal;
 // Rust watches the victim's inbound frame bytes, which have no
 // equivalent).
-func pushed(cluster *harness.Cluster, idx int) uint64 {
-	return cluster.Node(idx).Replication().Status().Metrics.PushedTransactions
-}
-
 // logCounters are the log-path activity counters for one node:
 // (received_transactions, applied_transactions). Snapshot application
 // bypasses both counters, so post-restart advancement proves the trial
@@ -380,27 +376,34 @@ func heal(t *testing.T, cluster *harness.Cluster, v int) {
 // nothing; the caller retries with fresh rows), mirroring the
 // inbound-byte trigger, which keys on inbound frame bytes instead of
 // push-start.
-func stopOncePushFlows(t *testing.T, cluster *harness.Cluster, prefix string, nrows int, pushedBefore uint64) bool {
+// served counts both delivery mechanisms to the victim: sender push
+// plus need-driven (anti-entropy pull) responses.
+func served(cluster *harness.Cluster, idx int) uint64 {
+	m := cluster.Node(idx).Replication().Status().Metrics
+	return m.PushedTransactions + m.NeedServed
+}
+
+func stopOncePushFlows(t *testing.T, cluster *harness.Cluster, prefix string, nrows int, servedBefore uint64) bool {
 	t.Helper()
-	// Check the cheap pushed counters first: a COUNT(*) over the
+	// Check the cheap served counters first: a COUNT(*) over the
 	// victim's writer every iteration costs milliseconds against a
 	// transfer that completes in tens of milliseconds, so the stop
 	// would systematically land after convergence. The row check runs
-	// only once a push started, to tell a converged victim (retry
+	// only once delivery started, to tell a converged victim (retry
 	// with fresh rows) from a mid-transfer one.
 	deadline := time.Now().Add(killTimeout)
 	for {
 		if !time.Now().Before(deadline) {
 			n := prefixCount(t, cluster, victim, prefix)
-			t.Fatalf("no push to the victim observed within %v (trial rows visible: %d/%d)",
+			t.Fatalf("no delivery to the victim observed within %v (trial rows visible: %d/%d)",
 				killTimeout, n, nrows)
 		}
-		pushedNow := pushed(cluster, sender) + pushed(cluster, witness)
-		if pushedNow > pushedBefore {
+		servedNow := served(cluster, sender) + served(cluster, witness)
+		if servedNow > servedBefore {
 			if prefixCount(t, cluster, victim, prefix) == nrows {
 				return true
 			}
-			t.Logf("stopping victim mid-transfer after %d trial push(es) started", pushedNow-pushedBefore)
+			t.Logf("stopping victim mid-transfer after %d trial deliveries started", servedNow-servedBefore)
 			cluster.StopNode(victim)
 			return false
 		}
@@ -581,11 +584,15 @@ func TestChunkedTransactionResumesAfterReceiverRestart(t *testing.T) {
 
 		// Heal, then stop once the trial transfer to the victim is
 		// flowing. Survivor convergence above proves every pre-heal
-		// push already landed, so any push advancement after this
-		// sample is victim-bound trial flow.
-		pushedBefore := pushed(cluster, sender) + pushed(cluster, witness)
+		// delivery already landed, so any push or need-serve
+		// advancement after this sample is victim-bound trial flow.
+		// Both mechanisms must be watched: post-heal delivery races
+		// between sender push and victim anti-entropy pull, and
+		// watching push alone times out whenever the pull wins
+		// despite full convergence.
+		servedBefore := served(cluster, sender) + served(cluster, witness)
 		heal(t, cluster, victim)
-		if stopOncePushFlows(t, cluster, prefix, nrows, pushedBefore) {
+		if stopOncePushFlows(t, cluster, prefix, nrows, servedBefore) {
 			t.Logf("attempt %d: victim converged before the stop landed; retrying with fresh rows", attempt)
 			waitConverged(t, cluster, expectedRows, attemptConvergeTimeout, "too-slow reconverge")
 			continue

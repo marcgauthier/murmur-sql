@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 // coerceValue preserves the Rust shell's SQLite-affinity conversions for both

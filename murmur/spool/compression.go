@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sync"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
 )
 
 // compressor dispatches block compression through the codec registry.

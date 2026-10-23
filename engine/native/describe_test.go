@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/config"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 // TestDescribeDDL pins that describing DDL succeeds without result columns.

@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/auth"
-	"github.com/marcgauthier/murmur-sql-go/config"
-	"github.com/marcgauthier/murmur-sql-go/engine"
-	"github.com/marcgauthier/murmur-sql-go/server"
+	"github.com/marcgauthier/murmur-sql/auth"
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/engine"
+	"github.com/marcgauthier/murmur-sql/server"
 	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 )
 

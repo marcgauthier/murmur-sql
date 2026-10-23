@@ -9,7 +9,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // NodeId is a 128-bit node or database identity.

@@ -14,7 +14,7 @@ import (
 
 	"bytes"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 func TestValidateWrappingKeyAuthenticatesEnvelope(t *testing.T) {

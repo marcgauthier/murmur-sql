@@ -7,9 +7,9 @@ import (
 	"os/signal"
 	"syscall"
 
-	"github.com/marcgauthier/murmur-sql-go/engine/native"
-	"github.com/marcgauthier/murmur-sql-go/internal/cli"
-	"github.com/marcgauthier/murmur-sql-go/service"
+	"github.com/marcgauthier/murmur-sql/engine/native"
+	"github.com/marcgauthier/murmur-sql/internal/cli"
+	"github.com/marcgauthier/murmur-sql/service"
 )
 
 func main() { os.Exit(run()) }

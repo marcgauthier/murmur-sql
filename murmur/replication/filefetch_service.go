@@ -178,6 +178,9 @@ func (s *fetchService) serve(conn quicConn) error {
 }
 
 func (s *fetchService) fetchMissing(sources []fileSource) error {
+	if err := s.objects.reapStagingOrphans(); err != nil {
+		return err
+	}
 	metadata, err := s.objects.List()
 	if err != nil {
 		return err
@@ -399,9 +402,15 @@ func (s *fetchService) fetch(ctx context.Context, source fileSource, meta *FileM
 	if err := publishStagedFile(s.objects, path, identityPath, meta); err != nil {
 		return err
 	}
+	// Drop resume state before the availability bookkeeping: once the
+	// object is published the sidecar is garbage, and a bookkeeping
+	// failure below must not strand it. A stranded sidecar with a
+	// published object is never revisited (the file reads available,
+	// so no fetch retries it) and wedges StagedTransfers until the
+	// next restart.
+	os.Remove(identityPath)
 	if err := s.objects.recordPeerAvailability(meta.Digest, meta.Generation, source.node, true); err != nil {
 		return err
 	}
-	os.Remove(identityPath)
 	return nil
 }

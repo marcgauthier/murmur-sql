@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
 )
 
 // Durability selects how much of the write path a commit waits for.

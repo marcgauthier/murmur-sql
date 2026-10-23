@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
 )
 
 func TestIndexTableVectors(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // Crash-test protocol. The worker writes numbered batches with

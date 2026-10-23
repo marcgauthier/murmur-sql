@@ -1,7 +1,7 @@
 package murmur
 
 import (
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
 )
 
 // Type aliases for administrative replication operations.

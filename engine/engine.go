@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 )
 
 const (

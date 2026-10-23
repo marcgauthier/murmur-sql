@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 	"golang.org/x/crypto/chacha20poly1305"
 	"golang.org/x/crypto/hkdf"
 )
@@ -475,15 +475,6 @@ func (b *Bridge) Release(table string, key []byte, column *string) (bool, error)
 		return false, invalidErr("bridge direction")
 	}
 	return b.backend.ReleaseOwnership(table, key, column)
-}
-
-// ExportSnapshot seals the current snapshot.
-func (b *Bridge) ExportSnapshot() (string, error) {
-	data, err := b.backend.Snapshot()
-	if err != nil {
-		return "", err
-	}
-	return b.Export(data)
 }
 
 // ExportFile exports one named file as bounded sealed bridge bundles.

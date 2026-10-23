@@ -6,7 +6,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
 )
 
 // Search index accessors.

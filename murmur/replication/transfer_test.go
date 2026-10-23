@@ -74,8 +74,11 @@ func transferCredentials(t *testing.T, ids []NodeId) ([][]byte, []transferCreds)
 
 func transferConfigs(t *testing.T) []*Config {
 	t.Helper()
-	ids := []NodeId{idOf(1), idOf(2)}
-	seeds := [][32]byte{fill32(11), fill32(22)}
+	return transferConfigsFor(t, []NodeId{idOf(1), idOf(2)}, [][32]byte{fill32(11), fill32(22)})
+}
+
+func transferConfigsFor(t *testing.T, ids []NodeId, seeds [][32]byte) []*Config {
+	t.Helper()
 	roots, creds := transferCredentials(t, ids)
 	trust := make(map[NodeId][32]byte)
 	for i, id := range ids {
@@ -218,9 +221,17 @@ func TestLargeTransactionArrives(t *testing.T) {
 	}
 }
 
-// Cross-peer repair with no complete copy anywhere: two nodes hold
-// disjoint staged chunks of one transaction and complete each other
-// through ChunkNeed repair (no push, no full re-stream).
+// Cross-peer repair with no complete copy anywhere: two seeders hold
+// disjoint staged chunks of one transaction and a joining node that holds
+// only the manifest repairs every index through ChunkNeed requests. The
+// seeders never peer with each other (membership discovery is off) and
+// never hold the full transaction, so they cannot push-stream it: the
+// joiner converges only via repair, and each seeder serves exactly the
+// indexes it holds (staged relay, never a full transaction). A two-node
+// mutual variant of this test used to assert exact serve counts in both
+// directions, but that is inherently racy: whichever side assembles first
+// legitimately push-streams the full transaction to its peer, making the
+// peer's repair request unnecessary.
 func TestDisjointPartialsRepair(t *testing.T) {
 	tx := sizedTransaction(200_000)
 	data := EncodeTransaction(&tx)
@@ -236,13 +247,26 @@ func TestDisjointPartialsRepair(t *testing.T) {
 	for i := split; i < count; i++ {
 		high = append(high, i)
 	}
-	cfg := transferConfigs(t)
+	cfg := transferConfigsFor(t,
+		[]NodeId{idOf(1), idOf(2), idOf(3)},
+		[][32]byte{fill32(11), fill32(22), fill32(33)})
+	// Pin the topology: no gossip discovery, so the seeders never peer
+	// with each other behind the test's back.
+	for _, c := range cfg {
+		c.Membership = false
+	}
 	backendD := transferBackend(idOf(1))
 	backendE := transferBackend(idOf(2))
+	backendF := transferBackend(idOf(3))
 	if err := backendD.Commit(craftChunks(t, &tx, low)); err != nil {
 		t.Fatal(err)
 	}
 	if err := backendE.Commit(craftChunks(t, &tx, high)); err != nil {
+		t.Fatal(err)
+	}
+	// The joiner holds only the manifest: every index is missing, so its
+	// repair sweep requests the full bitmap from both seeders.
+	if err := backendF.Commit(craftChunks(t, &tx, nil)); err != nil {
 		t.Fatal(err)
 	}
 	d, err := Start(cfg[0], backendD)
@@ -255,36 +279,53 @@ func TestDisjointPartialsRepair(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer e.Close()
-	addr := e.Status().Address
-	if addr == nil {
-		t.Fatal("no listen address")
-	}
-	if err := d.AddPeer(*addr); err != nil {
+	f, err := Start(cfg[2], backendF)
+	if err != nil {
 		t.Fatal(err)
+	}
+	defer f.Close()
+	for _, eng := range []*Handle{d, e} {
+		addr := eng.Status().Address
+		if addr == nil {
+			t.Fatal("no listen address")
+		}
+		if err := f.AddPeer(*addr); err != nil {
+			t.Fatal(err)
+		}
 	}
 	start := time.Now()
 	end := start.Add(60 * time.Second)
 	for {
-		dd, _ := backendD.Get(ReceiptKey(idOf(1), 1))
-		ee, _ := backendE.Get(ReceiptKey(idOf(1), 1))
-		if dd != nil && ee != nil {
+		if raw, _ := backendF.Get(ReceiptKey(idOf(1), 1)); raw != nil {
 			break
 		}
 		if time.Now().After(end) {
-			t.Fatalf("mutual repair did not converge (d=%v e=%v)", dd != nil, ee != nil)
+			t.Fatal("repair did not converge")
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	t.Logf("mutual repair converged in %.1fs", time.Since(start).Seconds())
-	// Each side served exactly the indexes the other was missing: staged
-	// relay, never a full transaction.
-	if got := e.Status().Metrics.ChunkNeedServed; got != uint64(len(high)) {
-		t.Fatalf("e served %d, want %d", got, len(high))
-	}
+	t.Logf("repair converged in %.1fs", time.Since(start).Seconds())
 	if got := d.Status().Metrics.ChunkNeedServed; got != uint64(len(low)) {
 		t.Fatalf("d served %d, want %d", got, len(low))
 	}
-	if d.Status().Metrics.ChunkNeedSent == 0 || e.Status().Metrics.ChunkNeedSent == 0 {
+	if got := e.Status().Metrics.ChunkNeedServed; got != uint64(len(high)) {
+		t.Fatalf("e served %d, want %d", got, len(high))
+	}
+	if f.Status().Metrics.ChunkNeedSent == 0 {
 		t.Fatal("no repair requests sent")
+	}
+	got, err := backendF.Get(LogKey(idOf(1), 1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got == nil {
+		t.Fatal("applied log record missing")
+	}
+	dec, err := DecodeTransaction(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(dec.Payload) != string(tx.Payload) {
+		t.Fatal("payload corrupted through repair path")
 	}
 }

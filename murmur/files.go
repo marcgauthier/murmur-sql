@@ -4,7 +4,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
 )
 
 func fileStore(db *Database) (*replication.FileObjects, error) {

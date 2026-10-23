@@ -204,6 +204,99 @@ func TestStagingReconciledAtOpen(t *testing.T) {
 	}
 }
 
+func TestReapStagingOrphans(t *testing.T) {
+	b := newTestBackend()
+	o, dir := openTestObjects(t, b)
+	meta, err := o.UploadOne("done", bytes.NewReader([]byte("data")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	staging := filepath.Join(dir, "staging")
+	if err := os.MkdirAll(staging, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	nine := idOf(9)
+	stem := func(digest [32]byte, generation uint64) string {
+		return Hex(nine[:]) + "-" + Hex(digest[:]) + ".g" + strconv.FormatUint(generation, 10)
+	}
+	write := func(name string, n int) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(staging, name), bytesRepeat(7, n), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := stem(meta.Digest, meta.Generation)
+	// Reaped: lone sidecar with a published object (publish completed,
+	// sidecar removal skipped: the files-resume strand shape).
+	write(done+".identity", 32)
+	// Reaped: lone sidecar, object absent (fetch died pre-partial).
+	write(stem(fill32(71), 0)+".identity", 32)
+	// Reaped: completed pair, object published.
+	meta72, err := o.UploadOne("done72", bytes.NewReader([]byte("data72")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(stem(meta72.Digest, meta72.Generation)+".part", 100)
+	write(stem(meta72.Digest, meta72.Generation)+".identity", 32)
+	// Reaped: lone partial, object published.
+	meta2, err := o.UploadOne("done2", bytes.NewReader([]byte("data2")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	write(stem(meta2.Digest, meta2.Generation)+".part", 100)
+	// Kept: valid resumable pair, object absent.
+	write(stem(fill32(79), 0)+".part", 100)
+	write(stem(fill32(79), 0)+".identity", 32)
+	// Kept: lone partial, object absent (the resume rule owns it).
+	write(stem(fill32(80), 0)+".part", 100)
+	// Kept: protected in-flight lone sidecar and pair.
+	write(stem(fill32(81), 0)+".identity", 32)
+	protSidecar := o.ProtectStaging(filepath.Join(staging, stem(fill32(81), 0)+".part"))
+	defer protSidecar.Release()
+	write(stem(fill32(82), 0)+".part", 100)
+	write(stem(fill32(82), 0)+".identity", 32)
+	protPair := o.ProtectStaging(filepath.Join(staging, stem(fill32(82), 0)+".part"))
+	defer protPair.Release()
+
+	if err := o.reapStagingOrphans(); err != nil {
+		t.Fatal(err)
+	}
+	left, err := os.ReadDir(staging)
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := make(map[string]bool, len(left))
+	for _, e := range left {
+		names[e.Name()] = true
+	}
+	for _, gone := range []string{
+		done + ".identity",
+		stem(fill32(71), 0) + ".identity",
+		stem(meta72.Digest, meta72.Generation) + ".part",
+		stem(meta72.Digest, meta72.Generation) + ".identity",
+		stem(meta2.Digest, meta2.Generation) + ".part",
+	} {
+		if names[gone] {
+			t.Fatalf("orphan survived: %s", gone)
+		}
+	}
+	for _, kept := range []string{
+		stem(fill32(79), 0) + ".part",
+		stem(fill32(79), 0) + ".identity",
+		stem(fill32(80), 0) + ".part",
+		stem(fill32(81), 0) + ".identity",
+		stem(fill32(82), 0) + ".part",
+		stem(fill32(82), 0) + ".identity",
+	} {
+		if !names[kept] {
+			t.Fatalf("live staging reaped: %s", kept)
+		}
+	}
+	if len(names) != 6 {
+		t.Fatalf("staging holds %d files, want 6 survivors", len(names))
+	}
+}
+
 func TestFilesBeginFinishUpload(t *testing.T) {
 	b := newTestBackend()
 	o, dir := openTestObjects(t, b)

@@ -26,8 +26,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // seed is the seeded RNG stream. The same seed is reused for every mode so

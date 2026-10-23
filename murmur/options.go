@@ -3,8 +3,8 @@ package murmur
 import (
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // Options configures Database open behavior.

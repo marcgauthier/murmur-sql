@@ -155,10 +155,16 @@ func peerID(conn quicConn, config *Config) (NodeId, error) {
 	if err != nil {
 		return zero, err
 	}
-	if len(config.AllowedPeers) > 0 && !config.AllowedPeers[id] {
+	if !peerAllowed(config, id) {
 		return zero, authErr("remote node denied")
 	}
 	return id, nil
+}
+
+// peerAllowed reports whether id passes the identity allow-list. An
+// empty list admits every authenticated identity.
+func peerAllowed(config *Config, id NodeId) bool {
+	return len(config.AllowedPeers) == 0 || config.AllowedPeers[id]
 }
 
 func parsePrivateKey(der []byte) (any, error) {
@@ -240,7 +246,7 @@ func newEndpoint(config *Config, bind netip.AddrPort, node NodeId, alpn []byte) 
 			if err != nil {
 				return err
 			}
-			if len(config.AllowedPeers) > 0 && !config.AllowedPeers[id] {
+			if !peerAllowed(config, id) {
 				return errors.New("peer identity denied")
 			}
 			return nil

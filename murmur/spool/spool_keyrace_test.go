@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // TestKeyRotationPruneWriteStorm exercises the key lifecycle: seals race

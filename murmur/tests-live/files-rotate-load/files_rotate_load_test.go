@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // fileKeys are the generation-0 (retired) and generation-1 (current) file

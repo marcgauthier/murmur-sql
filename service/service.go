@@ -18,7 +18,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 )
 
 type installation struct {

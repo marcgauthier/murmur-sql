@@ -8,8 +8,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 const sessionFileBytes = 16 << 20

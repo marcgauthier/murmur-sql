@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // TestConcurrentWriters hammers Put/Delete from many goroutines, then

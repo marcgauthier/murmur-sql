@@ -5,8 +5,8 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // Logical values split into authenticated Spool blocks. Only Spool is

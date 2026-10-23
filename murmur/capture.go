@@ -1,7 +1,7 @@
 package murmur
 
 import (
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
 )
 
 // Capture tracks one session over the managed tables.

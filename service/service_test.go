@@ -2,7 +2,7 @@ package service
 
 import (
 	"context"
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 	"path/filepath"
 	"strings"
 	"testing"

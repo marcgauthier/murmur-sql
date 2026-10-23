@@ -14,8 +14,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/config"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 const Version = "1.0.0-go"

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // Replication history lifecycle. All authoritative state is in the backend.

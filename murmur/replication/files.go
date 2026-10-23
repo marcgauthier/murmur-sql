@@ -21,7 +21,7 @@ import (
 
 	"hash"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -313,6 +313,12 @@ func parseStagingName(name string) ([32]byte, uint64, bool) {
 	if !ok {
 		return zero, 0, false
 	}
+	return parseStagingStem(stem)
+}
+
+// parseStagingStem parses a staging stem without its suffix.
+func parseStagingStem(stem string) ([32]byte, uint64, bool) {
+	var zero [32]byte
 	_, rest, found := strings.Cut(stem, "-")
 	if !found {
 		return zero, 0, false
@@ -341,6 +347,72 @@ func parseStagingName(name string) ([32]byte, uint64, bool) {
 		digest[j] = hi<<4 | lo
 	}
 	return digest, generation, true
+}
+
+// reapStagingOrphans removes staging residue no fetch can use:
+// unprotected lone sidecars (publish completed but sidecar removal was
+// skipped, or a fetch died before creating its partial), and
+// unprotected partials or pairs whose object is already published.
+// In-flight transfers hold protection over both paths and are never
+// touched; resumable pairs (partial plus sidecar, object absent) are
+// kept. Runs on the fetch tick so a strand wedges StagedTransfers for
+// one interval at most instead of until the next restart.
+func (o *FileObjects) reapStagingOrphans() error {
+	dir := filepath.Join(o.config.Directory, "staging")
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return ioErr(err)
+	}
+	present := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && !info.IsDir() {
+			present[e.Name()] = true
+		}
+	}
+	protected := func(name string) bool {
+		o.stagedPaths.Lock()
+		defer o.stagedPaths.Unlock()
+		return o.staged[filepath.Join(dir, name)]
+	}
+	objectPublished := func(stem string) bool {
+		digest, generation, ok := parseStagingStem(stem)
+		if !ok {
+			return false
+		}
+		st, err := os.Stat(o.path(digest, generation))
+		return err == nil && !st.IsDir()
+	}
+	for name := range present {
+		full := filepath.Join(dir, name)
+		switch {
+		case strings.HasSuffix(name, ".identity"):
+			stem := strings.TrimSuffix(name, ".identity")
+			if present[stem+".part"] || protected(name) {
+				continue
+			}
+			if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+				return ioErr(err)
+			}
+		case strings.HasSuffix(name, ".part"):
+			stem := strings.TrimSuffix(name, ".part")
+			if protected(name) || !objectPublished(stem) {
+				continue
+			}
+			if err := os.Remove(full); err != nil && !os.IsNotExist(err) {
+				return ioErr(err)
+			}
+			sidecar := stem + ".identity"
+			if present[sidecar] && !protected(sidecar) {
+				if err := os.Remove(filepath.Join(dir, sidecar)); err != nil && !os.IsNotExist(err) {
+					return ioErr(err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // StagedTransfer pins staging paths until released.

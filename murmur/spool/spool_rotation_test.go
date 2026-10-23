@@ -3,7 +3,7 @@ package spool_test
 import (
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // TestKeyRotation writes data, rotates twice, and requires everything

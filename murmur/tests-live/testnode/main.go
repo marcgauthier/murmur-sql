@@ -35,7 +35,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur"
 )
 
 // Version is the fixture version printed by the version subcommand.

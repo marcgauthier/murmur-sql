@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
 )
 
 // Maintenance rewrites every authoritative segment: re-encrypting

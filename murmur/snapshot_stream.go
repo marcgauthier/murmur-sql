@@ -4,8 +4,8 @@ import (
 	"bytes"
 	"os"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // SnapshotSource streams snapshot records from an immutable Spool

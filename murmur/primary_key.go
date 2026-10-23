@@ -9,7 +9,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
 )
 
 // Managed row identities. All SQL rewriting stays at the local SQL

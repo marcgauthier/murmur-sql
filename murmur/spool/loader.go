@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
 )
 
 // LoadFunc receives current record versions during a load scan.

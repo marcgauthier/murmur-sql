@@ -7,8 +7,8 @@ import (
 	"io"
 	"net/netip"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // Canonical SQLite replication profile. Deliberately distinct from RIME v6.

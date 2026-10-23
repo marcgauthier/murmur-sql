@@ -5,7 +5,7 @@ import (
 	"math/bits"
 	"sort"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // Policy selects the merge behavior of one column.
@@ -101,7 +101,9 @@ func (c *Counter) Value() (int64, error) {
 	} else {
 		magHi, magLo = hi, lo
 	}
-	if magHi != 0 || magLo > uint64(1)<<63 {
+	// Only the negative side may touch 1<<63 (MinInt64); a positive
+	// 1<<63 would wrap to MinInt64 below.
+	if magHi != 0 || magLo > uint64(1)<<63 || (!neg && magLo == uint64(1)<<63) {
 		return 0, protocolErr("counter exceeds SQLite integer range")
 	}
 	if neg {

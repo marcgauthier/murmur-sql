@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 func openReaderStore(t *testing.T, dir string, plain bool) *spool.Store {

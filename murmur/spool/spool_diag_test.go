@@ -3,7 +3,7 @@ package spool_test
 import (
 	"testing"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // TestDiagnostics exercises the info, file, and latency surfaces:

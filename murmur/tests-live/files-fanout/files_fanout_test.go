@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // objectKey is the file object key (0x54..).

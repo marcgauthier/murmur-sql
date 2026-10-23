@@ -11,7 +11,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur"
 )
 
 // DumpNodeForensics dumps diagnostics for one node. It never panics and

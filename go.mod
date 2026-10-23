@@ -1,4 +1,4 @@
-module github.com/marcgauthier/murmur-sql-go
+module github.com/marcgauthier/murmur-sql
 
 go 1.24.0
 

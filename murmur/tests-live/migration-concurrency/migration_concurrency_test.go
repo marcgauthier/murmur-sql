@@ -22,9 +22,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/sqlite"
-	"github.com/marcgauthier/murmur-sql-go/murmur"
-	"github.com/marcgauthier/murmur-sql-go/murmur/tests-live/harness"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/tests-live/harness"
 )
 
 // table is the base table (Rust: typed records with a Name field).
@@ -278,8 +278,15 @@ func waitFullConverged(t *testing.T, cluster *harness.Cluster, want int, timeout
 // assertNote requires a materialized Note value (Rust: assertNote).
 func assertNote(t *testing.T, cluster *harness.Cluster, idx int, name, want string) {
 	t.Helper()
-	got, present, err := tryReadNote(cluster.Node(idx), name)
-	if err != nil || !present || got != want {
+	ok := harness.WaitUntil(healTimeout, poll, func() bool {
+		got, present, err := tryReadNote(cluster.Node(idx), name)
+		return err == nil && present && got == want
+	})
+	// A single-shot read races the Note UPDATEs: names converge (and
+	// waitFullConverged passes) while the per-origin UPDATEs are still
+	// in flight, so the value must be awaited, not sampled once.
+	if !ok {
+		got, present, err := tryReadNote(cluster.Node(idx), name)
 		t.Fatalf("node%d Note(%q) = (%q,%v,%v), want %q", idx+1, name, got, present, err, want)
 	}
 }

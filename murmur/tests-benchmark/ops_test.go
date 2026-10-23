@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur"
 )
 
 // Focused N-driven benchmarks over a pre-seeded database. Each complements

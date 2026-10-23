@@ -18,7 +18,7 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
 )
 
 // Ca is a cluster test certificate authority.

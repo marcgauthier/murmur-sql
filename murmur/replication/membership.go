@@ -5,7 +5,7 @@ import (
 	"net/netip"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // MemberState is bounded SWIM state.

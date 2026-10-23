@@ -71,45 +71,6 @@ func TestBridgeRelease(t *testing.T) {
 	}
 }
 
-func TestBridgeExportSnapshot(t *testing.T) {
-	exportDir := t.TempDir()
-	receiveDir := t.TempDir()
-	payload := bytesRepeat(0xA5, 5000)
-	cfg := NewBridgeExporter(idOf(1), exportDir, "s", fill32(30), RecipientPublicForBridge(fill32(40)))
-	exporter, err := OpenBridge(*cfg, &snapshotBackend{Backend: newTestBackend(), snapshot: payload})
-	if err != nil {
-		t.Fatal(err)
-	}
-	backend := &bridgeBackend{testBackend: newTestBackend()}
-	receiver := testReceiver(t, receiveDir, backend)
-	path, err := exporter.ExportSnapshot()
-	if err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil || len(raw) == 0 {
-		t.Fatalf("snapshot bundle = %d bytes, %v", len(raw), err)
-	}
-	incoming := filepath.Join(receiveDir, filepath.Base(path))
-	if err := os.WriteFile(incoming, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	header, err := receiver.Stage(incoming)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if header.Sequence != 1 || header.Stream != "s" {
-		t.Fatalf("header = %+v", header)
-	}
-	n, err := receiver.Process()
-	if err != nil || n != 1 {
-		t.Fatalf("process = %d, %v", n, err)
-	}
-	if len(backend.imported) != 1 || string(backend.imported[0]) != string(payload) {
-		t.Fatal("snapshot payload did not import intact")
-	}
-}
-
 func TestBridgeCaptureFileEdges(t *testing.T) {
 	// No file store attached: capture is a no-op.
 	bare := testExporter(t, t.TempDir())

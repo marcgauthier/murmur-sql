@@ -39,6 +39,33 @@ func testCert(t *testing.T, uris ...string) []byte {
 	return der
 }
 
+// TestPeerAllowed pins the identity allow-list predicate behind both
+// enforcement points (QUIC session admission and the TLS identity
+// check): an empty list admits every authenticated identity, a
+// non-empty list admits exactly its members.
+func TestPeerAllowed(t *testing.T) {
+	c := NewConfig(netip.MustParseAddrPort("127.0.0.1:0"), Credentials{}, fill32(1))
+	if !peerAllowed(c, idOf(2)) {
+		t.Fatal("nil allow-list denies")
+	}
+	c.AllowedPeers = map[NodeId]bool{}
+	if !peerAllowed(c, idOf(2)) {
+		t.Fatal("empty allow-list denies")
+	}
+	c.AllowedPeers = map[NodeId]bool{idOf(1): true}
+	if !peerAllowed(c, idOf(1)) {
+		t.Fatal("listed identity denied")
+	}
+	if peerAllowed(c, idOf(2)) {
+		t.Fatal("unlisted identity allowed")
+	}
+	// An explicit false entry denies even when the key is present.
+	c.AllowedPeers = map[NodeId]bool{idOf(2): false}
+	if peerAllowed(c, idOf(2)) {
+		t.Fatal("false entry allowed")
+	}
+}
+
 func TestNodeID(t *testing.T) {
 	uri := "replicateddb://node/01010101010101010101010101010101"
 	der := testCert(t, "https://example.com", uri)

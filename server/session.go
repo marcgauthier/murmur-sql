@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/auth"
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/auth"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 const maxStatements = 1024

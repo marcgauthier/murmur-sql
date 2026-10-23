@@ -13,7 +13,7 @@ import (
 	"strings"
 	"syscall"
 
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 )
 
 const unitName = "murmur-sql.service"

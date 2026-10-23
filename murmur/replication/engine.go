@@ -13,7 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 // ReplicationMetrics counts engine activity. Field names mirror the Rust
@@ -35,6 +35,7 @@ type ReplicationMetrics struct {
 	QueueAvailableBytes  int    `json:"queue_available_bytes"`
 	ChunkNeedSent        uint64 `json:"chunk_need_sent"`
 	ChunkNeedServed      uint64 `json:"chunk_need_served"`
+	NeedServed           uint64 `json:"need_served"`
 	ApplyBatches         uint64 `json:"apply_batches"`
 	ApplyBytes           uint64 `json:"apply_bytes"`
 	ApplyNanos           uint64 `json:"apply_nanos"`
@@ -1718,6 +1719,7 @@ func (c *engineCore) message(id NodeId, message Message, send *queueSender) erro
 			}
 		}
 		if served >= message.From {
+			c.mutateStatus(func(s *Status) { s.Metrics.NeedServed += served - message.From + 1 })
 			c.peersMu.Lock()
 			if p, ok := c.peers[id]; ok {
 				if served > p.sent[message.Origin] {

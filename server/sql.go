@@ -6,7 +6,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/marcgauthier/murmur-sql-go/engine"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 func sqlError(code, msg string) error { return &engine.Error{Code: code, Message: msg} }

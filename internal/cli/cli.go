@@ -11,11 +11,11 @@ import (
 	"io"
 	"strings"
 
-	"github.com/marcgauthier/murmur-sql-go/auth"
-	"github.com/marcgauthier/murmur-sql-go/config"
-	"github.com/marcgauthier/murmur-sql-go/engine"
-	"github.com/marcgauthier/murmur-sql-go/logging"
-	"github.com/marcgauthier/murmur-sql-go/server"
+	"github.com/marcgauthier/murmur-sql/auth"
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/engine"
+	"github.com/marcgauthier/murmur-sql/logging"
+	"github.com/marcgauthier/murmur-sql/server"
 )
 
 const ServerUsage = "usage: murmur-server [--config <path>] [--validate-config]\n       murmur-server /install | /uninstall\n"

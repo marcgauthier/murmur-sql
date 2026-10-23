@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/compression"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
 )
 
 // TestCoverageStringFormatters tests string representations of enums across

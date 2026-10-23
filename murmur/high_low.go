@@ -6,9 +6,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur/internal/postcard"
-	"github.com/marcgauthier/murmur-sql-go/murmur/replication"
-	"github.com/marcgauthier/murmur-sql-go/murmur/spool"
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
+	"github.com/marcgauthier/murmur-sql/murmur/replication"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // HighLowOwner is one cell or row ownership record.

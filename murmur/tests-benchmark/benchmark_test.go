@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql-go/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur"
 )
 
 var (

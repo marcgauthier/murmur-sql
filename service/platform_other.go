@@ -5,7 +5,7 @@ package service
 import (
 	"context"
 	"errors"
-	"github.com/marcgauthier/murmur-sql-go/config"
+	"github.com/marcgauthier/murmur-sql/config"
 )
 
 func unsupported() error {
