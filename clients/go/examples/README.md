@@ -1,7 +1,7 @@
 # Murmur Go examples
 
 Runnable SQL examples using standard `database/sql` calls. Each starts its own scratch `murmur-server`
-(cargo builds it on first use), provisions what it needs, and verifies its
+(Go builds it on first use), provisions what it needs, and verifies its
 result. Run from `clients/go`:
 
 ```sh
@@ -38,7 +38,7 @@ go run ./examples/bridge
 | replication  | Two-node peer mesh, retention, CRDT policy ops, retire |
 | bridge       | High-receiver field release, re-release, row form |
 
-Set `MURMUR_SERVER_BIN` to skip the cargo build and use a prebuilt server.
+Set `MURMUR_SERVER_BIN` to skip the Go server build and use a prebuilt server.
 
 The tables example reads the managed key, checks that it cannot be changed, and
 verifies stable UUIDs after disabling and re-enabling a populated table. Inserts
@@ -96,3 +96,6 @@ checks that the old key is rejected, and reconnects with the new key to verify
 data. Open a fresh pool immediately after rotation: existing sessions stay
 unlocked, but new connections require the new key. Rotation rewraps the key
 registry; it does not rewrite every encrypted block.
+
+The keys, replication, and bridge examples inspect server SQLSTATE codes with
+`errors.As` and `*murmur.Error`; they require no driver imports.

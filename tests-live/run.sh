@@ -7,6 +7,10 @@ set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
 live="$root/tests-live"
 scenario=${1:-all}
+if [[ "${MURMUR_ENGINE_INTEGRATION:-}" != "1" ]]; then
+  echo "Live scenarios are opt-in. Set MURMUR_ENGINE_INTEGRATION=1 to run the real-engine scenarios." >&2
+  exit 1
+fi
 
 # One shared target dir: per-package target/ dirs duplicate the full
 # dependency build (~1.6 GB x 70 scenarios exhausted a 219 GB disk).
@@ -16,7 +20,7 @@ runtime_root=${MURMUR_LIVE_RUNTIME:-"$live/runtime"}
 started_at=$SECONDS
 
 echo "======================================================================"
-echo "  MURMUR RUST LIVE SCENARIO RUNNER"
+echo "  MURMUR GO SERVER / RUST LIVE SCENARIO RUNNER"
 echo "======================================================================"
 
 # Reap server processes rooted at OUR runtime dir on the way out (Ctrl-C,
@@ -42,8 +46,9 @@ trap sweep_runtime_servers EXIT INT TERM
 
 if [[ -z "${MURMUR_SERVER_BIN:-}" ]]; then
   echo "Building murmur-server binaries..."
-  cargo build --manifest-path "$root/Cargo.toml" --features replication --bin murmur-server --bin murmur-admin
-  export MURMUR_SERVER_BIN="$CARGO_TARGET_DIR/debug/murmur-server"
+  mkdir -p "$root/bin"
+  (cd "$root" && go build -o bin/murmur-server ./cmd/murmur-server && go build -o bin/murmur-admin ./cmd/murmur-admin)
+  export MURMUR_SERVER_BIN="$root/bin/murmur-server"
 fi
 if [[ ! -x "$MURMUR_SERVER_BIN" ]]; then
   echo "MURMUR_SERVER_BIN is not executable: $MURMUR_SERVER_BIN" >&2

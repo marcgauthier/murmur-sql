@@ -6,8 +6,9 @@ import servertest
 
 def main():
     with servertest.Scratch() as left, servertest.Scratch() as right:
-        policies = ('merge_policies = { "stats.count" = "counter", "stats.tags" = "set", '
-                    '"stats.highest" = "max", "stats.lowest" = "min" }\n')
+        policies = ('  merge_policies:\n    "stats.count": "counter"\n'
+                    '    "stats.tags": "set"\n    "stats.highest": "max"\n'
+                    '    "stats.lowest": "min"\n')
         options = servertest.mesh_options([left.dir, right.dir], policies)
         s0, s1 = left.start(**options[0]), right.start(**options[1])
         def config(server):

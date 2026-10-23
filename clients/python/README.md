@@ -1,3 +1,5 @@
+> Go-port status: the production server now uses MURMUR-GO through the native adapter. This integration is source-ported and has not been built or tested. See [port status](../../docs/PARITY.md).
+
 # Murmur Python client
 
 Pure-Python client over the PostgreSQL wire protocol, built on
@@ -60,7 +62,7 @@ with murmur.connect(murmur.Config(
 
 ## Tests and examples
 
-Tests and examples start a scratch `murmur-server` (cargo builds it on first use; set
+Tests and examples start a scratch `murmur-server` (Go builds it on first use; set
 `MURMUR_SERVER_BIN` to a prebuilt `--features replication` binary). From `clients/python`:
 
 ```sh

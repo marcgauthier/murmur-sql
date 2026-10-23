@@ -40,28 +40,14 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
             return (server, admin);
         }
         let root = repo();
-        let status = Command::new("cargo")
-            .args([
-                "build",
-                "--features",
-                "replication",
-                "--bin",
-                "murmur-server",
-                "--bin",
-                "murmur-admin",
-            ])
-            .current_dir(&root)
-            .status()
-            .expect("build server");
-        assert!(status.success(), "server build failed");
-        let target = std::env::var_os("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .map(|p| if p.is_absolute() { p } else { root.join(p) })
-            .unwrap_or_else(|| root.join("target"));
-        (
-            target.join("debug").join(binary_name("murmur-server")),
-            target.join("debug").join(binary_name("murmur-admin")),
-        )
+        let target = root.join("bin");
+        std::fs::create_dir_all(&target).expect("create Go binary directory");
+        for name in ["murmur-server", "murmur-admin"] {
+            let status=Command::new("go").arg("build").arg("-o").arg(target.join(binary_name(name))).arg(format!("./cmd/{name}"))
+                .current_dir(&root).status().expect("run go build");
+            assert!(status.success(), "Go server build failed");
+        }
+        (target.join(binary_name("murmur-server")),target.join(binary_name("murmur-admin")))
     })
 }
 fn hash() -> &'static str {

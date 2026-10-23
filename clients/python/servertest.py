@@ -1,6 +1,6 @@
 """Scratch murmur-server harness for the Python tests and examples.
 
-Builds ``murmur-server`` through cargo once per process (or reuses
+Builds ``murmur-server`` through Go once per process (or reuses
 ``MURMUR_SERVER_BIN``) and spawns throwaway instances. Dev-only: not part of
 the installable ``murmur`` package. PKI helpers need the ``cryptography``
 package (``pip install -e .[test]``).
@@ -28,7 +28,7 @@ PASSWORD = "test-password"
 
 
 def build() -> tuple:
-    """Return ``(server_bin, admin_bin)``, compiling with cargo when needed."""
+    """Return ``(server_bin, admin_bin)``, compiling with Go when needed."""
     global _built
     if _built:
         return _built
@@ -36,12 +36,11 @@ def build() -> tuple:
     if prebuilt:
         _built = (prebuilt, str(Path(prebuilt).parent / ("murmur-admin" + _EXE)))
         return _built
-    subprocess.run(
-        ["cargo", "build", "--features", "replication", "--bin", "murmur-server", "--bin", "murmur-admin"],
-        cwd=ROOT,
-        check=True,
-    )
-    target = ROOT / "target" / "debug"
+    target = ROOT / "bin"
+    target.mkdir(exist_ok=True)
+    for name in ("murmur-server", "murmur-admin"):
+        subprocess.run(["go", "build", "-o", str(target / (name + _EXE)), "./cmd/" + name], cwd=ROOT, check=True)
+
     _built = (str(target / ("murmur-server" + _EXE)), str(target / ("murmur-admin" + _EXE)))
     return _built
 
@@ -87,28 +86,28 @@ def start(
     directory: str,
     node_id: str = "",
     tls: Optional[TLSFiles] = None,
-    extra_toml: str = "",
+    extra_yaml: str = "",
     database_id: str = "",
 ) -> Server:
     """Write a scratch config (user ``admin``) and spawn murmur-server."""
     server_bin, _ = build()
     port = free_port()
-    config = Path(directory) / "config.toml"
+    config = Path(directory) / "config.yaml"
     tls_section = ""
     if tls:
         tls_section = (
-            f'[server.tls]\nenabled = true\ncert_file = "{_p(tls.cert)}"\n'
-            f'key_file = "{_p(tls.key)}"\n'
+            f"  tls:\n    enabled: true\n    cert_file: {_q(tls.cert)}\n"
+            f"    key_file: {_q(tls.key)}\n"
         )
-    node_line = f'node_id = "{node_id}"\n' if node_id else ""
+    node_line = f"  node_id: {_q(node_id)}\n" if node_id else ""
     if database_id:
-        node_line += f'database_id = "{database_id}"\n'
+        node_line += f"  database_id: {_q(database_id)}\n"
     config.write_text(
-        f'[server]\nbind = "127.0.0.1:{port}"\nproduction = false\n\n{tls_section}\n'
-        f'[storage]\ndata_dir = "{_p(Path(directory) / "data")}"\n{node_line}\n'
-        f'[[auth.users]]\nname = "admin"\npassword_hash = "{password_hash()}"\n\n'
-        f'[logging]\ndir = "{_p(Path(directory) / "logs")}"\n\n'
-        f'[backups]\ndir = "{_p(Path(directory) / "backups")}"\n\n{extra_toml}'
+        f"server:\n  bind: \"127.0.0.1:{port}\"\n  production: false\n{tls_section}\n"
+        f"storage:\n  data_dir: {_q(Path(directory) / 'data')}\n{node_line}\n"
+        f"auth:\n  users:\n    - name: \"admin\"\n      password_hash: {_q(password_hash())}\n\n"
+        f"logging:\n  dir: {_q(Path(directory) / 'logs')}\n\n"
+        f"backups:\n  dir: {_q(Path(directory) / 'backups')}\n\n{extra_yaml}"
     )
     proc = subprocess.Popen([server_bin, "--config", str(config)], stderr=subprocess.PIPE)
     deadline = time.time() + 20
@@ -128,6 +127,12 @@ def start(
 
 def _p(path) -> str:
     return str(path).replace("\\", "/")
+
+
+def _q(value) -> str:
+    import json
+
+    return json.dumps(_p(value))
 
 
 class Scratch:
@@ -268,18 +273,18 @@ def file_options(directory: str) -> dict:
     public_hex = signing.public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw
     ).hex()
-    toml = (
-        f'[replication]\nenabled = true\nbind = "127.0.0.1:0"\n'
-        f'cert_chain_file = "{_p(d / "file-node.pem")}"\n'
-        f'private_key_file = "{_p(d / "file-key.pem")}"\n'
-        f'ca_file = "{_p(d / "file-ca.pem")}"\n'
-        f'signing_key_hex = "{"03" * 32}"\n'
-        f'trusted_origins = {{ "{node}" = "{public_hex}" }}\n'
-        f'[replication.files]\ndirectory = "{_p(d / "objects")}"\nkey_hex = "{"07" * 32}"\n'
+    yaml = (
+        'replication:\n  enabled: true\n  bind: "127.0.0.1:0"\n'
+        f'  cert_chain_file: {_q(d / "file-node.pem")}\n'
+        f'  private_key_file: {_q(d / "file-key.pem")}\n'
+        f'  ca_file: {_q(d / "file-ca.pem")}\n'
+        f'  signing_key_hex: "{"03" * 32}"\n'
+        f'  trusted_origins:\n    "{node}": "{public_hex}"\n'
+        f'  files:\n    directory: {_q(d / "objects")}\n    key_hex: "{"07" * 32}"\n'
     )
-    return {"node_id": node, "extra_toml": toml}
+    return {"node_id": node, "extra_yaml": yaml}
 
-def mesh_options(directories, replication_toml=""):
+def mesh_options(directories, replication_extra=""):
     """Shared CA/database id and distinct trusted node identities; no initial peers."""
     import secrets
     from cryptography import x509
@@ -294,7 +299,7 @@ def mesh_options(directories, replication_toml=""):
     seeds = [secrets.token_bytes(32) for _ in directories]
     public = [ed25519.Ed25519PrivateKey.from_private_bytes(seed).public_key().public_bytes(
         serialization.Encoding.Raw, serialization.PublicFormat.Raw).hex() for seed in seeds]
-    trusted = ", ".join(f'"{node}" = "{key}"' for node, key in zip(nodes, public))
+    trusted = "\n".join(f'    "{node}": "{key}"' for node, key in zip(nodes, public))
     database_id = secrets.token_hex(16)
     options = []
     for i, (directory, node, seed) in enumerate(zip(directories, nodes, seeds)):
@@ -307,13 +312,14 @@ def mesh_options(directories, replication_toml=""):
         (d / "mesh-ca.pem").write_bytes(_pem_cert(ca))
         (d / "mesh-node.pem").write_bytes(_pem_cert(leaf))
         (d / "mesh-key.pem").write_bytes(_pem_key(leaf_key))
-        toml = (
-            f'[replication]\nenabled = true\nbind = "127.0.0.1:0"\n'
-            f'cert_chain_file = "{_p(d / "mesh-node.pem")}"\n'
-            f'private_key_file = "{_p(d / "mesh-key.pem")}"\n'
-            f'ca_file = "{_p(d / "mesh-ca.pem")}"\n'
-            f'signing_key_hex = "{seed.hex()}"\n'
-            f'trusted_origins = {{ {trusted} }}\n{replication_toml}'
+        extra = f"\n{replication_extra.rstrip()}\n" if replication_extra else ""
+        yaml = (
+            'replication:\n  enabled: true\n  bind: "127.0.0.1:0"\n'
+            f'  cert_chain_file: {_q(d / "mesh-node.pem")}\n'
+            f'  private_key_file: {_q(d / "mesh-key.pem")}\n'
+            f'  ca_file: {_q(d / "mesh-ca.pem")}\n'
+            f'  signing_key_hex: "{seed.hex()}"\n'
+            f'  trusted_origins:\n{trusted}{extra}\n'
         )
-        options.append(dict(node_id=node, database_id=database_id, extra_toml=toml))
+        options.append(dict(node_id=node, database_id=database_id, extra_yaml=yaml))
     return options

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
 	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
@@ -38,7 +37,11 @@ func main() {
 				t.Fatalf("mkdir: %v", err)
 			}
 		}
-		policies := "merge_policies = { \"stats.count\" = \"counter\", \"stats.highest\" = \"max\", \"stats.lowest\" = \"min\", \"stats.tags\" = \"set\" }\n"
+		policies := "  merge_policies:\n" +
+			"    \"stats.count\": \"counter\"\n" +
+			"    \"stats.highest\": \"max\"\n" +
+			"    \"stats.lowest\": \"min\"\n" +
+			"    \"stats.tags\": \"set\"\n"
 		opts := servertest.MeshOptions(t, dirs, policies)
 		node0, node1 := opts[0].NodeID, opts[1].NodeID
 		servers := []*servertest.Server{
@@ -175,8 +178,8 @@ func main() {
 			t.Fatalf("retired peer missing")
 		}
 		_, err = db0.ExecContext(ctx, "MURMUR PEER RETIRE '"+node0+"'")
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
+		var serverErr *murmur.Error
+		if !errors.As(err, &serverErr) || serverErr.Code != "22023" {
 			t.Fatalf("self-retire: %v", err)
 		}
 		fmt.Println("replication: verified peers, retention, policy ops, and retire")

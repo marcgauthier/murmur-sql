@@ -8,10 +8,11 @@ def main():
     with servertest.Scratch() as scratch:
         options = servertest.mesh_options([scratch.dir])[0]
         directory = str(Path(scratch.dir) / "staging").replace("\\", "/")
-        options["extra_toml"] += (
-            f'[replication.bridge]\nrole = "high-receiver"\ndomain = "{options["database_id"]}"\n'
-            f'trusted_domains = ["{"11" * 16}"]\ndirectory = "{directory}"\n'
-            f'stream = "test-stream"\nrecipient = "{"ee" * 32}"\nreceiver_secret_hex = "{"dd" * 32}"\n')
+        options["extra_yaml"] += (
+            '  bridge:\n    role: "high-receiver"\n    domain: "{}"\n'
+            '    trusted_domains:\n      - "{}"\n    directory: "{}"\n'
+            '    stream: "test-stream"\n    recipient: "{}"\n    receiver_secret_hex: "{}"\n'
+        ).format(options["database_id"], "11" * 16, directory, "ee" * 32, "dd" * 32)
         server = scratch.start(**options)
         with murmur.connect(murmur.Config(
                 port=server.port, user="admin", password=servertest.PASSWORD, key="bridge-key")) as db:

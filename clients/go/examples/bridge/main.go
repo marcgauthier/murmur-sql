@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
 	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
@@ -28,9 +27,9 @@ func main() {
 		// and recipient/secret are arbitrary distinct test values. Domain
 		// must equal the node's own database id.
 		o := opts[0]
-		o.ExtraTOML += fmt.Sprintf("[replication.bridge]\nrole = \"high-receiver\"\n"+
-			"domain = %q\ntrusted_domains = [%q]\ndirectory = %q\nstream = \"example-stream\"\n"+
-			"recipient = %q\nreceiver_secret_hex = %q\n",
+		o.ExtraYAML += fmt.Sprintf("  bridge:\n    role: \"high-receiver\"\n"+
+			"    domain: %q\n    trusted_domains:\n      - %q\n    directory: %q\n    stream: \"example-stream\"\n"+
+			"    recipient: %q\n    receiver_secret_hex: %q\n",
 			o.DatabaseID, strings.Repeat("11", 16), filepath.Join(node, "inbox"),
 			strings.Repeat("ee", 32), strings.Repeat("dd", 32))
 		server := servertest.Start(t, node, o)
@@ -66,8 +65,8 @@ func main() {
 			"MURMUR BRIDGE RELEASE missing 'r1' COLUMN title",
 		} {
 			_, err := db.ExecContext(ctx, query)
-			var pgErr *pgconn.PgError
-			if !errors.As(err, &pgErr) || pgErr.Code != "22023" {
+			var serverErr *murmur.Error
+			if !errors.As(err, &serverErr) || serverErr.Code != "22023" {
 				t.Fatalf("%s: %v", query, err)
 			}
 		}

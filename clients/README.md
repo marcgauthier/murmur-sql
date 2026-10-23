@@ -1,3 +1,5 @@
+> Go-port status: the production server now uses MURMUR-GO through the native adapter. This integration is source-ported and has not been built or tested. See [port status](../docs/PARITY.md).
+
 # Language clients
 
 Client implementations live under `clients/<language>` so additional languages

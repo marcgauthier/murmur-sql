@@ -1,35 +1,14 @@
-# Binaries and test artifacts
+/bin/
+/target/
+/logs/
+/data/
+/backups/
+/config.toml
+*.exe
 *.test
 *.out
-*.exe
-*.o
-*.a
-*.so
-
-# Coverage and profiling
-*.prof
-*.pprof
-coverage.txt
-
-# OS and IDE files
-.DS_Store
-.vscode/
-.idea/
-
-# Local build and live test runtime artifacts
-/bin/
-/spedsql
-/testnode
-tests-live/bin/
-tests-live/runtime/
-tests-live/failures/
-tests-live/abuse/abuse-report-*.md
-tests-live/endurance-chaos/endurance-report-*.md
-tests-benchmark/bin/
-tests-benchmark/runtime/
-tests-benchmark/failures/
-tests-benchmark/benchmark/perf-report-*.json
-
-# Rust build artifacts
-target/
+murmur-service-*.log
 **/target/
+**/runtime/
+**/__pycache__/
+**/.pytest_cache/

@@ -1,10 +1,21 @@
+> Go-port status: the production server now uses MURMUR-GO through the native adapter. This integration is source-ported and has not been built or tested. See [port status](../../docs/PARITY.md).
+
 # Murmur Go client
 
-A pure-Go PostgreSQL-wire connection package using pgx. `murmur.Open` returns
+A pure-Go PostgreSQL-wire connection package using the `github.com/marcgauthier/pq` fork. `murmur.Open` returns
 an ordinary `*sql.DB` and unlocks every physical pooled connection before use.
 Use standard `database/sql` methods for application SQL and `MURMUR ...`
 commands. There are no command helpers, custom database wrapper, or public
 result structs. SQL is the SQLite dialect; value parameters use `$N`.
+
+The fork is pinned with a `go.mod` replacement because it still declares the
+`github.com/lib/pq` module path. Applications consuming this client must also
+include this replacement in their own module; Go does not inherit replacements
+from dependencies:
+
+```go
+replace github.com/lib/pq => github.com/marcgauthier/pq v0.0.0-20260820222753-451ac10e4e85
+```
 
 ## Quickstart
 
@@ -49,7 +60,7 @@ func main() {
 
 ## Connection and pooling
 
-`Config` takes the server address, an `auth.users` login from `config.toml`,
+`Config` takes the server address, an `auth.users` login from `config.yaml`,
 and the database key (64 hex characters or a passphrase). Each physical
 connection executes `MURMUR UNLOCK` before first use; a wrong key fails `Open`
 with SQLSTATE `28000`. Host defaults to `127.0.0.1`, port to `5432`, database
@@ -203,16 +214,25 @@ Application code controls streaming, cancellation, and destination errors.
 
 ## Errors
 
-Use pgx errors with standard `errors.As`:
+Server-reported errors from `Open` and its returned `*sql.DB` pool automatically
+use `*murmur.Error`. Inspect them with standard `errors.As`:
 
 ```go
-var pgErr *pgconn.PgError
-if errors.As(err, &pgErr) && pgErr.Code == "28000" {
-    // Authentication, unlock, or TLS rejection; inspect pgErr.Message.
+var serverErr *murmur.Error
+if errors.As(err, &serverErr) && serverErr.Code == "28000" {
+    // Authentication, unlock, or TLS rejection; inspect serverErr.Message.
 }
 ```
 
-Import `errors` and `github.com/jackc/pgx/v5/pgconn`. See the
+Import `errors` and the MURMUR-SQL client as `murmur`. The independent error
+type exposes server diagnostics and `SQLState()`; fields may be empty when not
+supplied by the server. `Error()` preserves the original text and connection or
+unlock context, and `Unwrap()` preserves the cause. Concrete underlying driver
+types are not a compatibility guarantee. The `github.com/marcgauthier/pq` fork
+remains an internal dependency;
+applications do not need to import it. Validation, network, TLS, cancellation,
+and other non-server errors retain their existing types and do not receive
+fabricated SQLSTATE codes. See the
 [SQLSTATE reference](../../docs/USAGE.md#error-codes).
 
 ## Features
@@ -220,6 +240,7 @@ Import `errors` and `github.com/jackc/pgx/v5/pgconn`. See the
 | Feature            | Examples                  |
 |--------------------|---------------------------|
 | Connect and unlock | basic                     |
+| Server error handling | keys, replication, bridge |
 | CRUD with parameters | basic, concurrency      |
 | DDL migrations     | migrations                |
 | Automatic replication keys | tables            |

@@ -1,0 +1,187 @@
+# Murmur server configuration. Every section is optional; omitted keys take
+# the engine defaults. Unknown keys are rejected. Durations take units
+# ("500ms", "1s", "5m", "1h", "7d") or bare seconds; byte sizes take units
+# ("64KiB", "256MiB", "1GiB") or bare bytes.
+
+server:
+  # Postgres-wire listen address.
+  bind: "127.0.0.1:5432"
+  # Production mode requires TLS with client certificates (mTLS).
+  production: false
+  tls:
+    enabled: false
+    # cert_file: "/etc/murmur/server.crt"
+    # key_file: "/etc/murmur/server.key"
+    # ca_file: "/etc/murmur/ca.crt"
+
+storage:
+  data_dir: "./data"
+  # database_id: "00112233445566778899aabbccddeeff"
+  # node_id: "00112233445566778899aabbccddeeff"
+
+engine:
+  capture_interval: "1s"
+  capture_bytes: "8MiB"
+  queue_bytes: "64MiB"
+  transaction_bytes: "64MiB"
+  segment_bytes: "256MiB"
+  spool_block_bytes: "64KiB"
+  spool_cache_bytes: "32MiB"
+  snapshot_deltas: 128
+  snapshot_bytes: "256MiB"
+  compression_level: 3
+  storage_workers: 2
+  # data_key_max_age: "30d"
+  scheduler:
+    local_share: 90
+    remote_share: 10
+    max_debt: "1s"
+    maintenance_reserve_every: 100
+
+# Users allowed to open Postgres-wire sessions. Passwords are Argon2 hashes,
+# never plaintext; generate one with `murmur-admin hash-password`.
+# auth:
+#   users:
+#     - name: "admin"
+#       password_hash: "$argon2id$v=19$m=19456,t=2,p=1$..."
+
+replication:
+  enabled: false
+  # Local QUIC listen address for peer replication traffic.
+  bind: "127.0.0.1:9001"
+  # Routable IP:port announced to remote peers (useful behind NAT/containers).
+  # advertise: "203.0.113.10:9001"
+  # Initial remote seed node addresses to connect to on startup.
+  # Peers discover other cluster members dynamically via gossip membership.
+  # bootstrap:
+  #   - "203.0.113.11:9001"
+  #   - "203.0.113.12:9001"
+  # TLS credentials for mutual TLS over QUIC. The node certificate must contain
+  # a URI SAN matching this node's identity: replicateddb://node/<32-hex-node-id>.
+  # cert_chain_file: "/etc/murmur/replication.crt"
+  # private_key_file: "/etc/murmur/replication.key"
+  # ca_file: "/etc/murmur/replication-ca.crt"
+  # Ed25519 payload signing key (32 bytes = 64 hex characters), or path to key file.
+  # signing_key_hex: "...64 hex chars..."
+  # signing_key_file: "/etc/murmur/signing.key"
+  # Public keys of remote origin nodes (32-hex node ID -> 64-hex Ed25519 public key).
+  # Used to verify replication changes received directly or forwarded across the mesh.
+  # trusted_origins:
+  #   "00112233445566778899aabbccddeeff": "...64 hex chars..."
+  # Optional whitelist of accepted remote node IDs (32 hex characters). Empty allows any authenticated node.
+  # allowed_peers:
+  #   - "00112233445566778899aabbccddeeff"
+  # Optional CIDR blocks allowed to connect (e.g. ["10.0.0.0/8"]). Empty allows any network.
+  # allowed_networks:
+  #   - "10.0.0.0/8"
+  # Remote nodes explicitly authorized to supply full catch-up recovery snapshots.
+  # trusted_snapshot_sources:
+  #   - "00112233445566778899aabbccddeeff"
+  membership: true
+  dissemination: "gossip"
+  accept_remote_schema: true
+  master: false
+  # schema_master: "00112233445566778899aabbccddeeff"
+  fanout: 4
+  repairs: 2
+  sessions: 32
+  connections: 64
+  queue_bytes: "64MiB"
+  peer_queue_bytes: "4MiB"
+  staging_bytes: "256MiB"
+  staging_transfers: 4096
+  max_transaction_bytes: "64MiB"
+  snapshot_bytes: "512MiB"
+  snapshot_staging_bytes: "512MiB"
+  snapshot_transfer_lifetime: "7d"
+  incoming_interval: "1s"
+  batch_transactions: 64
+  batch_bytes: "4MiB"
+  adaptive_sync: false
+  anti_entropy_interval: "10s"
+  retention: "1h"
+  retention_interval: "1m"
+  minimum_retained: 1000
+  maximum_offline: "7d"
+  # merge_policies:
+  #   "items.count": "counter"
+
+  # Per-table replication flags, keyed by stable table ID. Missing entries mean
+  # local-only; set true to replicate. `MURMUR SET TABLE <name> REPLICATED true|false`
+  # edits this map.
+  tables: {}
+
+  # files:
+  #   directory: "./files"
+  #   key_hex: "...64 hex chars..."
+  #   fetch_bind: "127.0.0.1:0"
+  #   max_file_bytes: "4GiB"
+  #   max_staging_bytes: "1GiB"
+  #   concurrent_fetches: 2
+  #   fetch_interval: "30s"
+
+  # One-way Low-to-High bridge. Deploy two nodes with different database IDs:
+  # the Low node exports signed, recipient-sealed bundles from its outbox
+  # directory, and the operator copies completed `.bundle` files to the High
+  # node's inbox directory with an external delivery mechanism (disk, scp,
+  # HTTP PUT). Both sides need `replication.enabled: true` and a server
+  # with engine replication support. Uncomment ONE role per node.
+  #
+  # Key distribution (generate fresh values; these are placeholders):
+  # - High generates an X25519 keypair: its secret stays in the High config
+  #   (`receiver_secret_hex`), its public key goes in BOTH configs (`recipient`).
+  # - Low signs bundles with an Ed25519 seed (`signer_hex` on Low); the matching
+  #   public key goes in the High config (`trusted_signers` and `trusted_origins`,
+  #   keyed by the Low node ID).
+  # - `domain` must equal the node's own `storage.database_id`.
+  # - `stream` must match on both sides (1-64 chars: letters, digits, `-` and `_`).
+
+  # Low node: exports bundles from ./low-outbox.
+  # bridge:
+  #   role: "low-exporter"
+  #   domain: "11111111111111111111111111111111"
+  #   directory: "./low-outbox"
+  #   stream: "main"
+  #   recipient: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  #   signer_hex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  #   max_bundle_bytes: "16MiB"
+  #   max_payload_bytes: "64MiB"
+  #   staging_bytes: "256MiB"
+
+  # High node: stages bundles copied into ./high-inbox.
+  # bridge:
+  #   role: "high-receiver"
+  #   domain: "22222222222222222222222222222222"
+  #   trusted_domains:
+  #     - "11111111111111111111111111111111"
+  #   trusted_signers:
+  #     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  #   trusted_origins:
+  #     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+  #   directory: "./high-inbox"
+  #   stream: "main"
+  #   recipient: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+  #   receiver_secret_hex: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  #   max_bundle_bytes: "16MiB"
+  #   max_payload_bytes: "64MiB"
+  #   staging_bytes: "256MiB"
+
+backups:
+  # Folder for MURMUR BACKUP archives. SAVE/UPLOAD create it when missing.
+  dir: "./backups"
+
+logging:
+  dir: "./logs"
+  level: "info"
+  file_prefix: "murmur"
+  rotation: "daily"
+  retention_days: 14
+  console: false
+  victorialogs:
+    enabled: false
+    url: "http://127.0.0.1:9428"
+    # username: "logs"
+    # password: "secret"
+    # bearer_token: "token"
+    # labels:
+    #   service: "murmur"

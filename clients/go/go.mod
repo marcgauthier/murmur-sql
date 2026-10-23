@@ -4,12 +4,18 @@ go 1.24.0
 
 toolchain go1.24.7
 
-require github.com/jackc/pgx/v5 v5.8.0
+require github.com/lib/pq v1.10.9
+
+replace github.com/lib/pq => github.com/marcgauthier/pq v0.0.0-20260820222753-451ac10e4e85
+
+require github.com/marcgauthier/murmur-sql-go v0.0.0
 
 require (
-	github.com/jackc/pgpassfile v1.0.0 // indirect
-	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
-	github.com/jackc/puddle/v2 v2.2.2 // indirect
-	golang.org/x/sync v0.17.0 // indirect
-	golang.org/x/text v0.29.0 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
+	golang.org/x/sys v0.35.0 // indirect
+	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/marcgauthier/murmur-sql-go => ../..
+
+replace github.com/DataDog/zstd => ../../murmur/third_party/zstd

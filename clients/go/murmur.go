@@ -3,6 +3,7 @@ package murmur
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
 	"errors"
 	"fmt"
 	"net/url"
@@ -10,9 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/lib/pq"
 )
 
 // TLSMode selects Postgres sslmode negotiation.
@@ -129,6 +128,41 @@ func escapeKey(key string) string {
 	return strings.ReplaceAll(key, "'", "''")
 }
 
+type unlockConnector struct {
+	base driver.Connector
+	key  string
+}
+
+func (u unlockConnector) Connect(ctx context.Context) (driver.Conn, error) {
+	conn, err := u.base.Connect(ctx)
+	if err != nil {
+		return nil, serverError(err)
+	}
+	var execErr error
+	if execerCtx, ok := conn.(driver.ExecerContext); ok {
+		_, execErr = execerCtx.ExecContext(ctx, "MURMUR UNLOCK KEY '"+u.key+"'", nil)
+	} else if execer, ok := conn.(driver.Execer); ok {
+		_, execErr = execer.Exec("MURMUR UNLOCK KEY '"+u.key+"'", nil)
+	} else {
+		stmt, prepErr := conn.Prepare("MURMUR UNLOCK KEY '" + u.key + "'")
+		if prepErr != nil {
+			conn.Close()
+			return nil, fmt.Errorf("murmur: unlock failed: %w", serverError(prepErr))
+		}
+		_, execErr = stmt.Exec(nil)
+		stmt.Close()
+	}
+	if execErr != nil {
+		conn.Close()
+		return nil, fmt.Errorf("murmur: unlock failed: %w", serverError(execErr))
+	}
+	return conn, nil
+}
+
+func (u unlockConnector) Driver() driver.Driver {
+	return u.base.Driver()
+}
+
 // Open connects, verifies the server, and unlocks every pooled connection
 // with cfg.Key. Each physical connection runs MURMUR UNLOCK before first
 // use; a wrong key fails Open (and any later reconnect) with code 28000.
@@ -138,18 +172,15 @@ func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
 		return nil, err
 	}
 	key := escapeKey(cfg.Key)
-	pgxCfg, err := pgx.ParseConfig(connURL)
+	connector, err := pq.NewConnector(connURL)
 	if err != nil {
 		return nil, fmt.Errorf("murmur: bad connection string: %w", err)
 	}
-	pgxCfg.AfterConnect = func(ctx context.Context, conn *pgconn.PgConn) error {
-		_, err := conn.Exec(ctx, "MURMUR UNLOCK KEY '"+key+"'").ReadAll()
-		if err != nil {
-			return fmt.Errorf("murmur: unlock failed: %w", err)
-		}
-		return nil
+	unlockConn := unlockConnector{
+		base: connector,
+		key:  key,
 	}
-	db := stdlib.OpenDB(*pgxCfg)
+	db := sql.OpenDB(errorConnector{base: unlockConn})
 	if cfg.MaxOpenConns > 0 {
 		db.SetMaxOpenConns(cfg.MaxOpenConns)
 	}

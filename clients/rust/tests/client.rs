@@ -388,8 +388,7 @@ async fn peer_mesh_show_and_retention() {
 #[tokio::test]
 async fn policy_crdt_operations() {
     let dir = tempfile::tempdir().unwrap();
-    let policies = "merge_policies = { \"stats.count\" = \"counter\", \"stats.tags\" = \"set\", \
-        \"stats.highest\" = \"max\", \"stats.lowest\" = \"min\" }\n";
+    let policies = "  merge_policies:\n    \"stats.count\": \"counter\"\n    \"stats.tags\": \"set\"\n    \"stats.highest\": \"max\"\n    \"stats.lowest\": \"min\"\n";
     let opts = support::replication_options(dir.path(), policies);
     let server = support::start(dir, opts);
     let db = Client::connect(&support::config(&server, "policy-key"))
@@ -464,12 +463,10 @@ async fn bridge_release_field() {
     // Scratch high-receiver: no bundles are exchanged, so trust values are
     // fixed test constants; domain must equal the node's own database id.
     let domain = opts.database_id.clone();
-    opts.extra_toml.push_str(&format!(
-        "[replication.bridge]\nrole = \"high-receiver\"\ndomain = \"{domain}\"\n\
-         trusted_domains = [\"{}\"]\ndirectory = \"{}\"\nstream = \"test-stream\"\n\
-         recipient = \"{}\"\nreceiver_secret_hex = \"{}\"\n",
+    opts.extra_yaml.push_str(&format!(
+        "  bridge:\n    role: \"high-receiver\"\n    domain: \"{domain}\"\n    trusted_domains:\n      - \"{}\"\n    directory: \"{}\"\n    stream: \"test-stream\"\n    recipient: \"{}\"\n    receiver_secret_hex: \"{}\"\n",
         "11".repeat(16),
-        dir.path().join("staging").display(),
+        support::yaml_path(&dir.path().join("staging")),
         "ee".repeat(32),
         "dd".repeat(32),
     ));

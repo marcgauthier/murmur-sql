@@ -42,7 +42,7 @@ fn decode_hex_32(hex: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// `(server, admin)` binaries: `MURMUR_SERVER_BIN` or a cargo build once per process.
+/// `(server, admin)` binaries: `MURMUR_SERVER_BIN` or a Go build once per process.
 fn binaries() -> &'static (PathBuf, PathBuf) {
     static BINS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     BINS.get_or_init(|| {
@@ -54,17 +54,14 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
             }
         }
         let root = crate::artifacts::tests_live_dir().join("..");
-        let status = Command::new("cargo")
-            .args(["build", "--features", "replication", "--bin", "murmur-server", "--bin", "murmur-admin"])
-            .current_dir(&root)
-            .status()
-            .expect("run cargo");
-        assert!(status.success(), "cargo build of murmur-server failed");
-        let target = std::env::var("CARGO_TARGET_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| root.join("target"))
-            .join("debug");
-        (target.join(exe_name("murmur-server")), target.join(exe_name("murmur-admin")))
+        let target = root.join("bin");
+        std::fs::create_dir_all(&target).expect("create Go binary directory");
+        for name in ["murmur-server", "murmur-admin"] {
+            let status=Command::new("go").arg("build").arg("-o").arg(target.join(exe_name(name))).arg(format!("./cmd/{name}"))
+                .current_dir(&root).status().expect("run go build");
+            assert!(status.success(), "Go server build failed");
+        }
+        (target.join(exe_name("murmur-server")),target.join(exe_name("murmur-admin")))
     })
 }
 

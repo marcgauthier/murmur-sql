@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -64,13 +65,13 @@ func TestAuthFailure(t *testing.T) {
 	server := servertest.Start(t, dir, servertest.Options{})
 	cfg := testConfig(server)
 	cfg.Password = "wrong"
-	if _, err := murmur.Open(context.Background(), cfg); err == nil {
-		t.Fatal("expected auth failure")
+	if _, err := murmur.Open(context.Background(), cfg); codeOf(err) != "28P01" {
+		t.Fatalf("expected authentication SQLSTATE, got %v", err)
 	}
 	cfg = testConfig(server)
 	cfg.User = "nobody"
-	if _, err := murmur.Open(context.Background(), cfg); err == nil {
-		t.Fatal("expected unknown-user failure")
+	if _, err := murmur.Open(context.Background(), cfg); codeOf(err) != "28P01" {
+		t.Fatalf("expected unknown-user SQLSTATE, got %v", err)
 	}
 }
 
@@ -731,5 +732,37 @@ func TestDiagnosticStatusUsesOrdinarySQL(t *testing.T) {
 		if _, present := snapshot[field]; !present {
 			t.Fatalf("missing diagnostic field %s", field)
 		}
+	}
+}
+
+func TestIndependentErrorsAcrossPoolOperations(t *testing.T) {
+	server := servertest.Start(t, t.TempDir(), servertest.Options{})
+	db := open(t, testConfig(server))
+	ctx := context.Background()
+	if _, err := db.ExecContext(ctx, "CREATE TABLE independent_errors(id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	stmt, err := db.PrepareContext(ctx, "INSERT INTO independent_errors VALUES ($1)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stmt.Close()
+	if _, err := stmt.ExecContext(ctx, 1); err != nil {
+		t.Fatal(err)
+	}
+	_, err = stmt.ExecContext(ctx, 1)
+	var failure *murmur.Error
+	if !errors.As(fmt.Errorf("application: %w", err), &failure) || failure.Code != "23505" || failure.SQLState() != "23505" || failure.Message == "" {
+		t.Fatalf("prepared error: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT * FROM missing_independent_table").Scan(new(int)); codeOf(err) != "42P01" {
+		t.Fatalf("query row error: %v", err)
+	}
+	if _, err := db.PrepareContext(ctx, "SELEC broken"); codeOf(err) != "42601" {
+		t.Fatalf("prepare error: %v", err)
+	}
+	var count int
+	if err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM independent_errors").Scan(&count); err != nil || count != 1 {
+		t.Fatalf("pool unusable after rejection: %d %v", count, err)
 	}
 }

@@ -35,9 +35,9 @@ func TestReplicationCommandsNeedEnabledReplication(t *testing.T) {
 	}
 }
 
-func meshDBs(t *testing.T, dirs []string, replicationTOML string) ([]*servertest.Server, []*sql.DB, []servertest.Options) {
+func meshDBs(t *testing.T, dirs []string, replicationExtra string) ([]*servertest.Server, []*sql.DB, []servertest.Options) {
 	t.Helper()
-	opts := servertest.MeshOptions(t, dirs, replicationTOML)
+	opts := servertest.MeshOptions(t, dirs, replicationExtra)
 	servers := make([]*servertest.Server, len(dirs))
 	dbs := make([]*sql.DB, len(dirs))
 	for i, dir := range dirs {
@@ -148,8 +148,11 @@ func TestPeerMeshShowAndRetention(t *testing.T) {
 func TestPolicyOperations(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	policies := "merge_policies = { \"stats.count\" = \"counter\", \"stats.tags\" = \"set\", " +
-		"\"stats.highest\" = \"max\", \"stats.lowest\" = \"min\" }\n"
+	policies := "  merge_policies:\n" +
+		"    \"stats.count\": \"counter\"\n" +
+		"    \"stats.tags\": \"set\"\n" +
+		"    \"stats.highest\": \"max\"\n" +
+		"    \"stats.lowest\": \"min\"\n"
 	_, dbs, _ := meshDBs(t, []string{dir}, policies)
 	db := dbs[0]
 	if _, err := db.ExecContext(ctx, `CREATE TABLE stats(key TEXT NOT NULL PRIMARY KEY,
@@ -196,16 +199,16 @@ func TestPolicyOperations(t *testing.T) {
 }
 
 // bridgeOptions provisions one replication node plus a [replication.bridge]
-// section. role is "high-receiver" or "low-exporter"; keyTOML carries the
+// section. role is "high-receiver" or "low-exporter"; keyYAML carries the
 // role's key lines. No bundles are exchanged, so trust values are arbitrary
 // distinct test constants; domain must equal the node's own database id.
-func bridgeOptions(t *testing.T, dir, role, keyTOML string) servertest.Options {
+func bridgeOptions(t *testing.T, dir, role, keyYAML string) servertest.Options {
 	t.Helper()
 	opts := servertest.MeshOptions(t, []string{dir}, "")
 	o := opts[0]
-	o.ExtraTOML += fmt.Sprintf("[replication.bridge]\nrole = %q\ndomain = %q\n"+
-		"trusted_domains = [%q]\ndirectory = %q\nstream = \"test-stream\"\n%s",
-		role, o.DatabaseID, strings.Repeat("11", 16), filepath.Join(dir, "staging"), keyTOML)
+	o.ExtraYAML += fmt.Sprintf("  bridge:\n    role: %q\n    domain: %q\n"+
+		"    trusted_domains:\n      - %q\n    directory: %q\n    stream: \"test-stream\"\n%s",
+		role, o.DatabaseID, strings.Repeat("11", 16), filepath.Join(dir, "staging"), keyYAML)
 	return o
 }
 
@@ -213,7 +216,7 @@ func TestBridgeRelease(t *testing.T) {
 	ctx := context.Background()
 	highDir := t.TempDir()
 	highOpts := bridgeOptions(t, highDir, "high-receiver",
-		fmt.Sprintf("recipient = %q\nreceiver_secret_hex = %q\n",
+		fmt.Sprintf("    recipient: %q\n    receiver_secret_hex: %q\n",
 			strings.Repeat("ee", 32), strings.Repeat("dd", 32)))
 	high := open(t, testConfig(servertest.Start(t, highDir, highOpts)))
 	if _, err := high.ExecContext(ctx, `CREATE TABLE notes(name TEXT NOT NULL PRIMARY KEY,
@@ -259,7 +262,7 @@ func TestBridgeRelease(t *testing.T) {
 	// A Low exporter rejects even a well-formed address with 22023.
 	lowDir := t.TempDir()
 	lowOpts := bridgeOptions(t, lowDir, "low-exporter",
-		fmt.Sprintf("recipient = %q\nsigner_hex = %q\n",
+		fmt.Sprintf("    recipient: %q\n    signer_hex: %q\n",
 			strings.Repeat("ee", 32), strings.Repeat("bb", 32)))
 	low := open(t, testConfig(servertest.Start(t, lowDir, lowOpts)))
 	if _, err := low.ExecContext(ctx, "CREATE TABLE notes(name TEXT NOT NULL PRIMARY KEY, title TEXT NOT NULL)"); err != nil {

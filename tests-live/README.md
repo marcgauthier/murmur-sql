@@ -1,3 +1,5 @@
+> Go-port status: launchers build the native Go server. The latest engine integration is untested. `MURMUR_ENGINE_INTEGRATION=1` opts into live scenarios; no live tests have been run for this integration. See [verification status](../docs/TESTING.md).
+
 # MURMUR Rust live multi-process tests (`tests-live/`)
 
 Port of the Go live suites in `/media/marc/2TB/Archives/MURMUR/tests-live/`

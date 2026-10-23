@@ -27,7 +27,7 @@ fn exe(name: &str) -> String {
     }
 }
 
-/// `(server, admin)` binaries: `MURMUR_SERVER_BIN` or a cargo build once per process.
+/// `(server, admin)` binaries: `MURMUR_SERVER_BIN` or a Go build once per process.
 fn binaries() -> &'static (PathBuf, PathBuf) {
     static BINS: OnceLock<(PathBuf, PathBuf)> = OnceLock::new();
     BINS.get_or_init(|| {
@@ -37,25 +37,14 @@ fn binaries() -> &'static (PathBuf, PathBuf) {
             return (server, admin);
         }
         let root = root();
-        let status = Command::new("cargo")
-            .args([
-                "build",
-                "--features",
-                "replication",
-                "--bin",
-                "murmur-server",
-                "--bin",
-                "murmur-admin",
-            ])
-            .current_dir(&root)
-            .status()
-            .expect("run cargo");
-        assert!(status.success(), "cargo build of murmur-server failed");
-        let target = root.join("target").join("debug");
-        (
-            target.join(exe("murmur-server")),
-            target.join(exe("murmur-admin")),
-        )
+        let target = root.join("bin");
+        std::fs::create_dir_all(&target).expect("create Go binary directory");
+        for name in ["murmur-server", "murmur-admin"] {
+            let status=Command::new("go").arg("build").arg("-o").arg(target.join(exe(name))).arg(format!("./cmd/{name}"))
+                .current_dir(&root).status().expect("run go build");
+            assert!(status.success(), "Go server build failed");
+        }
+        (target.join(exe("murmur-server")),target.join(exe("murmur-admin")))
     })
 }
 
@@ -81,11 +70,12 @@ fn free_port() -> u16 {
         .port()
 }
 
-fn toml_path(p: &Path) -> String {
+/// Forward-slash path for YAML double-quoted config strings.
+pub fn yaml_path(p: &Path) -> String {
     p.to_string_lossy().replace('\\', "/")
 }
 
-/// TLS files for `[server.tls]`.
+/// TLS files for the `server.tls` section.
 pub struct TlsFiles {
     pub cert: PathBuf,
     pub key: PathBuf,
@@ -97,7 +87,7 @@ pub struct Options {
     pub node_id: String,
     pub database_id: String,
     pub tls: Option<TlsFiles>,
-    pub extra_toml: String,
+    pub extra_yaml: String,
 }
 
 /// Scratch directory plus a running server, both removed on drop.
@@ -124,38 +114,38 @@ impl Scratch {
 pub fn start(dir: tempfile::TempDir, opts: Options) -> Scratch {
     let port = free_port();
     let d = dir.path();
-    let mut cfg = format!("[server]\nbind = \"127.0.0.1:{port}\"\nproduction = false\n\n");
+    let mut cfg = format!("server:\n  bind: \"127.0.0.1:{port}\"\n  production: false\n");
     if let Some(tls) = &opts.tls {
         writeln!(
             cfg,
-            "[server.tls]\nenabled = true\ncert_file = \"{}\"\nkey_file = \"{}\"\n",
-            toml_path(&tls.cert),
-            toml_path(&tls.key)
+            "  tls:\n    enabled: true\n    cert_file: \"{}\"\n    key_file: \"{}\"\n",
+            yaml_path(&tls.cert),
+            yaml_path(&tls.key)
         )
         .unwrap();
     }
     let node = if opts.node_id.is_empty() {
         String::new()
     } else {
-        format!("node_id = \"{}\"\n", opts.node_id)
+        format!("  node_id: \"{}\"\n", opts.node_id)
     };
     let dbid = if opts.database_id.is_empty() {
         String::new()
     } else {
-        format!("database_id = \"{}\"\n", opts.database_id)
+        format!("  database_id: \"{}\"\n", opts.database_id)
     };
     write!(
         cfg,
-        "[storage]\ndata_dir = \"{}\"\n{node}{dbid}\n[[auth.users]]\nname = \"admin\"\npassword_hash = \"{}\"\n\n\
-         [logging]\ndir = \"{}\"\n\n[backups]\ndir = \"{}\"\n\n{}",
-        toml_path(&d.join("data")),
+        "storage:\n  data_dir: \"{}\"\n{node}{dbid}\nauth:\n  users:\n    - name: \"admin\"\n      password_hash: \"{}\"\n\n\
+         logging:\n  dir: \"{}\"\n\nbackups:\n  dir: \"{}\"\n\n{}",
+        yaml_path(&d.join("data")),
         password_hash(),
-        toml_path(&d.join("logs")),
-        toml_path(&d.join("backups")),
-        opts.extra_toml
+        yaml_path(&d.join("logs")),
+        yaml_path(&d.join("backups")),
+        opts.extra_yaml
     )
     .unwrap();
-    let config = d.join("config.toml");
+    let config = d.join("config.yaml");
     std::fs::write(&config, cfg).unwrap();
     let mut child = Command::new(&binaries().0)
         .arg("--config")
@@ -238,22 +228,22 @@ pub fn file_options(dir: &Path) -> Options {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect();
-    let extra_toml = format!(
-        "[replication]\nenabled = true\nbind = \"127.0.0.1:0\"\ncert_chain_file = \"{}\"\nprivate_key_file = \"{}\"\n\
-         ca_file = \"{}\"\nsigning_key_hex = \"{}\"\ntrusted_origins = {{ \"{node}\" = \"{public}\" }}\n\
-         [replication.files]\ndirectory = \"{}\"\nkey_hex = \"{}\"\n",
-        toml_path(&dir.join("file-node.pem")),
-        toml_path(&dir.join("file-key.pem")),
-        toml_path(&dir.join("file-ca.pem")),
+    let extra_yaml = format!(
+        "replication:\n  enabled: true\n  bind: \"127.0.0.1:0\"\n  cert_chain_file: \"{}\"\n  private_key_file: \"{}\"\n  \
+         ca_file: \"{}\"\n  signing_key_hex: \"{}\"\n  trusted_origins:\n    \"{node}\": \"{public}\"\n  \
+         files:\n    directory: \"{}\"\n    key_hex: \"{}\"\n",
+        yaml_path(&dir.join("file-node.pem")),
+        yaml_path(&dir.join("file-key.pem")),
+        yaml_path(&dir.join("file-ca.pem")),
         "03".repeat(32),
-        toml_path(&dir.join("objects")),
+        yaml_path(&dir.join("objects")),
         "07".repeat(32),
     );
     Options {
         node_id: node,
         database_id: String::new(),
         tls: None,
-        extra_toml,
+        extra_yaml,
     }
 }
 
@@ -286,10 +276,10 @@ fn fresh_hex(bytes: usize) -> String {
 
 /// Provision `dirs` as one replication mesh: a shared database id, distinct
 /// node ids, one CA, and mutual `trusted_origins`. Returns one [`Options`]
-/// per directory, in order. `replication_toml` is appended inside each
-/// node's `[replication]` section (for example `merge_policies = {...}`).
+/// per directory, in order. `replication_extra` is appended inside each
+/// node's `replication` section (for example a `merge_policies` map).
 /// Nodes start unmeshed; dial them together with the client's `peer_add`.
-pub fn replication_mesh_options(dirs: &[&Path], replication_toml: &str) -> Vec<Options> {
+pub fn replication_mesh_options(dirs: &[&Path], replication_extra: &str) -> Vec<Options> {
     let database_id = fresh_hex(16);
     let mut nodes = Vec::with_capacity(dirs.len());
     while nodes.len() < dirs.len() {
@@ -321,9 +311,9 @@ pub fn replication_mesh_options(dirs: &[&Path], replication_toml: &str) -> Vec<O
     let origins = nodes
         .iter()
         .zip(pubs.iter())
-        .map(|(node, key)| format!("\"{node}\" = \"{key}\""))
+        .map(|(node, key)| format!("    \"{node}\": \"{key}\""))
         .collect::<Vec<_>>()
-        .join(", ");
+        .join("\n");
     dirs.iter()
         .zip(nodes.iter())
         .zip(seeds.iter())
@@ -340,22 +330,27 @@ pub fn replication_mesh_options(dirs: &[&Path], replication_toml: &str) -> Vec<O
             std::fs::write(dir.join("repl-ca.pem"), ca.pem()).unwrap();
             std::fs::write(dir.join("repl-node.pem"), leaf.pem()).unwrap();
             std::fs::write(dir.join("repl-key.pem"), leaf_key.serialize_pem()).unwrap();
-            let extra_toml = format!(
-                "[replication]\nenabled = true\nbind = \"127.0.0.1:0\"\ncert_chain_file = \"{}\"\nprivate_key_file = \"{}\"\n\
-                 ca_file = \"{}\"\nsigning_key_hex = \"{seed}\"\ntrusted_origins = {{ {origins} }}\n{replication_toml}\n",
-                toml_path(&dir.join("repl-node.pem")),
-                toml_path(&dir.join("repl-key.pem")),
-                toml_path(&dir.join("repl-ca.pem")),
+            let extra = if replication_extra.is_empty() {
+                String::new()
+            } else {
+                format!("\n{}\n", replication_extra.trim_end())
+            };
+            let extra_yaml = format!(
+                "replication:\n  enabled: true\n  bind: \"127.0.0.1:0\"\n  cert_chain_file: \"{}\"\n  private_key_file: \"{}\"\n  \
+                 ca_file: \"{}\"\n  signing_key_hex: \"{seed}\"\n  trusted_origins:\n{origins}{extra}\n",
+                yaml_path(&dir.join("repl-node.pem")),
+                yaml_path(&dir.join("repl-key.pem")),
+                yaml_path(&dir.join("repl-ca.pem")),
             );
-            Options { node_id: node.clone(), database_id: database_id.clone(), tls: None, extra_toml }
+            Options { node_id: node.clone(), database_id: database_id.clone(), tls: None, extra_yaml }
         })
         .collect()
 }
 
 /// A single replication-enabled node (one-node mesh). See
 /// [`replication_mesh_options`].
-pub fn replication_options(dir: &Path, replication_toml: &str) -> Options {
-    replication_mesh_options(&[dir], replication_toml)
+pub fn replication_options(dir: &Path, replication_extra: &str) -> Options {
+    replication_mesh_options(&[dir], replication_extra)
         .pop()
         .unwrap()
 }

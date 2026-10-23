@@ -59,5 +59,10 @@
   ],
   "Key rotation": [
     "keys"
+  ],
+  "Server error handling": [
+    "keys",
+    "replication",
+    "bridge"
   ]
 }

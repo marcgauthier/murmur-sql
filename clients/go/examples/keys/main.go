@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/jackc/pgx/v5/pgconn"
 	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 	"github.com/marcgauthier/murmur-sql/clients/go/examples/internal/run"
 	"github.com/marcgauthier/murmur-sql/clients/go/internal/servertest"
@@ -38,8 +37,8 @@ func main() {
 			stale.Close()
 			t.Fatalf("old key still works")
 		}
-		var pgErr *pgconn.PgError
-		if !errors.As(err, &pgErr) || pgErr.Code != "28000" {
+		var serverErr *murmur.Error
+		if !errors.As(err, &serverErr) || serverErr.Code != "28000" {
 			t.Fatalf("old key: %v", err)
 		}
 		cfg.Key = "new-key"

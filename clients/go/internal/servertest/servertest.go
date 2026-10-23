@@ -32,7 +32,7 @@ type TB interface {
 	Cleanup(func())
 }
 
-// RepoRoot locates the workspace root (the directory holding Cargo.toml).
+// RepoRoot locates the workspace root (the directory holding go.mod).
 func RepoRoot(t TB) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -44,7 +44,7 @@ func RepoRoot(t TB) string {
 	if err != nil {
 		t.Fatalf("%v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "Cargo.toml")); err != nil {
+	if _, err := os.Stat(filepath.Join(root, "go.mod")); err != nil {
 		t.Fatalf("repository root not found at %s", root)
 	}
 	return root
@@ -65,17 +65,28 @@ func Build(t TB) (serverBin, adminBin string) {
 	}
 	buildOnce.Do(func() {
 		root := RepoRoot(t)
-		cmd := exec.Command("cargo", "build", "--features", "replication", "--bin", "murmur-server", "--bin", "murmur-admin")
-		cmd.Dir = root
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("cargo build server bins failed: %v\n%s", err, out)
+		for _, name := range []string{"murmur-server", "murmur-admin"} {
+			suffix := ""
+			if runtime.GOOS == "windows" {
+				suffix = ".exe"
+			}
+			target := filepath.Join(root, "bin", name+suffix)
+			if err := os.MkdirAll(filepath.Dir(target), 0755); err != nil {
+				t.Fatalf("%v", err)
+			}
+			cmd := exec.Command("go", "build", "-o", target, "./cmd/"+name)
+			cmd.Dir = root
+			if out, err := cmd.CombinedOutput(); err != nil {
+				t.Fatalf("go build %s failed: %v\n%s", name, err, out)
+			}
 		}
+
 	})
 	suffix := ""
 	if runtime.GOOS == "windows" {
 		suffix = ".exe"
 	}
-	target := filepath.Join(RepoRoot(t), "target", "debug")
+	target := filepath.Join(RepoRoot(t), "bin")
 	return filepath.Join(target, "murmur-server"+suffix), filepath.Join(target, "murmur-admin"+suffix)
 }
 
@@ -120,7 +131,9 @@ type Options struct {
 	Production bool
 	// TLSFiles, when set, enables [server.tls] with these PEM paths.
 	TLSFiles *TLSFiles
-	// ExtraTOML is appended to the generated config.
+	// ExtraYAML is appended to the generated config.
+	ExtraYAML string
+	// ExtraTOML alias for backwards compatibility.
 	ExtraTOML string
 }
 
@@ -141,19 +154,20 @@ type Server struct {
 // server is killed during test cleanup; call Stop for an early shutdown
 // (e.g. restart tests).
 func Start(t TB, dir string, opts Options) *Server {
+
 	t.Helper()
 	serverBin, _ := Build(t)
 	if opts.Port == 0 {
 		opts.Port = FreePort(t)
 	}
-	configPath := filepath.Join(dir, "config.toml")
+	configPath := filepath.Join(dir, "config.yaml")
 	var tlsSection string
 	if opts.TLSFiles != nil {
 		caLine := ""
 		if opts.TLSFiles.CA != "" {
-			caLine = fmt.Sprintf("ca_file = %q\n", opts.TLSFiles.CA)
+			caLine = fmt.Sprintf("    ca_file: %q\n", opts.TLSFiles.CA)
 		}
-		tlsSection = fmt.Sprintf("[server.tls]\nenabled = true\ncert_file = %q\nkey_file = %q\n%s",
+		tlsSection = fmt.Sprintf("  tls:\n    enabled: true\n    cert_file: %q\n    key_file: %q\n%s",
 			opts.TLSFiles.Cert, opts.TLSFiles.Key, caLine)
 	}
 	production := "false"
@@ -163,8 +177,8 @@ func Start(t TB, dir string, opts Options) *Server {
 	if existing, err := os.ReadFile(configPath); err == nil && len(existing) > 0 {
 		lines := strings.Split(string(existing), "\n")
 		for i, line := range lines {
-			if strings.HasPrefix(strings.TrimSpace(line), "bind = ") {
-				lines[i] = fmt.Sprintf("bind = \"127.0.0.1:%d\"", opts.Port)
+			if strings.HasPrefix(strings.TrimSpace(line), "bind:") || strings.HasPrefix(strings.TrimSpace(line), "bind :") {
+				lines[i] = fmt.Sprintf("  bind: \"127.0.0.1:%d\"", opts.Port)
 				break
 			}
 		}
@@ -172,30 +186,18 @@ func Start(t TB, dir string, opts Options) *Server {
 			t.Fatalf("%v", err)
 		}
 	} else {
-		config := fmt.Sprintf("[server]\nbind = \"127.0.0.1:%d\"\nproduction = %s\n\n%s\n"+
-			"[storage]\ndata_dir = %q\n%s%s\n"+
-			"[[auth.users]]\nname = \"admin\"\npassword_hash = %q\n\n"+
-			"[logging]\ndir = %q\n\n"+
-			"[backups]\ndir = %q\n\n%s",
+		extra := opts.ExtraYAML
+		if extra == "" {
+			extra = opts.ExtraTOML
+		}
+		config := fmt.Sprintf("server:\n  bind: \"127.0.0.1:%d\"\n  production: %s\n%s\n"+
+			"storage:\n  data_dir: %q\n%s%s\n"+
+			"auth:\n  users:\n    - name: \"admin\"\n      password_hash: %q\n\n"+
+			"logging:\n  dir: %q\n\n"+
+			"backups:\n  dir: %q\n\n%s",
 			opts.Port, production, tlsSection,
 			filepath.Join(dir, "data"), nodeIDLine(opts.NodeID), databaseIDLine(opts.DatabaseID), PasswordHash(t, "test-password"),
-			filepath.Join(dir, "logs"), filepath.Join(dir, "backups"), opts.ExtraTOML)
-		// Keep authoritative table settings when restarting the same scratch store.
-		if previous, err := os.ReadFile(configPath); err == nil && !strings.Contains(opts.ExtraTOML, "[replication.tables]") {
-			active := false
-			for _, line := range strings.Split(string(previous), "\n") {
-				trimmed := strings.TrimSpace(line)
-				if strings.HasPrefix(trimmed, "[") {
-					if active {
-						break
-					}
-					active = trimmed == "[replication.tables]"
-				}
-				if active {
-					config += line + "\n"
-				}
-			}
-		}
+			filepath.Join(dir, "logs"), filepath.Join(dir, "backups"), extra)
 		if err := os.WriteFile(configPath, []byte(config), 0o644); err != nil {
 			t.Fatalf("%v", err)
 		}
@@ -342,14 +344,14 @@ func nodeIDLine(node string) string {
 	if node == "" {
 		return ""
 	}
-	return fmt.Sprintf("node_id = %q\n", node)
+	return fmt.Sprintf("  node_id: %q\n", node)
 }
 
 func databaseIDLine(db string) string {
 	if db == "" {
 		return ""
 	}
-	return fmt.Sprintf("database_id = %q\n", db)
+	return fmt.Sprintf("  database_id: %q\n", db)
 }
 
 // nodeCredential is one leaf certificate plus its private key (PEM).
@@ -408,7 +410,13 @@ func FileOptions(t TB, dir string) Options {
 			t.Fatalf("%v", err)
 		}
 	}
-	return Options{NodeID: node, ExtraTOML: fmt.Sprintf("[replication]\nenabled = true\nbind = \"127.0.0.1:0\"\ncert_chain_file = %q\nprivate_key_file = %q\nca_file = %q\nsigning_key_hex = %q\ntrusted_origins = { %q = %q }\n[replication.files]\ndirectory = %q\nkey_hex = %q\n", filepath.Join(dir, "file-node.pem"), filepath.Join(dir, "file-key.pem"), filepath.Join(dir, "file-ca.pem"), strings.Repeat("03", 32), node, fmt.Sprintf("%x", ed25519.NewKeyFromSeed([]byte(strings.Repeat("\x03", 32))).Public()), filepath.Join(dir, "objects"), strings.Repeat("07", 32))}
+	return Options{
+		NodeID: node,
+		ExtraYAML: fmt.Sprintf("replication:\n  enabled: true\n  bind: \"127.0.0.1:0\"\n  cert_chain_file: %q\n  private_key_file: %q\n  ca_file: %q\n  signing_key_hex: %q\n  trusted_origins:\n    %q: %q\n  files:\n    directory: %q\n    key_hex: %q\n",
+			filepath.Join(dir, "file-node.pem"), filepath.Join(dir, "file-key.pem"), filepath.Join(dir, "file-ca.pem"),
+			strings.Repeat("03", 32), node, fmt.Sprintf("%x", ed25519.NewKeyFromSeed([]byte(strings.Repeat("\x03", 32))).Public()),
+			filepath.Join(dir, "objects"), strings.Repeat("07", 32)),
+	}
 }
 
 func hexID(t TB, n int) string {
@@ -422,10 +430,10 @@ func hexID(t TB, n int) string {
 
 // MeshOptions provisions len(dirs) replication nodes sharing one database id
 // and CA, with mutual trusted_origins. It returns one Options per dir, in
-// order. replicationTOML is appended inside each node's [replication]
+// order. replicationExtra is appended inside each node's replication
 // section (for example merge_policies). Nodes start unmeshed; dial them
 // together with PeerAdd.
-func MeshOptions(t TB, dirs []string, replicationTOML string) []Options {
+func MeshOptions(t TB, dirs []string, replicationExtra string) []Options {
 	t.Helper()
 	if len(dirs) == 0 {
 		t.Fatalf("MeshOptions needs at least one directory")
@@ -460,7 +468,7 @@ func MeshOptions(t TB, dirs []string, replicationTOML string) []Options {
 	caPEM, creds := issueNodeCredentials(t, "mesh", nodes)
 	var origins []string
 	for i := range nodes {
-		origins = append(origins, fmt.Sprintf("%q = %q", nodes[i], pubs[i]))
+		origins = append(origins, fmt.Sprintf("    %q: %q", nodes[i], pubs[i]))
 	}
 	opts := make([]Options, len(dirs))
 	for i, dir := range dirs {
@@ -469,12 +477,16 @@ func MeshOptions(t TB, dirs []string, replicationTOML string) []Options {
 				t.Fatalf("%v", err)
 			}
 		}
+		extra := ""
+		if replicationExtra != "" {
+			extra = "\n" + strings.TrimRight(replicationExtra, "\n") + "\n"
+		}
 		opts[i] = Options{
 			NodeID:     nodes[i],
 			DatabaseID: dbid,
-			ExtraTOML: fmt.Sprintf("[replication]\nenabled = true\nbind = \"127.0.0.1:0\"\ncert_chain_file = %q\nprivate_key_file = %q\nca_file = %q\nsigning_key_hex = %q\ntrusted_origins = { %s }\n%s\n",
+			ExtraYAML: fmt.Sprintf("replication:\n  enabled: true\n  bind: \"127.0.0.1:0\"\n  cert_chain_file: %q\n  private_key_file: %q\n  ca_file: %q\n  signing_key_hex: %q\n  trusted_origins:\n%s%s\n",
 				filepath.Join(dir, "repl-node.pem"), filepath.Join(dir, "repl-key.pem"), filepath.Join(dir, "repl-ca.pem"),
-				seeds[i], strings.Join(origins, ", "), replicationTOML),
+				seeds[i], strings.Join(origins, "\n"), extra),
 		}
 	}
 	return opts

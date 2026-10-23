@@ -5,8 +5,7 @@ use murmur_client::Client;
 #[tokio::main]
 async fn main() {
     let dir = tempfile::tempdir().unwrap();
-    let policies = "merge_policies = { \"stats.count\" = \"counter\", \"stats.tags\" = \"set\", \
-        \"stats.highest\" = \"max\", \"stats.lowest\" = \"min\" }\n";
+    let policies = "  merge_policies:\n    \"stats.count\": \"counter\"\n    \"stats.tags\": \"set\"\n    \"stats.highest\": \"max\"\n    \"stats.lowest\": \"min\"\n";
     let opts = support::replication_options(dir.path(), policies);
     let server = support::start(dir, opts);
     let db = Client::connect(&support::config(&server, "policy-key"))

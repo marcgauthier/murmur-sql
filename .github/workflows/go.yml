@@ -1,0 +1,25 @@
+name: Go SQL server
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache-dependency-path: |
+            go.sum
+            clients/go/go.sum
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -timeout 30m ./...
+      - run: go vet ./...
+        working-directory: clients/go
+      - run: go test -race ./...
+        working-directory: clients/go

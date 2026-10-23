@@ -5,13 +5,13 @@ import (
 	"database/sql"
 	"errors"
 
-	"github.com/jackc/pgx/v5/pgconn"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 )
 
 func codeOf(err error) string {
-	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) {
-		return pgErr.Code
+	var serverErr *murmur.Error
+	if errors.As(err, &serverErr) {
+		return serverErr.Code
 	}
 	return ""
 }
