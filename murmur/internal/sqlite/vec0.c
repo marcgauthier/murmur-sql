@@ -12,6 +12,7 @@
 #include "../../third_party/sqlite/sqlite3.h"
 
 #include <ctype.h>
+#include <stdint.h>
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>

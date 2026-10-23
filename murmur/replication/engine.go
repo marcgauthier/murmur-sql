@@ -535,6 +535,16 @@ func (c *engineCore) sessionsAvailable() int {
 	return cap(c.sessions) - len(c.sessions)
 }
 
+// acceptAllowed reports whether an incoming connection may proceed to
+// the session handshake: parseable remote address, allowed network,
+// room under the connection cap, and session headroom past the
+// fanout-plus-repairs reserve (gossip and repair must never starve
+// behind a flood of half-open sessions).
+func acceptAllowed(config *Config, remote netip.AddrPort, addrOK bool, peers, sessionsAvail int) bool {
+	return addrOK && NetworkAllowed(config, remote) &&
+		peers < config.Connections && sessionsAvail > config.Fanout+config.Repairs
+}
+
 func (c *engineCore) trySession() bool {
 	select {
 	case c.sessions <- struct{}{}:
@@ -607,7 +617,7 @@ loop:
 			c.peersMu.Lock()
 			peerCount := len(c.peers)
 			c.peersMu.Unlock()
-			if err != nil || !NetworkAllowed(c.config, remote) || peerCount >= c.config.Connections || c.sessionsAvailable() <= c.config.Fanout+c.config.Repairs {
+			if !acceptAllowed(c.config, remote, err == nil, peerCount, c.sessionsAvailable()) {
 				refuse(conn)
 				continue
 			}
