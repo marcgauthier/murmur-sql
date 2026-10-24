@@ -23,3 +23,88 @@ jobs:
         working-directory: clients/go
       - run: go test -race ./...
         working-directory: clients/go
+  benchmark:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24.x'
+          cache: true
+      - name: Benchmark actual Spool end-to-end Put + durable Flush
+        run: |
+          cat > /tmp/spool-capacity.go <<'BENCHGO'
+          package main
+          import (
+            "crypto/rand"
+            "encoding/binary"
+            "fmt"
+            "os"
+            "path/filepath"
+            "runtime"
+            "sync"
+            "time"
+            "github.com/marcgauthier/murmur-sql/murmur/spool"
+          )
+          type testCase struct { label string; size, writers, count int; zeros, plain, noCompression bool }
+          func main(){
+            fmt.Printf("Machine: GOOS=%s GOARCH=%s CPUs=%d Go=%s\n", runtime.GOOS,runtime.GOARCH,runtime.NumCPU(),runtime.Version())
+            cases:=[]testCase{}
+            for _,writers:=range []int{1,16} {
+              cases=append(cases,
+                testCase{"AES + deflate, random, 128B",128,writers,100000,false,false,false},
+                testCase{"AES + deflate, random, 1KB",1024,writers,100000,false,false,false},
+                testCase{"AES + deflate, zeros, 1KB",1024,writers,100000,true,false,false},
+                testCase{"AES + no compression, random, 1KB",1024,writers,100000,false,false,true},
+                testCase{"plaintext + deflate, random, 1KB",1024,writers,100000,false,true,false},
+              )
+            }
+            fmt.Printf("Mode | Writers | Size | Records/s | Raw MiB/s | Disk MiB | Raw/Disk | Elapsed\n")
+            for _,tc:=range cases {
+              if err:=run(tc);err!=nil{ fmt.Fprintf(os.Stderr,"FAIL %s: %v\n",tc.label,err);os.Exit(1) }
+            }
+          }
+          func run(tc testCase) error {
+            dir,err:=os.MkdirTemp("","spool-capacity-*");if err!=nil{return err};defer os.RemoveAll(dir)
+            o:=spool.DefaultOptions(dir)
+            if tc.plain { o.Encryption=spool.EncryptionNone; o.MasterKey=nil }else{o.MasterKey=[]byte("0123456789abcdef0123456789abcdef")}
+            if tc.noCompression{o.Compression=spool.CompressionNone; o.CompressionSet=true}
+            o.ReclaimInterval=-1
+            st,err:=spool.Open(o);if err!=nil{return err}
+            vals:=make([][]byte,4096)
+            for i:=range vals {vals[i]=make([]byte,tc.size);if !tc.zeros {if _,err:=rand.Read(vals[i]);err!=nil{return err}}}
+            var wg sync.WaitGroup
+            errCh:=make(chan error,tc.writers)
+            start:=time.Now()
+            for w:=0;w<tc.writers;w++{
+              wg.Add(1)
+              go func(w int){
+                defer wg.Done()
+                lo:=tc.count*w/tc.writers;hi:=tc.count*(w+1)/tc.writers
+                var key [8]byte
+                for i:=lo;i<hi;i++{
+                  binary.LittleEndian.PutUint64(key[:],uint64(i+1))
+                  if err:=st.Put(key[:],vals[i%len(vals)]);err!=nil{errCh<-err;return}
+                }
+              }(w)
+            }
+            wg.Wait()
+            close(errCh);for err:=range errCh { _=st.Close();return err }
+            if err:=st.Flush();err!=nil{_ = st.Close();return err}
+            elapsed:=time.Since(start)
+            if err:=st.Close();err!=nil{return err}
+            var disk int64
+            files,err:=os.ReadDir(filepath.Join(dir,"segments"));if err!=nil{return err}
+            for _,f:=range files {if info,err:=f.Info();err==nil {disk+=info.Size()}}
+            raw:=float64(tc.count*tc.size)
+            mib:=1048576.0
+            fmt.Printf("%s | %d | %d | %.0f | %.1f | %.1f | %.2fx | %s\n",tc.label,tc.writers,tc.size,float64(tc.count)/elapsed.Seconds(),raw/mib/elapsed.Seconds(),float64(disk)/mib,raw/float64(disk),elapsed.Round(time.Millisecond))
+            return nil
+          }
+          BENCHGO
+          go run /tmp/spool-capacity.go
+      - name: Existing built-in Spool benchmarks
+        run: |
+          go test -run '^$' -bench '^Benchmark(PutWriters|FlushThroughput)$' -benchtime=100000x -count=1 -timeout=15m ./murmur/spool
+          go test -run '^$' -bench '^BenchmarkGroupSyncWrites$' -benchtime=200x -count=1 -timeout=15m ./murmur/spool
