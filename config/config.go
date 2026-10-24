@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/marcgauthier/murmur-sql/keyprovider"
 	"gopkg.in/yaml.v3"
 )
 
@@ -291,11 +292,22 @@ func (r ReplicationConfig) Validate() error {
 		if !nonempty(pointer(r.CertChainFile)) || !nonempty(pointer(r.PrivateKeyFile)) || !nonempty(pointer(r.CaFile)) {
 			return errors.New("replication requires TLS credential files")
 		}
-		if (r.SigningKeyHex == nil) == (r.SigningKeyFile == nil) {
+		sources := 0
+		for _, s := range []*string{r.SigningKeyHex, r.SigningKeyFile, r.SigningKeyURI} {
+			if s != nil {
+				sources++
+			}
+		}
+		if sources != 1 {
 			return errors.New("set exactly one replication signing key source")
 		}
 		if r.SigningKeyHex != nil {
 			if _, e := ParseHex(*r.SigningKeyHex, 32); e != nil {
+				return e
+			}
+		}
+		if r.SigningKeyURI != nil {
+			if _, _, e := keyprovider.ParseURI(*r.SigningKeyURI); e != nil {
 				return e
 			}
 		}
@@ -304,11 +316,29 @@ func (r ReplicationConfig) Validate() error {
 		if !nonempty(f.Directory) || f.MaxFileBytes == 0 || f.ConcurrentFetches == 0 || f.FetchInterval <= 0 {
 			return errors.New("invalid replication.files limits")
 		}
-		if _, e := ParseHex(f.KeyHex, 32); e != nil {
-			return e
+		if nonempty(f.KeyHex) == (f.KeyURI != nil) {
+			return errors.New("set exactly one replication.files key source")
+		}
+		if nonempty(f.KeyHex) {
+			if _, e := ParseHex(f.KeyHex, 32); e != nil {
+				return e
+			}
+		}
+		if f.KeyURI != nil {
+			if _, _, e := keyprovider.ParseURI(*f.KeyURI); e != nil {
+				return e
+			}
+		}
+		if f.PreviousKeyHex != nil && f.PreviousKeyURI != nil {
+			return errors.New("set at most one replication.files previous key source")
 		}
 		if f.PreviousKeyHex != nil {
 			if _, e := ParseHex(*f.PreviousKeyHex, 32); e != nil {
+				return e
+			}
+		}
+		if f.PreviousKeyURI != nil {
+			if _, _, e := keyprovider.ParseURI(*f.PreviousKeyURI); e != nil {
 				return e
 			}
 		}
@@ -336,9 +366,17 @@ func (r ReplicationConfig) Validate() error {
 				return e
 			}
 		}
-		for _, s := range []*string{b.SignerHex, b.ReceiverSecretHex} {
-			if s != nil {
-				if _, e := ParseHex(*s, 32); e != nil {
+		for _, pair := range [][2]*string{{b.SignerHex, b.SignerURI}, {b.ReceiverSecretHex, b.ReceiverSecretURI}} {
+			if pair[0] != nil && pair[1] != nil {
+				return errors.New("set at most one bridge credential source per key")
+			}
+			if pair[0] != nil {
+				if _, e := ParseHex(*pair[0], 32); e != nil {
+					return e
+				}
+			}
+			if pair[1] != nil {
+				if _, _, e := keyprovider.ParseURI(*pair[1]); e != nil {
 					return e
 				}
 			}
@@ -351,7 +389,7 @@ func (r ReplicationConfig) Validate() error {
 				return errors.New("invalid bridge stream")
 			}
 		}
-		if b.Role == "low-exporter" && b.SignerHex == nil || b.Role == "high-receiver" && (b.ReceiverSecretHex == nil || len(b.TrustedDomains) == 0) {
+		if (b.Role == "low-exporter" && b.SignerHex == nil && b.SignerURI == nil) || (b.Role == "high-receiver" && ((b.ReceiverSecretHex == nil && b.ReceiverSecretURI == nil) || len(b.TrustedDomains) == 0)) {
 			return errors.New("missing bridge credentials or trusted domains")
 		}
 		if b.MaxBundleBytes == 0 || b.MaxBundleBytes > 16<<20 || b.MaxPayloadBytes == 0 || b.MaxPayloadBytes > 64<<20 || b.StagingBytes < b.MaxBundleBytes {

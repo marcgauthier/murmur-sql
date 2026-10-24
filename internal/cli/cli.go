@@ -30,7 +30,7 @@ commands:
   rekey <data-dir> --new-passphrase <value> | --new-key-hex <64-hex>
   hash-password [--password <value>]  (reads stdin when omitted)
 options:
-  --json --passphrase <value> --key-hex <64-hex>
+  --json --passphrase <value> --key-hex <64-hex> --key-provider-uri <uri>
   --new-passphrase <value> --new-key-hex <64-hex>
   --fresh-node-id[=<32-hex>] --fresh-db-id[=<32-hex>]
   -h, --help  -v, --version
@@ -124,7 +124,7 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 	}
 	var positional []string
 	jsonOut := false
-	var passphrase, password, keyHex, newPassphrase, newKeyHex *string
+	var passphrase, password, keyHex, newPassphrase, newKeyHex, keyProviderURI *string
 	request := engine.AdminRequest{}
 	for i := 0; i < len(args); i++ {
 		name, value, equal := strings.Cut(args[i], "=")
@@ -139,7 +139,7 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 			jsonOut = true
 		case "--backup":
 			request.Backup = true
-		case "--password", "--passphrase", "--key-hex", "--new-passphrase", "--new-key-hex":
+		case "--password", "--passphrase", "--key-hex", "--new-passphrase", "--new-key-hex", "--key-provider-uri":
 			v, e := option(args, &i, name)
 			if e != nil {
 				fmt.Fprintln(errOut, e)
@@ -156,6 +156,8 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 				newPassphrase = &v
 			case "--new-key-hex":
 				newKeyHex = &v
+			case "--key-provider-uri":
+				keyProviderURI = &v
 			}
 		case "--fresh-node-id", "--fresh-db-id":
 			var id [16]byte
@@ -236,11 +238,20 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 	if n == 3 {
 		request.Destination = positional[2]
 	}
-	if keyHex != nil && passphrase != nil {
-		fmt.Fprintln(errOut, "set exactly one of --key-hex and --passphrase")
+	sources := 0
+	for _, s := range []*string{keyHex, passphrase, keyProviderURI} {
+		if s != nil {
+			sources++
+		}
+	}
+	if sources > 1 {
+		fmt.Fprintln(errOut, "set at most one of --key-hex, --passphrase, and --key-provider-uri")
 		return 1
 	}
-	if keyHex != nil {
+	if keyProviderURI != nil {
+		request.KeyProviderURI = *keyProviderURI
+		defer func() { request.KeyProviderURI = "" }()
+	} else if keyHex != nil {
 		b, e := hex.DecodeString(strings.TrimSpace(*keyHex))
 		if e != nil || len(b) != 32 {
 			fmt.Fprintln(errOut, "key-hex must be exactly 32 bytes (64 hex characters)")

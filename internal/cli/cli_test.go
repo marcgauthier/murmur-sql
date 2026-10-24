@@ -77,6 +77,14 @@ func TestAdminCredentialFlags(t *testing.T) {
 	if code, _, errs := admin("status", "/unused", "--key-hex", raw, "--passphrase", "x"); code != 1 {
 		t.Fatal("dual credential accepted", code, errs)
 	}
+	if code, c, errs := admin("status", "/unused", "--key-provider-uri", "env:MURMUR_KEY"); code != 0 {
+		t.Fatal(code, errs)
+	} else if c.got.KeyProviderURI != "env:MURMUR_KEY" || c.got.Passphrase != "" || c.got.Key != [32]byte{} {
+		t.Fatalf("provider uri routed to %+v", c.got)
+	}
+	if code, _, errs := admin("status", "/unused", "--key-provider-uri", "env:X", "--passphrase", "x"); code != 1 {
+		t.Fatal("provider plus passphrase accepted", code, errs)
+	}
 	if code, c, errs := admin("rekey", "/unused", "--passphrase", "x", "--new-passphrase", "y"); code != 0 {
 		t.Fatal(code, errs)
 	} else if c.got.NewPassphrase != "y" || c.got.NewKey != [32]byte{} {

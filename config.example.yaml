@@ -61,9 +61,13 @@ replication:
   # cert_chain_file: "/etc/murmur/replication.crt"
   # private_key_file: "/etc/murmur/replication.key"
   # ca_file: "/etc/murmur/replication-ca.crt"
-  # Ed25519 payload signing key (32 bytes = 64 hex characters), or path to key file.
+  # Ed25519 payload signing key: exactly one of inline hex, a key file
+  # (raw 32 bytes or hex text), or a key provider URI. URIs keep secrets
+  # out of config: file:/path, env:VAR_NAME, or exec:/helper?timeout=5s
+  # (the helper prints the key to stdout; use it for KMS/HSM fetchers).
   # signing_key_hex: "...64 hex chars..."
   # signing_key_file: "/etc/murmur/signing.key"
+  # signing_key_uri: "file:///etc/murmur/signing.key"
   # Public keys of remote origin nodes (32-hex node ID -> 64-hex Ed25519 public key).
   # Used to verify replication changes received directly or forwarded across the mesh.
   # trusted_origins:
@@ -114,6 +118,7 @@ replication:
   # files:
   #   directory: "./files"
   #   key_hex: "...64 hex chars..."
+  #   key_uri: "file:///etc/murmur/files.key"
   #   fetch_bind: "127.0.0.1:0"
   #   max_file_bytes: "4GiB"
   #   max_staging_bytes: "1GiB"
@@ -144,6 +149,7 @@ replication:
   #   stream: "main"
   #   recipient: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   #   signer_hex: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  #   signer_uri: "file:///etc/murmur/bridge-signer.key"
   #   max_bundle_bytes: "16MiB"
   #   max_payload_bytes: "64MiB"
   #   staging_bytes: "256MiB"
@@ -162,6 +168,7 @@ replication:
   #   stream: "main"
   #   recipient: "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
   #   receiver_secret_hex: "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  #   receiver_secret_uri: "file:///etc/murmur/bridge-receiver.key"
   #   max_bundle_bytes: "16MiB"
   #   max_payload_bytes: "64MiB"
   #   staging_bytes: "256MiB"

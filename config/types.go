@@ -73,6 +73,7 @@ type ReplicationConfig struct {
 	CaFile                   *string                  `yaml:"ca_file" json:"ca_file"`
 	SigningKeyHex            *string                  `yaml:"signing_key_hex" json:"signing_key_hex"`
 	SigningKeyFile           *string                  `yaml:"signing_key_file" json:"signing_key_file"`
+	SigningKeyURI            *string                  `yaml:"signing_key_uri" json:"signing_key_uri"`
 	TrustedOrigins           map[string]string        `yaml:"trusted_origins" json:"trusted_origins"`
 	AllowedPeers             []string                 `yaml:"allowed_peers" json:"allowed_peers"`
 	AllowedNetworks          []string                 `yaml:"allowed_networks" json:"allowed_networks"`
@@ -112,7 +113,9 @@ type ReplicationConfig struct {
 type ReplicationFilesConfig struct {
 	Directory         string   `yaml:"directory" json:"directory"`
 	KeyHex            string   `yaml:"key_hex" json:"key_hex"`
+	KeyURI            *string  `yaml:"key_uri" json:"key_uri"`
 	PreviousKeyHex    *string  `yaml:"previous_key_hex" json:"previous_key_hex"`
+	PreviousKeyURI    *string  `yaml:"previous_key_uri" json:"previous_key_uri"`
 	Generation        uint64   `yaml:"generation" json:"generation"`
 	FetchBind         string   `yaml:"fetch_bind" json:"fetch_bind"`
 	MaxFileBytes      Bytes    `yaml:"max_file_bytes" json:"max_file_bytes"`
@@ -130,7 +133,9 @@ type ReplicationBridgeConfig struct {
 	Stream            string            `yaml:"stream" json:"stream"`
 	Recipient         string            `yaml:"recipient" json:"recipient"`
 	ReceiverSecretHex *string           `yaml:"receiver_secret_hex" json:"receiver_secret_hex"`
+	ReceiverSecretURI *string           `yaml:"receiver_secret_uri" json:"receiver_secret_uri"`
 	SignerHex         *string           `yaml:"signer_hex" json:"signer_hex"`
+	SignerURI         *string           `yaml:"signer_uri" json:"signer_uri"`
 	TrustedSigners    map[string]string `yaml:"trusted_signers" json:"trusted_signers"`
 	MaxBundleBytes    Bytes             `yaml:"max_bundle_bytes" json:"max_bundle_bytes"`
 	MaxPayloadBytes   Bytes             `yaml:"max_payload_bytes" json:"max_payload_bytes"`

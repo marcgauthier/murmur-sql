@@ -2,6 +2,7 @@
 package native
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/pem"
 	"fmt"
@@ -9,11 +10,11 @@ import (
 	"os"
 	"strings"
 	"time"
-	"unicode"
 
+	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/keyprovider"
 	"github.com/marcgauthier/murmur-sql/murmur"
 	"github.com/marcgauthier/murmur-sql/murmur/replication"
-	"github.com/marcgauthier/murmur-sql/config"
 )
 
 func key32(s string) ([32]byte, error) {
@@ -22,6 +23,46 @@ func key32(s string) ([32]byte, error) {
 	copy(k[:], b)
 	clear(b)
 	return k, e
+}
+
+// resolveSecret loads a 32-byte secret from exactly one source: inline
+// hex, a key file (raw 32 bytes or hex text), or a key provider URI.
+// Config validation enforces the source rules; the helper fails closed
+// on any other combination. Provider resolution uses a background
+// context; exec helper URIs carry their own timeout.
+func resolveSecret(hex, file, uri *string) ([32]byte, error) {
+	var zero [32]byte
+	set := 0
+	for _, s := range []*string{hex, file, uri} {
+		if s != nil {
+			set++
+		}
+	}
+	if set != 1 {
+		return zero, fmt.Errorf("set exactly one key source")
+	}
+	switch {
+	case hex != nil:
+		return key32(*hex)
+	case file != nil:
+		raw, e := os.ReadFile(*file)
+		if e != nil {
+			return zero, e
+		}
+		defer clear(raw)
+		return keyprovider.ParseKeyMaterial(raw)
+	default:
+		return keyprovider.ResolveURI(context.Background(), *uri)
+	}
+}
+
+// hexRef adapts a required hex string to the *string source form; empty
+// means unset so validation errors surface instead of empty keys.
+func hexRef(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 func nodeID(s string) ([16]byte, error) {
 	var n [16]byte
@@ -180,26 +221,7 @@ func replicationConfig(r config.ReplicationConfig) (*replication.Config, error) 
 	if block == nil {
 		return nil, fmt.Errorf("no replication private key")
 	}
-	var signing [32]byte
-	if r.SigningKeyHex != nil {
-		signing, e = key32(*r.SigningKeyHex)
-	} else {
-		var raw []byte
-		raw, e = os.ReadFile(*r.SigningKeyFile)
-		if e == nil {
-			if len(raw) == 32 {
-				copy(signing[:], raw)
-			} else {
-				signing, e = key32(strings.Map(func(c rune) rune {
-					if unicode.IsSpace(c) {
-						return -1
-					}
-					return c
-				}, string(raw)))
-			}
-			clear(raw)
-		}
-	}
+	signing, e := resolveSecret(r.SigningKeyHex, r.SigningKeyFile, r.SigningKeyURI)
 	if e != nil {
 		return nil, e
 	}
@@ -331,7 +353,7 @@ func replicationConfig(r config.ReplicationConfig) (*replication.Config, error) 
 		out.MergePolicies[replication.PolicyColumn{Table: table, Column: column}] = p
 	}
 	if f := r.Files; f != nil {
-		key, e := key32(f.KeyHex)
+		key, e := resolveSecret(hexRef(f.KeyHex), nil, f.KeyURI)
 		if e != nil {
 			return nil, e
 		}
@@ -348,8 +370,8 @@ func replicationConfig(r config.ReplicationConfig) (*replication.Config, error) 
 			return nil, e
 		}
 		v.FetchInterval = time.Duration(f.FetchInterval)
-		if f.PreviousKeyHex != nil {
-			k, e := key32(*f.PreviousKeyHex)
+		if f.PreviousKeyHex != nil || f.PreviousKeyURI != nil {
+			k, e := resolveSecret(f.PreviousKeyHex, nil, f.PreviousKeyURI)
 			if e != nil {
 				return nil, e
 			}
@@ -384,15 +406,15 @@ func replicationConfig(r config.ReplicationConfig) (*replication.Config, error) 
 		if e != nil {
 			return nil, e
 		}
-		if b.ReceiverSecretHex != nil {
-			k, e := key32(*b.ReceiverSecretHex)
+		if b.ReceiverSecretHex != nil || b.ReceiverSecretURI != nil {
+			k, e := resolveSecret(b.ReceiverSecretHex, nil, b.ReceiverSecretURI)
 			if e != nil {
 				return nil, e
 			}
 			v.ReceiverSecret = &k
 		}
-		if b.SignerHex != nil {
-			k, e := key32(*b.SignerHex)
+		if b.SignerHex != nil || b.SignerURI != nil {
+			k, e := resolveSecret(b.SignerHex, nil, b.SignerURI)
 			if e != nil {
 				return nil, e
 			}

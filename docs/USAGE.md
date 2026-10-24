@@ -308,6 +308,37 @@ standalone admin CLI uses a different passphrase convention; use this
 repository's admin binary or an explicit raw key when working with
 databases created through SQL.
 
+## Key providers
+
+Config secrets (the replication signing key, files keys, bridge signer
+and receiver secrets) accept a provider URI as an alternative to inline
+hex or key files, so key material never sits in config:
+
+```yaml
+replication:
+  signing_key_uri: "file:///etc/murmur/signing.key"
+```
+
+Supported URIs, all resolving to 32 bytes (raw, or hex text):
+
+- `file:/path/to/key` — raw 32 bytes or whitespace-trimmed hex text.
+- `env:VAR_NAME` — hex text from the environment.
+- `exec:/helper?timeout=5s` — runs the helper as `helper <uri>` with a
+  30-second default timeout; stdout carries the key. Helpers inherit
+  the process environment, so a small script can fetch from KMS/HSM.
+  Helpers must exit zero and must not print secrets to stderr (a
+  bounded tail is included in errors).
+
+Offline admin opens provider-backed stores without a passphrase:
+
+```sh
+bin/murmur-admin keys ./data --key-provider-uri "file:///etc/murmur/store.key"
+```
+
+`--validate-config` resolves URIs like a real boot, so it reports
+missing helpers or keys before deployment. TLS credentials stay
+file-based: providers yield 32-byte symmetric material only.
+
 ## Logs and services
 
 Logs use `log/slog` JSON in `<prefix>.YYYY-MM-DD` files with UTC daily rotation.

@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/marcgauthier/murmur-sql/keyprovider"
 	"github.com/marcgauthier/murmur-sql/murmur"
 	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
@@ -22,19 +24,35 @@ var defaultKey = [32]byte{
 }
 
 type globalOpts struct {
-	json          bool
-	passphrase    *string
-	keyHex        *string
-	newPassphrase *string
-	newKeyHex     *string
-	isBackup      bool
-	freshNodeID   *[16]byte
-	freshDBID     *[16]byte
+	json           bool
+	passphrase     *string
+	keyHex         *string
+	keyProviderURI *string
+	newPassphrase  *string
+	newKeyHex      *string
+	isBackup       bool
+	freshNodeID    *[16]byte
+	freshDBID      *[16]byte
 }
 
 func (o *globalOpts) resolveCredential(dir string) (murmur.Credential, error) {
-	if o.keyHex != nil && o.passphrase != nil {
-		return murmur.Credential{}, fmt.Errorf("set exactly one of --key-hex and --passphrase")
+	sources := 0
+	for _, s := range []*string{o.keyHex, o.passphrase, o.keyProviderURI} {
+		if s != nil {
+			sources++
+		}
+	}
+	if sources > 1 {
+		return murmur.Credential{}, fmt.Errorf("set at most one of --key-hex, --passphrase, and --key-provider-uri")
+	}
+	if o.keyProviderURI != nil {
+		key, err := keyprovider.ResolveURI(context.Background(), *o.keyProviderURI)
+		if err != nil {
+			return murmur.Credential{}, err
+		}
+		out := murmur.KeyCredential(append([]byte(nil), key[:]...))
+		clear(key[:])
+		return out, nil
 	}
 	if o.keyHex != nil {
 		raw, err := hex.DecodeString(strings.TrimSpace(*o.keyHex))
@@ -96,6 +114,7 @@ Options:
   --json                                  Output structured JSON format
   --passphrase=<str>                      Passphrase for database encryption
   --key-hex=<hex>                         32-byte (64 hex char) raw encryption key
+  --key-provider-uri=<uri>                Key provider URI (file:/env:/exec:) for the store key
   --new-passphrase=<str>                  New passphrase for rekey
   --new-key-hex=<hex>                     New 32-byte raw key for rekey
   --backup                                Treat target directory as backup archive in `+"`verify`"+`
@@ -722,6 +741,12 @@ func run() int {
 		case arg == "--key-hex" && i+1 < len(args):
 			i++
 			opts.keyHex = &args[i]
+		case strings.HasPrefix(arg, "--key-provider-uri="):
+			v := strings.TrimPrefix(arg, "--key-provider-uri=")
+			opts.keyProviderURI = &v
+		case arg == "--key-provider-uri" && i+1 < len(args):
+			i++
+			opts.keyProviderURI = &args[i]
 		case strings.HasPrefix(arg, "--new-passphrase="):
 			v := strings.TrimPrefix(arg, "--new-passphrase=")
 			opts.newPassphrase = &v

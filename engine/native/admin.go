@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/marcgauthier/murmur-sql/engine"
+	"github.com/marcgauthier/murmur-sql/keyprovider"
 	"github.com/marcgauthier/murmur-sql/murmur"
 	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
@@ -33,12 +34,29 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 	if _, e := os.Stat(r.DataDir); e != nil {
 		return nil, translate(e)
 	}
+	var providerKey [32]byte
+	useProvider := false
+	if r.KeyProviderURI != "" {
+		k, e := keyprovider.ResolveURI(ctx, r.KeyProviderURI)
+		if e != nil {
+			return nil, translate(e)
+		}
+		providerKey, useProvider = k, true
+		clear(k[:])
+	}
+	defer clear(providerKey[:])
+	credFor := func(dir string) murmur.Credential {
+		if useProvider {
+			return murmur.KeyCredential(providerKey[:])
+		}
+		return credentialFor(dir, r.Key, r.Passphrase)
+	}
 	var db *murmur.Database
 	open := func() error {
 		options := murmur.DefaultOptions()
 		options.Mode = murmur.OpenExisting
 		var e error
-		db, e = murmur.OpenWithCredential(r.DataDir, credentialFor(r.DataDir, r.Key, r.Passphrase), options)
+		db, e = murmur.OpenWithCredential(r.DataDir, credFor(r.DataDir), options)
 		return translate(e)
 	}
 	defer func() {
@@ -135,7 +153,7 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 		count := 0
 		if r.Backup {
 			mode = "backup"
-			verification = murmur.VerifyBackupWithCredential(r.DataDir, credentialFor(r.DataDir, r.Key, r.Passphrase))
+			verification = murmur.VerifyBackupWithCredential(r.DataDir, credFor(r.DataDir))
 		} else {
 			verification = open()
 			if verification == nil {
@@ -167,7 +185,7 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 		report = map[string]any{"source_dir": r.DataDir, "destination_dir": r.Destination, "database_id": hexID(db.DatabaseID()), "node_id": hexID(db.NodeID()), "success": true}
 	case "restore":
 		options := murmur.RestoreOptions{NewDatabaseID: r.FreshDatabaseID, NewNodeID: r.FreshNodeID}
-		if e := murmur.RestoreWithCredentialAndOptions(r.DataDir, r.Destination, credentialFor(r.DataDir, r.Key, r.Passphrase), options); e != nil {
+		if e := murmur.RestoreWithCredentialAndOptions(r.DataDir, r.Destination, credFor(r.DataDir), options); e != nil {
 			return nil, translate(e)
 		}
 		var databaseID, nodeID any

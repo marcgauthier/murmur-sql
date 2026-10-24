@@ -98,6 +98,10 @@ type AdminRequest struct {
 	// Passphrase carries the current credential as a non-hex secret;
 	// when set it takes the same envelope-KDF selection as OpenRequest.
 	Passphrase string
+	// KeyProviderURI resolves the current credential from a key
+	// provider (see the keyprovider package). When set it takes
+	// precedence over Key and Passphrase.
+	KeyProviderURI string
 	// NewKey and NewPassphrase carry the rotation target for the
 	// "rekey" operation: exactly one must be set.
 	NewKey                       [32]byte
