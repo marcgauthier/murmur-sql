@@ -85,13 +85,13 @@ func (s *Server) saveFlags(flags map[string]bool) error {
 	}
 	return nil
 }
-func (s *Server) unlock(ctx context.Context, key [32]byte) error {
+func (s *Server) unlock(ctx context.Context, key [32]byte, passphrase string) error {
 	s.slot.Lock()
 	defer s.slot.Unlock()
 	if s.db != nil {
-		return s.db.Unlock(ctx, key)
+		return s.db.Unlock(ctx, key, passphrase)
 	}
-	db, _, e := s.factory.Open(ctx, engine.OpenRequest{Config: s.Config(), Key: key, TableFlagsSink: s.saveFlags})
+	db, _, e := s.factory.Open(ctx, engine.OpenRequest{Config: s.Config(), Key: key, Passphrase: passphrase, TableFlagsSink: s.saveFlags})
 	if e != nil {
 		return e
 	}

@@ -66,15 +66,26 @@ func VerifyPassword(phc string, password []byte) bool {
 	return subtle.ConstantTimeCompare(got, want) == 1
 }
 
+// IsRawKey reports whether s is a raw 32-byte key: exactly 64 hexadecimal
+// characters. Every other string is a passphrase. The rule is shared by
+// SQL unlock secrets and key-hex options; murmur mirrors it for credential
+// selection, so keep the two in sync.
+func IsRawKey(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	_, e := hex.DecodeString(s)
+	return e == nil
+}
+
 // ResolveKey matches MURMUR UNLOCK: exactly 64 hex characters is a raw key;
 // all other strings are SHA-256 passphrases.
 func ResolveKey(s string) [32]byte {
-	if len(s) == 64 {
-		if b, e := hex.DecodeString(s); e == nil {
-			var k [32]byte
-			copy(k[:], b)
-			return k
-		}
+	if IsRawKey(s) {
+		b, _ := hex.DecodeString(s)
+		var k [32]byte
+		copy(k[:], b)
+		return k
 	}
 	return sha256.Sum256([]byte(s))
 }

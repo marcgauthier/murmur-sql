@@ -58,15 +58,20 @@ at `path`. Reopening with the same key unlocks it; a wrong key fails with
 key := make([]byte, 32) // load from a KMS, HSM, or encrypted key file
 ```
 
-Passphrases derive with `auth.ResolveKey`: a 64-character hex string is a
-raw 32-byte key, anything else is SHA-256 hashed:
+`OpenWithCredential` also accepts a passphrase, which new stores stretch
+with Argon2id (parameters stored in the envelope); a 64-character hex
+string is always a raw 32-byte key instead:
 
 ```go
-import "github.com/marcgauthier/murmur-sql/auth"
-
-raw := auth.ResolveKey("correct horse battery staple")
-db, err := murmur.Open(dir+"/store", raw[:], options)
+db, err := murmur.OpenWithCredential(dir+"/store",
+    murmur.PassphraseCredential("correct horse battery staple"), options)
 ```
+
+Stores created before passphrase support keep the legacy mapping
+(SHA-256 of the passphrase as the master key) and still open through
+`murmur.CredentialForSecret` with the envelope KDF. `RotateCredential`
+to a passphrase migrates the envelope to Argon2id; afterwards the
+legacy mapping is rejected.
 
 ## Replication
 

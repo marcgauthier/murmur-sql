@@ -47,7 +47,8 @@ func cols(def string) []engine.Column {
 
 var commandColumns = map[string]string{
 	"SHOW TABLES REPLICATION": "table replicated", "SHOW STATUS": "status", "SHOW METRICS": "subsystem metric value",
-	"SHOW PEERS":          "node_id address connected last_seen_millis_ago:i sent_watermark:i schema_agreed push_mode",
+	"SHOW PEERS":          "node_id address connected last_seen_millis_ago:i sent_watermark:i schema_agreed push_mode lag_txns:i origins_behind:i last_progress_millis_ago:i queue_messages:i queue_available_bytes:i member_state",
+	"SHOW HEAD":           "origin applied:i",
 	"SHOW REPLICATION":    "running address peers:i members:i staged_transactions:i applied_transactions:i last_error committed:i",
 	"SHOW RETENTION":      "node_id last_seen_millis:i retired origin acknowledged:i collected_transactions:i last_collection_millis:i",
 	"SHOW COLUMNS FTS":    "table column enabled index_name ready rebuilding pending_keys:i queued_bytes:i error",
@@ -171,7 +172,7 @@ func parseCommand(sql string) (commandSpec, error) {
 				return invalid()
 			}
 			take("SHOW METRICS", 2)
-		case "STATUS", "PEERS", "REPLICATION", "RETENTION":
+		case "STATUS", "PEERS", "REPLICATION", "RETENTION", "HEAD":
 			if len(ts) != 2 {
 				return invalid()
 			}
@@ -218,6 +219,37 @@ func parseCommand(sql string) (commandSpec, error) {
 			return invalid()
 		}
 		take("RETENTION COLLECT", 2)
+	case "WAIT":
+		if upper(1) != "FOR" {
+			return invalid()
+		}
+		if upper(2) == "LAG" {
+			if len(ts) != 4 && (len(ts) != 6 || upper(4) != "TIMEOUT") {
+				return invalid()
+			}
+			take("WAIT FOR LAG", 3)
+			if len(ts) == 6 {
+				c.args = []token{ts[3], ts[5]}
+				c.types = c.types[:2]
+			}
+			c.types[0] = engine.Int8
+			if len(c.types) == 2 {
+				c.types[1] = engine.Int8
+			}
+			break
+		}
+		if len(ts) != 4 && (len(ts) != 6 || upper(4) != "TIMEOUT") {
+			return invalid()
+		}
+		take("WAIT FOR", 2)
+		if len(ts) == 6 {
+			c.args = []token{ts[2], ts[3], ts[5]}
+			c.types = c.types[:3]
+		}
+		c.types[1] = engine.Int8
+		if len(c.types) == 3 {
+			c.types[2] = engine.Int8
+		}
 	case "POLICY":
 		if len(ts) != 6 {
 			return invalid()
@@ -439,6 +471,27 @@ func (c commandSpec) values(params []engine.Value) ([]engine.Value, error) {
 	}
 	return out, nil
 }
+
+// packSecret encodes an unlock secret for the engine: raw keys as key
+// bytes, passphrases as text. The engine selects the envelope KDF.
+func packSecret(secret string) engine.Value {
+	if auth.IsRawKey(secret) {
+		key := auth.ResolveKey(secret)
+		out := append([]byte{}, key[:]...)
+		clear(key[:])
+		return out
+	}
+	return secret
+}
+
+// clearSecret wipes a packed raw key; passphrases are immutable strings
+// and are dropped by the caller instead.
+func clearSecret(v engine.Value) {
+	if b, ok := v.([]byte); ok {
+		clear(b)
+	}
+}
+
 func (c commandSpec) execute(ctx context.Context, s *session, params []engine.Value) (engine.Result, error) {
 	args, e := c.values(params)
 	if e != nil {
@@ -451,9 +504,15 @@ func (c commandSpec) execute(ctx context.Context, s *session, params []engine.Va
 		if secret == "" {
 			return result, sqlError("28000", "MURMUR UNLOCK needs a non-empty key")
 		}
-		key := auth.ResolveKey(secret)
+		var key [32]byte
+		var passphrase string
+		if auth.IsRawKey(secret) {
+			key = auth.ResolveKey(secret)
+		} else {
+			passphrase = secret
+		}
 		defer clear(key[:])
-		if e = s.server.unlock(ctx, key); e != nil {
+		if e = s.server.unlock(ctx, key, passphrase); e != nil {
 			return result, e
 		}
 		s.unlocked = true
@@ -482,26 +541,31 @@ func (c commandSpec) execute(ctx context.Context, s *session, params []engine.Va
 		if args[1] == "" {
 			return result, sqlError("22023", "new key must be non-empty")
 		}
-		old, new := auth.ResolveKey(args[0].(string)), auth.ResolveKey(args[1].(string))
-		if old == new {
+		if args[0].(string) == args[1].(string) {
 			return result, sqlError("22023", "new key must differ from previous key")
 		}
-		args = []engine.Value{append([]byte{}, old[:]...), append([]byte{}, new[:]...)}
-		defer clear(args[0].([]byte))
-		defer clear(args[1].([]byte))
-		clear(old[:])
-		clear(new[:])
+		args = []engine.Value{packSecret(args[0].(string)), packSecret(args[1].(string))}
+		defer clearSecret(args[0])
+		defer clearSecret(args[1])
 	case "RESTORE":
 		if args[1] == "" {
 			return result, sqlError("28000", "restore key must be non-empty")
 		}
-		key := auth.ResolveKey(args[1].(string))
-		if e = db.Unlock(ctx, key); e != nil {
+		secret := args[1].(string)
+		var key [32]byte
+		var passphrase string
+		if auth.IsRawKey(secret) {
+			key = auth.ResolveKey(secret)
+		} else {
+			passphrase = secret
+		}
+		if e = db.Unlock(ctx, key, passphrase); e != nil {
+			clear(key[:])
 			return result, e
 		}
-		args[1] = append([]byte{}, key[:]...)
+		args[1] = packSecret(secret)
 		clear(key[:])
-		defer clear(args[1].([]byte))
+		defer clearSecret(args[1])
 	case "POLICY MIN", "POLICY MAX":
 		v := args[3].(string)
 		if n, e := strconv.ParseInt(v, 10, 64); e == nil {

@@ -45,6 +45,42 @@ func TestValidateWrappingKeyAuthenticatesEnvelope(t *testing.T) {
 	}
 }
 
+func TestValidateCredentialPassphrase(t *testing.T) {
+	dir := t.TempDir()
+	options := testOptions(t, dir)
+	options.MasterKey = nil
+	options.Passphrase = "correct horse battery staple"
+	store, err := spool.Open(options)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	hint, err := spool.ReadKeyHint(dir)
+	if err != nil {
+		t.Fatalf("ReadKeyHint: %v", err)
+	}
+	if hint.KDF != spool.KDFArgon2id {
+		t.Fatalf("hint KDF = %d, want KDFArgon2id", hint.KDF)
+	}
+	if err := spool.ValidateCredential(dir, nil, options.Passphrase, nil, ""); err != nil {
+		t.Fatalf("ValidateCredential: %v", err)
+	}
+	if err := spool.ValidateCredential(dir, nil, "wrong passphrase", nil, ""); !errors.Is(err, spool.ErrWrongKey) {
+		t.Fatalf("wrong passphrase returned %v, want ErrWrongKey", err)
+	}
+	if err := spool.ValidateCredential(dir, bytes.Repeat([]byte{0x4b}, 32), "", nil, ""); !errors.Is(err, spool.ErrWrongKey) {
+		t.Fatalf("master key against passphrase store returned %v, want ErrWrongKey", err)
+	}
+	if err := spool.ValidateCredential(dir, nil, "", nil, ""); err == nil {
+		t.Fatal("empty credential accepted, want error")
+	}
+	if err := spool.ValidateCredential(dir, bytes.Repeat([]byte{0x4b}, 32), "both", nil, ""); err == nil {
+		t.Fatal("dual credential accepted, want error")
+	}
+}
+
 // TestPlaintextAudit writes high-entropy canary keys and values
 // through every mutation path, rotates, rewrites, and checkpoints,
 // then requires the canaries to appear in no store file.

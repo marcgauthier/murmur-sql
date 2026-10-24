@@ -256,7 +256,14 @@ func (s *LogicalStore) RotateKey() error {
 
 // RotateMasterKey re-protects the keyring under a new master key.
 func (s *LogicalStore) RotateMasterKey(newKey []byte) error {
-	if err := s.store.RotateMasterKey(newKey, ""); err != nil {
+	return s.RotateCredential(newKey, "")
+}
+
+// RotateCredential re-protects the keyring under a new master key or
+// passphrase: exactly one must be set. Changing the credential form
+// migrates the envelope KDF.
+func (s *LogicalStore) RotateCredential(newKey []byte, newPassphrase string) error {
+	if err := s.store.RotateMasterKey(newKey, newPassphrase); err != nil {
 		return storageErr("%v", err)
 	}
 	return nil

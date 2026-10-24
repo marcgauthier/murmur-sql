@@ -41,3 +41,18 @@ func TestKeyCompatibility(t *testing.T) {
 		t.Fatal("admin passphrase accidentally treated as hex")
 	}
 }
+
+func TestIsRawKey(t *testing.T) {
+	raw := strings.Repeat("ab", 32)
+	upper := strings.Repeat("AB", 32)
+	for _, s := range []string{raw, upper, strings.Repeat("09", 32)} {
+		if !IsRawKey(s) {
+			t.Fatalf("IsRawKey(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "secret", strings.Repeat("a", 63), strings.Repeat("a", 65), strings.Repeat("zz", 32), strings.Repeat("ab", 31) + "zz", " " + raw[:63]} {
+		if IsRawKey(s) {
+			t.Fatalf("IsRawKey(%q) = true, want false", s)
+		}
+	}
+}

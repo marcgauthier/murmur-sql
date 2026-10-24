@@ -330,15 +330,27 @@ type Database struct {
 
 // Open opens or creates a database.
 func Open(path string, key []byte, options Options) (*Database, error) {
-	return openInner(path, key, options, nil)
+	return openInner(path, KeyCredential(key), options, nil)
+}
+
+// OpenWithCredential opens or creates a database with a master key or
+// passphrase credential.
+func OpenWithCredential(path string, cred Credential, options Options) (*Database, error) {
+	return openInner(path, cred, options, nil)
 }
 
 // OpenWithFlags opens with explicit table replication flags.
 func OpenWithFlags(path string, key []byte, options Options, flags map[string]bool) (*Database, error) {
-	return openInner(path, key, options, flags)
+	return openInner(path, KeyCredential(key), options, flags)
 }
 
-func openInner(path string, key []byte, options Options, flags map[string]bool) (*Database, error) {
+// OpenWithCredentialAndFlags opens with a master key or passphrase
+// credential plus explicit table replication flags.
+func OpenWithCredentialAndFlags(path string, cred Credential, options Options, flags map[string]bool) (*Database, error) {
+	return openInner(path, cred, options, flags)
+}
+
+func openInner(path string, cred Credential, options Options, flags map[string]bool) (*Database, error) {
 	if options.Replication != nil {
 		config := options.Replication
 		if len(config.Credentials.Chain) == 0 {
@@ -357,7 +369,7 @@ func openInner(path string, key []byte, options Options, flags map[string]bool) 
 		return nil, err
 	}
 	schedulerConfig := options.Scheduler
-	keyCopy := append([]byte(nil), key...)
+	credCopy := Credential{Key: append([]byte(nil), cred.Key...), Passphrase: cred.Passphrase}
 	tx := make(chan dbMessage)
 	type startResult struct {
 		identity  Identity
@@ -374,13 +386,14 @@ func openInner(path string, key []byte, options Options, flags map[string]bool) 
 	go func() {
 		defer close(threadDone)
 		core, err := func() (*Core, error) {
-			opened, err := OpenStorage(path, keyCopy, &options, progress)
+			opened, err := OpenStorageWithCredential(path, credCopy, &options, progress)
 			if err != nil {
 				return nil, err
 			}
-			for i := range keyCopy {
-				keyCopy[i] = 0
+			for i := range credCopy.Key {
+				credCopy.Key[i] = 0
 			}
+			credCopy.Passphrase = ""
 			connection, err := RecoverCurrent(opened, progress)
 			if err != nil {
 				opened.Close()
@@ -923,9 +936,27 @@ func RestoreWithOptions(backup, destination string, key []byte, options RestoreO
 	return RestoreBackup(backup, destination, key, &options)
 }
 
+// RestoreWithCredential restores a backup directory with a master key
+// or passphrase credential, preserving identity.
+func RestoreWithCredential(backup, destination string, cred Credential) error {
+	return RestoreWithCredentialAndOptions(backup, destination, cred, DefaultRestoreOptions())
+}
+
+// RestoreWithCredentialAndOptions restores with a master key or
+// passphrase credential plus optional fresh identity.
+func RestoreWithCredentialAndOptions(backup, destination string, cred Credential, options RestoreOptions) error {
+	return RestoreBackupWithCredential(backup, destination, cred, &options)
+}
+
 // VerifyBackup verifies a backup directory opens and rebuilds.
 func VerifyBackup(backup string, key []byte) error {
 	return VerifyBackupDir(backup, key)
+}
+
+// VerifyBackupWithCredential verifies a backup directory with a master
+// key or passphrase credential.
+func VerifyBackupWithCredential(backup string, cred Credential) error {
+	return VerifyBackupDirWithCredential(backup, cred)
 }
 
 // RotateDataKey rotates the data encryption key.
@@ -947,6 +978,17 @@ func (db *Database) RotateDataKey() error {
 
 // RotateMasterKey replaces the 32-byte application key.
 func (db *Database) RotateMasterKey(newKey [32]byte) error {
+	return db.RotateCredential(KeyCredential(newKey[:]))
+}
+
+// RotateCredential re-protects the keyring under a new master key or
+// passphrase. Changing the credential form migrates the envelope KDF,
+// which is also the migration path from legacy SHA-256-derived master
+// keys to Argon2id passphrases.
+func (db *Database) RotateCredential(cred Credential) error {
+	if err := cred.validate(); err != nil {
+		return err
+	}
 	ticket, err := db.inner.scheduler.Admit(WriterMaintenance)
 	if err != nil {
 		return err
@@ -957,8 +999,10 @@ func (db *Database) RotateMasterKey(newKey [32]byte) error {
 			return nil, err
 		}
 		reply := make(chan error, 1)
+		// Copy: the worker wipes the key bytes after use.
+		work := Work{Kind: WorkRotateMasterKey, MasterKey: append([]byte(nil), cred.Key...), Passphrase: cred.Passphrase, RotateReply: reply}
 		select {
-		case c.worker <- Work{Kind: WorkRotateMasterKey, MasterKey: newKey[:], RotateReply: reply}:
+		case c.worker <- work:
 		case <-time.After(5 * time.Minute):
 			return nil, ErrClosed
 		}

@@ -444,6 +444,14 @@ func readKeys(dir string, masterKey []byte, passphrase string, storeID, contextI
 	return r, nil
 }
 
+// KDFDirect and KDFArgon2id name the keys.enc envelope KDFs reported
+// by KeyHint.KDF: direct master-key HKDF and Argon2id-stretched
+// passphrases with parameters stored in the envelope header.
+const (
+	KDFDirect   = kdfDirectHKDF
+	KDFArgon2id = kdfArgon2id
+)
+
 // KeyHint carries bounded, non-secret store metadata for wrapping-key
 // selection. It is read without key material: the wrapping id is a
 // lookup hint only, trusted after the envelope authenticates.
@@ -500,7 +508,19 @@ func ReadKeyHint(dir string) (KeyHint, error) {
 // expectedWrappingID are optional; when supplied they must match the
 // authenticated envelope identity.
 func ValidateWrappingKey(dir string, masterKey, expectedContext []byte, expectedWrappingID string) error {
-	if len(masterKey) != 32 {
+	return ValidateCredential(dir, masterKey, "", expectedContext, expectedWrappingID)
+}
+
+// ValidateCredential authenticates a store's key envelope with either a
+// 32-byte master key or a passphrase: exactly one must be set. It opens
+// nothing writable and scans no records. expectedContext and
+// expectedWrappingID are optional; when supplied they must match the
+// authenticated envelope identity.
+func ValidateCredential(dir string, masterKey []byte, passphrase string, expectedContext []byte, expectedWrappingID string) error {
+	if (len(masterKey) > 0) == (passphrase != "") {
+		return fmt.Errorf("spool: set exactly one of masterKey and passphrase")
+	}
+	if len(masterKey) > 0 && len(masterKey) != 32 {
 		return fmt.Errorf("spool: master key must be 32 bytes")
 	}
 	if len(expectedContext) != 0 && len(expectedContext) != 16 {
@@ -516,7 +536,7 @@ func ValidateWrappingKey(dir string, masterKey, expectedContext []byte, expected
 	if len(expectedContext) == 16 && string(expectedContext) != string(hint.ContextID[:]) {
 		return fmt.Errorf("spool: expected context does not match store: %w", ErrContextMismatch)
 	}
-	ring, err := readKeys(dir, masterKey, "", hint.StoreID, hint.ContextID)
+	ring, err := readKeys(dir, masterKey, passphrase, hint.StoreID, hint.ContextID)
 	if err != nil {
 		return err
 	}

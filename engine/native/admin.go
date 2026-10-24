@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/marcgauthier/murmur-sql/engine"
 	"github.com/marcgauthier/murmur-sql/murmur"
 	"github.com/marcgauthier/murmur-sql/murmur/spool"
-	"github.com/marcgauthier/murmur-sql/engine"
 )
 
 type adminReport struct {
@@ -25,6 +25,8 @@ func (r adminReport) MarshalJSON() ([]byte, error) { return json.Marshal(r.value
 func (r adminReport) String() string               { return r.human }
 func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, err error) {
 	defer clear(r.Key[:])
+	defer clear(r.NewKey[:])
+	defer func() { r.Passphrase, r.NewPassphrase = "", "" }()
 	if e := ctx.Err(); e != nil {
 		return nil, e
 	}
@@ -36,7 +38,7 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 		options := murmur.DefaultOptions()
 		options.Mode = murmur.OpenExisting
 		var e error
-		db, e = murmur.Open(r.DataDir, r.Key[:], options)
+		db, e = murmur.OpenWithCredential(r.DataDir, credentialFor(r.DataDir, r.Key, r.Passphrase), options)
 		return translate(e)
 	}
 	defer func() {
@@ -84,11 +86,12 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 			}
 			tables = append(tables, map[string]any{"id": t.ID, "name": t.Name, "columns_count": len(t.Columns), "primary_key": pk})
 		}
-		report = map[string]any{"data_dir": r.DataDir, "database_id": hexID(db.DatabaseID()), "node_id": hexID(db.NodeID()), "storage_files": files, "storage_disk_bytes": bytes, "wrapping_key_id": hint.WrappingKeyID, "keyring_seq": hint.KeyringSeq, "table_count": len(schema.Tables), "index_count": len(schema.Indexes), "tables": tables}
+		report = map[string]any{"data_dir": r.DataDir, "database_id": hexID(db.DatabaseID()), "node_id": hexID(db.NodeID()), "storage_files": files, "storage_disk_bytes": bytes, "wrapping_key_id": hint.WrappingKeyID, "kdf": kdfName(hint.KDF), "keyring_seq": hint.KeyringSeq, "table_count": len(schema.Tables), "index_count": len(schema.Indexes), "tables": tables}
 	case "keys":
 		if e := open(); e != nil {
 			return nil, e
 		}
+		hint, _ := spool.ReadKeyHint(r.DataDir)
 		inventory := db.KeyInventory()
 		keys := make([]map[string]any, 0, len(inventory.DataKeys))
 		for _, k := range inventory.DataKeys {
@@ -102,7 +105,29 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 			}
 			keys = append(keys, map[string]any{"id": k.ID, "id_hex": fmt.Sprintf("%08x", k.ID), "created_at_epoch_secs": created, "status": status})
 		}
-		report = map[string]any{"data_dir": r.DataDir, "encrypted": inventory.Encrypted, "wrapping_key_id": inventory.WrappingKeyID, "active_data_key_id": inventory.ActiveDataKeyID, "keyring_seq": inventory.KeyringSeq, "manifest_generation": inventory.ManifestGeneration, "data_keys_count": len(keys), "data_keys": keys}
+		report = map[string]any{"data_dir": r.DataDir, "encrypted": inventory.Encrypted, "wrapping_key_id": inventory.WrappingKeyID, "kdf": kdfName(hint.KDF), "active_data_key_id": inventory.ActiveDataKeyID, "keyring_seq": inventory.KeyringSeq, "manifest_generation": inventory.ManifestGeneration, "data_keys_count": len(keys), "data_keys": keys}
+	case "rekey":
+		if e := open(); e != nil {
+			return nil, e
+		}
+		if r.NewPassphrase == "" && r.NewKey == [32]byte{} {
+			return nil, userError("22023", "rekey needs --new-key-hex or --new-passphrase")
+		}
+		newCred := murmur.KeyCredential(r.NewKey[:])
+		if r.NewPassphrase != "" {
+			newCred = murmur.PassphraseCredential(r.NewPassphrase)
+		}
+		if e := db.RotateCredential(newCred); e != nil {
+			return nil, translate(e)
+		}
+		if e := db.Flush(); e != nil {
+			return nil, translate(e)
+		}
+		kdf := "unknown"
+		if hint, e := spool.ReadKeyHint(r.DataDir); e == nil {
+			kdf = kdfName(hint.KDF)
+		}
+		report = map[string]any{"data_dir": r.DataDir, "success": true, "kdf": kdf}
 	case "verify":
 		mode := "database"
 		var verification error
@@ -110,7 +135,7 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 		count := 0
 		if r.Backup {
 			mode = "backup"
-			verification = murmur.VerifyBackup(r.DataDir, r.Key[:])
+			verification = murmur.VerifyBackupWithCredential(r.DataDir, credentialFor(r.DataDir, r.Key, r.Passphrase))
 		} else {
 			verification = open()
 			if verification == nil {
@@ -142,7 +167,7 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 		report = map[string]any{"source_dir": r.DataDir, "destination_dir": r.Destination, "database_id": hexID(db.DatabaseID()), "node_id": hexID(db.NodeID()), "success": true}
 	case "restore":
 		options := murmur.RestoreOptions{NewDatabaseID: r.FreshDatabaseID, NewNodeID: r.FreshNodeID}
-		if e := murmur.RestoreWithOptions(r.DataDir, r.Destination, r.Key[:], options); e != nil {
+		if e := murmur.RestoreWithCredentialAndOptions(r.DataDir, r.Destination, credentialFor(r.DataDir, r.Key, r.Passphrase), options); e != nil {
 			return nil, translate(e)
 		}
 		var databaseID, nodeID any
@@ -158,6 +183,19 @@ func (Factory) Admin(ctx context.Context, r engine.AdminRequest) (result any, er
 	}
 	return adminReport{values: report, human: formatReport(r.Operation, report)}, err
 }
+
+// kdfName renders a keys.enc KDF id for reports.
+func kdfName(kdf uint8) string {
+	switch kdf {
+	case spool.KDFArgon2id:
+		return "argon2id"
+	case spool.KDFDirect:
+		return "direct"
+	default:
+		return fmt.Sprintf("unknown(%d)", kdf)
+	}
+}
+
 func directorySize(path string) (uint64, int, error) {
 	var size uint64
 	count := 0
@@ -235,7 +273,7 @@ func formatReport(op string, r map[string]any) string {
 		}
 	case "inspect":
 		out.WriteString("=== Murmur Storage Inspection ===\n")
-		for _, pair := range [][2]string{{"Data Directory", "data_dir"}, {"Database ID", "database_id"}, {"Node ID", "node_id"}, {"Files On Disk", "storage_files"}, {"Disk Bytes", "storage_disk_bytes"}, {"Wrapping Key ID", "wrapping_key_id"}, {"Keyring Sequence", "keyring_seq"}, {"Tables Registered", "table_count"}, {"Indexes Registered", "index_count"}} {
+		for _, pair := range [][2]string{{"Data Directory", "data_dir"}, {"Database ID", "database_id"}, {"Node ID", "node_id"}, {"Files On Disk", "storage_files"}, {"Disk Bytes", "storage_disk_bytes"}, {"Wrapping Key ID", "wrapping_key_id"}, {"Envelope KDF", "kdf"}, {"Keyring Sequence", "keyring_seq"}, {"Tables Registered", "table_count"}, {"Indexes Registered", "index_count"}} {
 			line(pair[0], pair[1])
 		}
 		if tables, ok := r["tables"].([]map[string]any); ok && len(tables) > 0 {
@@ -246,7 +284,7 @@ func formatReport(op string, r map[string]any) string {
 		}
 	case "keys":
 		out.WriteString("=== Murmur Key Registry & Inventory ===\n")
-		fmt.Fprintf(&out, "Data Directory:         %v\nEncrypted:              %v\nWrapping Key ID:        %v\nActive Data Key ID:     %08x (#%v)\nKeyring Persist Seq:    %v\nManifest Generation:    %v\nTotal Data Keys:        %v\n", r["data_dir"], r["encrypted"], r["wrapping_key_id"], r["active_data_key_id"], r["active_data_key_id"], r["keyring_seq"], r["manifest_generation"], r["data_keys_count"])
+		fmt.Fprintf(&out, "Data Directory:         %v\nEncrypted:              %v\nWrapping Key ID:        %v\nEnvelope KDF:           %v\nActive Data Key ID:     %08x (#%v)\nKeyring Persist Seq:    %v\nManifest Generation:    %v\nTotal Data Keys:        %v\n", r["data_dir"], r["encrypted"], r["wrapping_key_id"], r["kdf"], r["active_data_key_id"], r["active_data_key_id"], r["keyring_seq"], r["manifest_generation"], r["data_keys_count"])
 		if keys, ok := r["data_keys"].([]map[string]any); ok && len(keys) > 0 {
 			out.WriteString("\n  Key ID    Status    Created At (UNIX secs)\n  --------  --------  ----------------------\n")
 			for _, k := range keys {
@@ -254,6 +292,8 @@ func formatReport(op string, r map[string]any) string {
 			}
 		}
 
+	case "rekey":
+		fmt.Fprintf(&out, "PASS: Store re-protected successfully.\nData Directory:   %v\nEnvelope KDF:     %v\n", r["data_dir"], r["kdf"])
 	case "verify":
 		if r["valid"] == true {
 			if r["mode"] == "backup" {

@@ -68,8 +68,12 @@ func SQLState(err error) string {
 var ErrUnavailable = &Error{Code: "0A000", Message: "database engine is intentionally disabled for this host"}
 
 type OpenRequest struct {
-	Config         config.Config
-	Key            [32]byte
+	Config config.Config
+	Key    [32]byte
+	// Passphrase carries a non-hex unlock secret. When set it selects
+	// passphrase protection (Argon2id for new stores, the envelope KDF
+	// for existing ones); otherwise Key is the raw master key.
+	Passphrase     string
 	TableFlagsSink func(map[string]bool) error
 }
 type OpenOutcome uint8
@@ -88,9 +92,16 @@ type Command struct {
 	Arguments []Value
 }
 type AdminRequest struct {
-	Operation                    string
-	DataDir, Destination         string
-	Key                          [32]byte
+	Operation            string
+	DataDir, Destination string
+	Key                  [32]byte
+	// Passphrase carries the current credential as a non-hex secret;
+	// when set it takes the same envelope-KDF selection as OpenRequest.
+	Passphrase string
+	// NewKey and NewPassphrase carry the rotation target for the
+	// "rekey" operation: exactly one must be set.
+	NewKey                       [32]byte
+	NewPassphrase                string
 	Backup                       bool
 	FreshNodeID, FreshDatabaseID *[16]byte
 }
@@ -109,11 +120,12 @@ type ConfigValidator interface{ ValidateConfig(config.Config) error }
 // Database operations must be safe for concurrent sessions. Execute is one
 // autocommit statement. Migrate owns schema changes; Describe must not execute
 // writes. Disconnect releases all connection-owned transfer/cursor handles.
-// Unlock verifies a key on an already-open instance without opening storage.
-// Command must persist table-flag changes through TableFlagsSink before
-// publishing them. Restore/key rotation must invalidate appropriate handles.
+// Unlock verifies a key or passphrase on an already-open instance without
+// opening storage. Command must persist table-flag changes through
+// TableFlagsSink before publishing them. Restore/key rotation must invalidate
+// appropriate handles.
 type Database interface {
-	Unlock(context.Context, [32]byte) error
+	Unlock(context.Context, [32]byte, string) error
 	Execute(context.Context, string, []Value) (Result, error)
 	Describe(context.Context, string, []uint32) (Description, error)
 	Migrate(context.Context, string) (Result, error)

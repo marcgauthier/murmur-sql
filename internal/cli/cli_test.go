@@ -3,10 +3,25 @@ package cli
 import (
 	"bytes"
 	"context"
-	"github.com/marcgauthier/murmur-sql/auth"
 	"strings"
 	"testing"
+
+	"github.com/marcgauthier/murmur-sql/auth"
+	"github.com/marcgauthier/murmur-sql/engine"
 )
+
+type captureAdmin struct {
+	got engine.AdminRequest
+}
+
+func (c *captureAdmin) Open(context.Context, engine.OpenRequest) (engine.Database, engine.OpenOutcome, error) {
+	return nil, 0, engine.ErrUnavailable
+}
+
+func (c *captureAdmin) Admin(_ context.Context, r engine.AdminRequest) (any, error) {
+	c.got = r
+	return map[string]any{"ok": true}, nil
+}
 
 func TestAdminPasswordAndUnavailable(t *testing.T) {
 	var out, errs bytes.Buffer
@@ -37,6 +52,49 @@ func TestCLIValidation(t *testing.T) {
 		errs.Reset()
 		if code := Admin(context.Background(), args, strings.NewReader(""), &out, &errs, nil); code != 1 {
 			t.Fatal(args, code)
+		}
+	}
+}
+
+func TestAdminCredentialFlags(t *testing.T) {
+	raw := strings.Repeat("ab", 32)
+	admin := func(args ...string) (int, *captureAdmin, string) {
+		var out, errs bytes.Buffer
+		c := &captureAdmin{}
+		code := Admin(context.Background(), args, strings.NewReader(""), &out, &errs, c)
+		return code, c, errs.String()
+	}
+	if code, c, errs := admin("status", "/unused", "--passphrase", "s3cret"); code != 0 {
+		t.Fatal(code, errs)
+	} else if c.got.Passphrase != "s3cret" || c.got.Key != [32]byte{} {
+		t.Fatalf("passphrase routed to %+v", c.got)
+	}
+	if code, c, errs := admin("status", "/unused", "--passphrase", raw); code != 0 {
+		t.Fatal(code, errs)
+	} else if c.got.Passphrase != "" || c.got.Key != auth.ResolveKey(raw) {
+		t.Fatalf("64-hex passphrase routed to %+v", c.got)
+	}
+	if code, _, errs := admin("status", "/unused", "--key-hex", raw, "--passphrase", "x"); code != 1 {
+		t.Fatal("dual credential accepted", code, errs)
+	}
+	if code, c, errs := admin("rekey", "/unused", "--passphrase", "x", "--new-passphrase", "y"); code != 0 {
+		t.Fatal(code, errs)
+	} else if c.got.NewPassphrase != "y" || c.got.NewKey != [32]byte{} {
+		t.Fatalf("new passphrase routed to %+v", c.got)
+	}
+	if code, c, errs := admin("rekey", "/unused", "--key-hex", raw, "--new-key-hex", raw); code != 0 {
+		t.Fatal(code, errs)
+	} else if c.got.NewPassphrase != "" || c.got.NewKey != auth.ResolveKey(raw) {
+		t.Fatalf("new key routed to %+v", c.got)
+	}
+	for _, args := range [][]string{
+		{"rekey", "/unused", "--passphrase", "x"},
+		{"rekey", "/unused", "--passphrase", "x", "--new-passphrase", "y", "--new-key-hex", raw},
+		{"rekey", "/unused", "--passphrase", "x", "--new-key-hex", "bad"},
+		{"status", "/unused", "--new-passphrase", "y"},
+	} {
+		if code, _, errs := admin(args...); code != 1 {
+			t.Fatal(args, code, errs)
 		}
 	}
 }

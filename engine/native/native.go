@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/marcgauthier/murmur-sql/murmur"
 	"github.com/marcgauthier/murmur-sql/engine"
+	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 type Factory struct{}
@@ -26,11 +27,77 @@ type database struct {
 	files   fileHandles
 }
 
+// credentialFor maps request key material to a store credential. A
+// non-empty passphrase selects the envelope KDF for existing stores
+// (Argon2id, or the legacy SHA-256 mapping for KDF-0 envelopes) and
+// passphrase protection for new ones; otherwise the raw key is used
+// unchanged. Unreadable envelopes fall through to the passphrase form
+// so opens fail downstream with the store's own error.
+func credentialFor(dir string, key [32]byte, passphrase string) murmur.Credential {
+	if passphrase == "" {
+		return murmur.KeyCredential(key[:])
+	}
+	if hint, err := spool.ReadKeyHint(dir); err == nil && hint.Encrypted {
+		return murmur.CredentialForSecret(passphrase, hint.KDF)
+	}
+	return murmur.PassphraseCredential(passphrase)
+}
+
+// credentialHash canonicalizes request key material for session
+// verification: the passphrase wins when set, else the raw key. The
+// comparison is an equality check against the opening credential, not
+// key derivation.
+func credentialHash(key [32]byte, passphrase string) [32]byte {
+	if passphrase != "" {
+		return sha256.Sum256([]byte(passphrase))
+	}
+	return sha256.Sum256(key[:])
+}
+
+// splitCredential decodes a rotation/restore credential argument:
+// []byte is a raw key, string is a passphrase.
+func splitCredential(v engine.Value, key *[32]byte, passphrase *string) error {
+	switch t := v.(type) {
+	case []byte:
+		if len(t) != 32 {
+			return userError("22023", "key must be 32 bytes")
+		}
+		copy(key[:], t)
+	case string:
+		if t == "" {
+			return userError("28000", "key must be non-empty")
+		}
+		*passphrase = t
+	default:
+		return userError("22023", "key must be bytes or text")
+	}
+	return nil
+}
+
+// credentialEqual reports same-form equality, plus the cross-form
+// no-op: rotating a passphrase to the raw legacy SHA-256 of that same
+// passphrase would rewrap a KDF-0 envelope under identical material.
+// A new passphrase always changes the protector, so the reverse
+// direction needs no check.
+func credentialEqual(oldKey, newKey [32]byte, oldPass, newPass string) bool {
+	if oldPass == "" && newPass == "" {
+		return oldKey == newKey
+	}
+	if oldPass != "" && newPass != "" {
+		return oldPass == newPass
+	}
+	if newPass == "" {
+		return newKey == sha256.Sum256([]byte(oldPass))
+	}
+	return false
+}
+
 var _ engine.Factory = Factory{}
 var _ engine.Database = (*database)(nil)
 
 func (Factory) Open(ctx context.Context, r engine.OpenRequest) (engine.Database, engine.OpenOutcome, error) {
 	defer clear(r.Key[:])
+	defer func() { r.Passphrase = "" }()
 	if e := ctx.Err(); e != nil {
 		return nil, 0, e
 	}
@@ -62,12 +129,13 @@ func (Factory) Open(ctx context.Context, r engine.OpenRequest) (engine.Database,
 			return nil, 0, translate(e)
 		}
 	}
-	db, e := murmur.OpenWithFlags(r.Config.Storage.DataDir, r.Key[:], options, r.Config.Replication.Tables)
+	db, e := murmur.OpenWithCredentialAndFlags(r.Config.Storage.DataDir, credentialFor(r.Config.Storage.DataDir, r.Key, r.Passphrase), options, r.Config.Replication.Tables)
 	if e != nil {
 		return nil, 0, translate(e)
 	}
-	d := &database{db: db, request: r, keyHash: sha256.Sum256(r.Key[:])}
+	d := &database{db: db, request: r, keyHash: credentialHash(r.Key, r.Passphrase)}
 	clear(d.request.Key[:])
+	d.request.Passphrase = ""
 	d.request.Config = r.Config.Snapshot()
 	if e = d.applyFlags(db); e != nil {
 		db.Close()
@@ -107,23 +175,23 @@ func (d *database) applyFlags(db *murmur.Database) error {
 	}
 	return translate(db.MarkTableConfigOwned())
 }
-func (d *database) verify(key [32]byte) error {
+func (d *database) verify(key [32]byte, passphrase string) error {
 	if d.closed || d.db == nil {
 		return translate(murmur.ErrClosed)
 	}
-	hash := sha256.Sum256(key[:])
+	hash := credentialHash(key, passphrase)
 	if subtle.ConstantTimeCompare(hash[:], d.keyHash[:]) != 1 {
 		return translate(murmur.ErrWrongKey)
 	}
 	return nil
 }
-func (d *database) Unlock(ctx context.Context, key [32]byte) error {
+func (d *database) Unlock(ctx context.Context, key [32]byte, passphrase string) error {
 	if e := ctx.Err(); e != nil {
 		return e
 	}
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return d.verify(key)
+	return d.verify(key, passphrase)
 }
 func (d *database) Close(ctx context.Context) error {
 	d.mu.Lock()
@@ -175,20 +243,29 @@ func (d *database) rotate(ctx context.Context, args []engine.Value) (engine.Resu
 		return engine.Result{}, e
 	}
 	var previous, next [32]byte
-	copy(previous[:], args[0].([]byte))
-	copy(next[:], args[1].([]byte))
-	defer clear(previous[:])
-	defer clear(next[:])
-	if e := d.verify(previous); e != nil {
+	var previousPass, nextPass string
+	if e := splitCredential(args[0], &previous, &previousPass); e != nil {
 		return engine.Result{}, e
 	}
-	if previous == next {
+	if e := splitCredential(args[1], &next, &nextPass); e != nil {
+		return engine.Result{}, e
+	}
+	defer clear(previous[:])
+	defer clear(next[:])
+	if e := d.verify(previous, previousPass); e != nil {
+		return engine.Result{}, e
+	}
+	if credentialEqual(previous, next, previousPass, nextPass) {
 		return engine.Result{}, userError("22023", "new key must differ from previous key")
 	}
-	if e := d.db.RotateMasterKey(next); e != nil {
+	cred := murmur.KeyCredential(next[:])
+	if nextPass != "" {
+		cred = murmur.PassphraseCredential(nextPass)
+	}
+	if e := d.db.RotateCredential(cred); e != nil {
 		return engine.Result{}, translate(e)
 	}
-	d.keyHash = sha256.Sum256(next[:])
+	d.keyHash = credentialHash(next, nextPass)
 	return engine.Result{Tag: "ROTATE"}, translate(d.db.Flush())
 }
 func (d *database) restore(ctx context.Context, args []engine.Value) (engine.Result, error) {
@@ -198,11 +275,17 @@ func (d *database) restore(ctx context.Context, args []engine.Value) (engine.Res
 		return engine.Result{}, e
 	}
 	var key [32]byte
-	copy(key[:], args[1].([]byte))
-	defer clear(key[:])
-	if e := d.verify(key); e != nil {
+	var passphrase string
+	if e := splitCredential(args[1], &key, &passphrase); e != nil {
 		return engine.Result{}, e
 	}
+	defer clear(key[:])
+	if e := d.verify(key, passphrase); e != nil {
+		return engine.Result{}, e
+	}
+	// The backup predates any rotation since it was taken, so select
+	// the credential against the backup envelope, not the live one.
+	cred := credentialFor(args[0].(string), key, passphrase)
 	live := filepath.Clean(d.request.Config.Storage.DataDir)
 	parent := filepath.Dir(live)
 	stage, e := os.MkdirTemp(parent, ".murmur-restoring-*")
@@ -211,7 +294,7 @@ func (d *database) restore(ctx context.Context, args []engine.Value) (engine.Res
 	}
 	os.Remove(stage)
 	defer os.RemoveAll(stage)
-	if e = murmur.Restore(args[0].(string), stage, key[:]); e != nil {
+	if e = murmur.RestoreWithCredential(args[0].(string), stage, cred); e != nil {
 		return engine.Result{}, translate(e)
 	}
 	d.cfgMu.Lock()
@@ -224,7 +307,7 @@ func (d *database) restore(ctx context.Context, args []engine.Value) (engine.Res
 	// Validate the restored store without binding the live node's peer listener.
 	trialOptions := options
 	trialOptions.Replication = nil
-	trial, e := murmur.OpenWithFlags(stage, key[:], trialOptions, cfg.Replication.Tables)
+	trial, e := murmur.OpenWithCredentialAndFlags(stage, cred, trialOptions, cfg.Replication.Tables)
 	if e != nil {
 		return engine.Result{}, translate(e)
 	}
@@ -238,7 +321,7 @@ func (d *database) restore(ctx context.Context, args []engine.Value) (engine.Res
 	d.db = nil
 	replaced := filepath.Join(parent, "."+filepath.Base(live)+".replaced-"+time.Now().UTC().Format("20060102-150405.000000000"))
 	reopen := func() error {
-		db, err := murmur.OpenWithFlags(live, key[:], options, cfg.Replication.Tables)
+		db, err := murmur.OpenWithCredentialAndFlags(live, cred, options, cfg.Replication.Tables)
 		if err != nil {
 			return err
 		}

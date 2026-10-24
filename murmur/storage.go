@@ -392,8 +392,12 @@ type Work struct {
 	BarrierReply   chan<- error
 	RetryReply     chan<- error
 	RotateReply    chan<- error
-	MasterKey      []byte
-	StopReply      chan<- error
+	// MasterKey and Passphrase carry the new envelope credential for
+	// WorkRotateMasterKey: exactly one must be set. The worker wipes
+	// MasterKey bytes after use; Passphrase strings are dropped.
+	MasterKey  []byte
+	Passphrase string
+	StopReply  chan<- error
 }
 
 // Opened is an open storage handle owned by the worker thread.
@@ -436,8 +440,13 @@ type StatusState struct {
 }
 
 func spoolOptions(path string, key []byte, o *Options) spool.Options {
+	return spoolOptionsWithCredential(path, KeyCredential(key), o)
+}
+
+func spoolOptionsWithCredential(path string, cred Credential, o *Options) spool.Options {
 	opts := spool.DefaultOptions(path)
-	opts.MasterKey = append([]byte(nil), key...)
+	opts.MasterKey = append([]byte(nil), cred.Key...)
+	opts.Passphrase = cred.Passphrase
 	opts.TargetBlockBytes = o.SpoolBlockBytes
 	opts.ReadCacheBytes = o.SpoolCacheBytes
 	opts.Codec = compression.MustZstd(o.CompressionLevel)
@@ -656,9 +665,13 @@ func sqlArg(v Value) any {
 
 // OpenStorage opens (or creates) the storage handle.
 func OpenStorage(path string, key []byte, o *Options, progress *OpenProgressReporter) (*Opened, error) {
+	return OpenStorageWithCredential(path, KeyCredential(key), o, progress)
+}
+
+func OpenStorageWithCredential(path string, cred Credential, o *Options, progress *OpenProgressReporter) (*Opened, error) {
 	progress.Phase(PhaseOpening)
-	if len(key) != 32 {
-		return nil, invalidErr("application key must be 32 bytes")
+	if err := cred.validate(); err != nil {
+		return nil, err
 	}
 	switch o.Mode {
 	case OpenCreateNew:
@@ -675,11 +688,11 @@ func OpenStorage(path string, key []byte, o *Options, progress *OpenProgressRepo
 		if err != nil || info.IsDir() {
 			return nil, invalidErr("database storage does not exist")
 		}
-		if err := spool.ValidateWrappingKey(path, key, nil, ""); err != nil {
+		if err := spool.ValidateCredential(path, cred.Key, cred.Passphrase, nil, ""); err != nil {
 			return nil, keyError(err)
 		}
 	}
-	opts := spoolOptions(path, key, o)
+	opts := spoolOptionsWithCredential(path, cred, o)
 	var history []Event
 	schema := Schema{}
 	var identity *Identity
@@ -1156,7 +1169,8 @@ func StartStorage(opened *Opened, o *Options, status *StatusState) (*spool.Store
 					}
 					reopen := *o
 					reopen.Mode = OpenExisting
-					replacement, err := OpenStorage(string(opened.Opts.Path), opened.Opts.MasterKey, &reopen, NewOpenProgressReporter(nil))
+					reopenCred := Credential{Key: opened.Opts.MasterKey, Passphrase: opened.Opts.Passphrase}
+					replacement, err := OpenStorageWithCredential(string(opened.Opts.Path), reopenCred, &reopen, NewOpenProgressReporter(nil))
 					if err != nil {
 						return err
 					}
@@ -1219,17 +1233,19 @@ func StartStorage(opened *Opened, o *Options, status *StatusState) (*spool.Store
 				var err error
 				if failed != nil {
 					err = storageErr("%s", *failed)
-				} else if rerr := opened.Store.RotateMasterKey(w.MasterKey); rerr != nil {
+				} else if rerr := opened.Store.RotateCredential(w.MasterKey, w.Passphrase); rerr != nil {
 					err = rerr
 				} else {
 					for i := range opened.Opts.MasterKey {
 						opened.Opts.MasterKey[i] = 0
 					}
 					opened.Opts.MasterKey = append([]byte(nil), w.MasterKey...)
+					opened.Opts.Passphrase = w.Passphrase
 				}
 				for i := range w.MasterKey {
 					w.MasterKey[i] = 0
 				}
+				w.Passphrase = ""
 				w.RotateReply <- err
 			case WorkBackup:
 				if failed != nil {

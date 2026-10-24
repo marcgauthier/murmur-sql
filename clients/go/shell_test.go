@@ -11,24 +11,28 @@ import (
 	"time"
 
 	"github.com/marcgauthier/murmur-sql/auth"
+	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 	"github.com/marcgauthier/murmur-sql/config"
 	"github.com/marcgauthier/murmur-sql/engine"
 	"github.com/marcgauthier/murmur-sql/server"
-	murmur "github.com/marcgauthier/murmur-sql/clients/go"
 )
 
 // This fixture returns fixed protocol results and never emulates storage.
-type protocolFixture struct{ key [32]byte }
+type protocolFixture struct {
+	key        [32]byte
+	passphrase string
+}
 
 func (f *protocolFixture) Open(ctx context.Context, r engine.OpenRequest) (engine.Database, engine.OpenOutcome, error) {
 	f.key = r.Key
+	f.passphrase = r.Passphrase
 	return f, engine.OpenedNew, nil
 }
 func (f *protocolFixture) Admin(context.Context, engine.AdminRequest) (any, error) {
 	return nil, engine.ErrUnavailable
 }
-func (f *protocolFixture) Unlock(ctx context.Context, key [32]byte) error {
-	if key != f.key {
+func (f *protocolFixture) Unlock(ctx context.Context, key [32]byte, passphrase string) error {
+	if key != f.key || passphrase != f.passphrase {
 		return &engine.Error{Code: "28000", Message: "incorrect key"}
 	}
 	return nil

@@ -24,7 +24,8 @@ in memory; `MURMUR FLUSH` waits for the engine's durability boundary.
 
 The standard library and Go project packages are preferred. The only independent
 third-party dependency is YAML parsing (`gopkg.in/yaml.v3` v3.0.1) for server
-configuration, with database passphrase derivation using standard library `crypto/sha256`.
+configuration, with database passphrase derivation using `golang.org/x/crypto`
+Argon2id (legacy stores keep the previous SHA-256 mapping until rekeyed).
 Low-level SQLite and zstd implementations are vendored directly in `murmur/third_party/`.
 
 - [Embedded Go library](murmur/README.md)

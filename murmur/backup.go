@@ -177,10 +177,14 @@ func restoreOptions() Options {
 }
 
 func verifyStoreDir(path string, key []byte) (Identity, error) {
+	return verifyStoreDirWithCredential(path, KeyCredential(key))
+}
+
+func verifyStoreDirWithCredential(path string, cred Credential) (Identity, error) {
 	var zero Identity
 	options := restoreOptions()
 	progress := NewOpenProgressReporter(nil)
-	opened, err := OpenStorage(path, key, &options, progress)
+	opened, err := OpenStorageWithCredential(path, cred, &options, progress)
 	if err != nil {
 		return zero, err
 	}
@@ -201,13 +205,19 @@ func verifyStoreDir(path string, key []byte) (Identity, error) {
 
 // RestoreBackup restores an online backup to a new live directory.
 func RestoreBackup(backup, dst string, key []byte, options *RestoreOptions) error {
-	if len(key) != 32 {
-		return invalidErr("application key must be 32 bytes")
+	return RestoreBackupWithCredential(backup, dst, KeyCredential(key), options)
+}
+
+// RestoreBackupWithCredential restores an online backup with a master
+// key or passphrase credential.
+func RestoreBackupWithCredential(backup, dst string, cred Credential, options *RestoreOptions) error {
+	if err := cred.validate(); err != nil {
+		return err
 	}
 	if !isFile(filepath.Join(backup, "manifest")) {
 		return invalidErr("backup storage does not exist")
 	}
-	if err := spool.ValidateWrappingKey(backup, key, nil, ""); err != nil {
+	if err := spool.ValidateCredential(backup, cred.Key, cred.Passphrase, nil, ""); err != nil {
 		return keyError(err)
 	}
 	if err := CopyStoreDir(backup, dst); err != nil {
@@ -216,7 +226,7 @@ func RestoreBackup(backup, dst string, key []byte, options *RestoreOptions) erro
 	step := func() error {
 		if options.NewDatabaseID != nil || options.NewNodeID != nil {
 			restoreOpts := restoreOptions()
-			opened, err := OpenStorage(dst, key, &restoreOpts, NewOpenProgressReporter(nil))
+			opened, err := OpenStorageWithCredential(dst, cred, &restoreOpts, NewOpenProgressReporter(nil))
 			if err != nil {
 				return err
 			}
@@ -234,7 +244,7 @@ func RestoreBackup(backup, dst string, key []byte, options *RestoreOptions) erro
 				return err
 			}
 		}
-		_, err := verifyStoreDir(dst, key)
+		_, err := verifyStoreDirWithCredential(dst, cred)
 		return err
 	}
 	if err := step(); err != nil {
@@ -246,13 +256,19 @@ func RestoreBackup(backup, dst string, key []byte, options *RestoreOptions) erro
 
 // VerifyBackupDir verifies a backup directory without mutating it.
 func VerifyBackupDir(backup string, key []byte) error {
-	if len(key) != 32 {
-		return invalidErr("application key must be 32 bytes")
+	return VerifyBackupDirWithCredential(backup, KeyCredential(key))
+}
+
+// VerifyBackupDirWithCredential verifies a backup directory with a
+// master key or passphrase credential, without mutating it.
+func VerifyBackupDirWithCredential(backup string, cred Credential) error {
+	if err := cred.validate(); err != nil {
+		return err
 	}
 	if !isFile(filepath.Join(backup, "manifest")) {
 		return invalidErr("backup storage does not exist")
 	}
-	if err := spool.ValidateWrappingKey(backup, key, nil, ""); err != nil {
+	if err := spool.ValidateCredential(backup, cred.Key, cred.Passphrase, nil, ""); err != nil {
 		return keyError(err)
 	}
 	parent := filepath.Dir(backup)
@@ -269,7 +285,7 @@ func VerifyBackupDir(backup string, key []byte) error {
 		if err := CopyStoreDir(backup, tmp); err != nil {
 			return err
 		}
-		_, err := verifyStoreDir(tmp, key)
+		_, err := verifyStoreDirWithCredential(tmp, cred)
 		_ = os.RemoveAll(tmp)
 		return err
 	}

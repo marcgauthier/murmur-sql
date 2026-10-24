@@ -99,7 +99,10 @@ MURMUR FLUSH;
 
 Each physical connection starts locked, even when another connection has opened
 the database. A 64-character hexadecimal unlock secret is a raw 32-byte key;
-other secrets are SHA-256 passphrases. Secrets are not written to server logs.
+other secrets are Argon2id passphrases on new stores. Stores created before
+passphrase support keep the legacy SHA-256 mapping; rotating to a passphrase
+(`MURMUR ROTATE KEY '<old>' '<new>'`) migrates the envelope to Argon2id, after
+which the legacy mapping is rejected. Secrets are not written to server logs.
 
 `$1`, `$2`, etc. are rewritten to SQLite `?1`, `?2`, etc. outside quotes and
 comments. Parameter values are passed separately, never interpolated. Simple
@@ -139,6 +142,7 @@ These command families are parsed and executed through the native adapter:
 | Diagnostics | `MURMUR SHOW STATUS`, `MURMUR SHOW METRICS SQLITE` |
 | Peer management | `MURMUR PEER ADD '127.0.0.1:9002'`, `MURMUR PEER REMOVE 'node-id'`, `MURMUR PEER RETIRE 'node-id'`, `MURMUR PEER SYNC` |
 | Replication state | `MURMUR SHOW PEERS`, `MURMUR SHOW REPLICATION`, `MURMUR SHOW RETENTION`, `MURMUR RETENTION COLLECT` |
+| Read-your-write | `MURMUR SHOW HEAD`, `MURMUR WAIT FOR 'origin' 42`, `MURMUR WAIT FOR LAG 0` |
 | Merge policies | `MURMUR POLICY COUNTER_ADD counters value 'key' 1`, `MURMUR POLICY SET_ADD tags values 'key' 'tag'` |
 | Extrema | `MURMUR POLICY MIN readings value 'key' 3`, `MURMUR POLICY MAX readings value 'key' 9` |
 | Bridge ownership | `MURMUR BRIDGE RELEASE items 'key' COLUMN name` |
@@ -148,6 +152,49 @@ These command families are parsed and executed through the native adapter:
 Vector dimensions are 1–8192, with `l2`, `cosine`, or `l1` distances. Flags accept
 true/false, on/off, yes/no, or 1/0. Non-file administration commands do not accept
 bound parameters; quote literal secrets/names with SQL single-quote escaping.
+
+## Replication lag
+
+`MURMUR SHOW PEERS` reports one row per connected peer. The lag columns
+read as follows:
+
+- `lag_txns`: worst per-origin applied deficit against this node's heads —
+  how many transactions the peer still needs to catch up. Peers that never
+  reported progress count as fully behind.
+- `origins_behind`: how many origins lag at all.
+- `last_progress_millis_ago`: age of the peer's last progress report
+  (NULL when none arrived yet).
+- `queue_messages` / `queue_available_bytes`: outbound queue depth and
+  remaining byte budget toward that peer.
+- `member_state`: SWIM membership view of the peer
+  (`alive`, `suspect`, `dead`, `left`, `unknown`).
+
+Suggested SLO: warn when any peer exceeds 30 seconds without progress or
+10,000 transactions behind. Act before the peer stays offline past
+`maximum_offline`: retention collection protects connected peers, but a
+peer offline past that bound loses its retained tail and must resync
+from a full snapshot.
+
+## Read-your-write
+
+Replication is asynchronous: a write flushed on one node is not instantly
+readable on another. The read-your-write recipe closes the gap:
+
+```sql
+-- on the writer, after MURMUR FLUSH:
+MURMUR SHOW HEAD;            -- origin, applied per origin; note yours
+-- on the reader:
+MURMUR WAIT FOR 'writer-origin-hex' 42;  -- blocks until applied >= 42
+SELECT ...;                  -- the write is visible
+```
+
+`MURMUR WAIT FOR LAG 0` instead waits until this node is within the
+bound of everything its peers observed (bounded staleness with no
+cursor to carry). Both accept `TIMEOUT <seconds>` (default 30);
+expiry reports `57014`. Waiting for a retired origin fails fast with
+`22023` instead of hanging. Heads resolve within about a second, so
+sub-second timeouts may expire on a healthy cluster; prefer generous
+timeouts and let the wait return early.
 
 ## Files over PostgreSQL SQL
 
@@ -234,18 +281,32 @@ bin/murmur-admin verify ./data --backup --key-hex <64-hex>
 bin/murmur-admin restore ./backup ./restored --fresh-node-id --passphrase example
 ```
 
-`--key-hex` takes precedence over `--passphrase`. Admin passphrases are always
-SHA-256 hashed, including strings containing exactly 64 hexadecimal characters.
-Without either option, the Rust development key is selected and a message is
-printed to stderr. `--fresh-node-id[=<32-hex>]` and
-`--fresh-db-id[=<32-hex>]` assign explicit or random identities.
+Set exactly one of `--key-hex` and `--passphrase`. A 64-character
+hexadecimal `--passphrase` is a raw key, matching SQL; other passphrases
+take the store's envelope KDF (Argon2id, or the legacy SHA-256 mapping on
+pre-migration stores). Without either option, the Rust development key is
+selected and a message is printed to stderr. `--fresh-node-id[=<32-hex>]`
+and `--fresh-db-id[=<32-hex>]` assign explicit or random identities.
 `hash-password` reads one line from stdin when `--password` is omitted.
 
-`status`, `inspect`, `verify`, `backup`, `restore`, and `keys` use the native
-engine. Run offline administration against a stopped server's data directory.
-SQL passphrases use SHA-256 key derivation; the sibling engine's standalone
-admin CLI uses a different passphrase convention. Use this repository's admin
-binary or an explicit raw key when working with databases created through SQL.
+`status`, `inspect`, `verify`, `backup`, `restore`, `keys`, and `rekey` use
+the native engine. Run offline administration against a stopped server's
+data directory. `rekey` re-protects the store under `--new-key-hex` or
+`--new-passphrase` and reports the resulting envelope KDF:
+
+```sh
+bin/murmur-admin rekey ./data --passphrase old-secret --new-passphrase new-secret
+```
+
+Migration notes: databases created through SQL before passphrase support
+open with the same secret (legacy mapping) and migrate on the first
+rotation to a passphrase, whether via `MURMUR ROTATE KEY` or `rekey`. A
+pre-migration store whose `--passphrase` was exactly 64 hex characters was
+protected by the SHA-256 of that string; open it once with
+`--key-hex <sha256-of-that-string>` and `rekey` it. The sibling engine's
+standalone admin CLI uses a different passphrase convention; use this
+repository's admin binary or an explicit raw key when working with
+databases created through SQL.
 
 ## Logs and services
 

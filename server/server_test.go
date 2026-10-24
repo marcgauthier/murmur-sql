@@ -34,6 +34,7 @@ import (
 type fixtureEngine struct {
 	mu             sync.Mutex
 	key            [32]byte
+	passphrase     string
 	opened, closed bool
 	writes         int
 	disconnected   []uint64
@@ -48,16 +49,17 @@ func (f *fixtureEngine) Open(ctx context.Context, r engine.OpenRequest) (engine.
 	defer f.mu.Unlock()
 	f.opened = true
 	f.key = r.Key
+	f.passphrase = r.Passphrase
 	f.sink = r.TableFlagsSink
 	return f, engine.OpenedNew, nil
 }
 func (f *fixtureEngine) Admin(context.Context, engine.AdminRequest) (any, error) {
 	return nil, engine.ErrUnavailable
 }
-func (f *fixtureEngine) Unlock(ctx context.Context, k [32]byte) error {
+func (f *fixtureEngine) Unlock(ctx context.Context, k [32]byte, passphrase string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if k != f.key {
+	if k != f.key || passphrase != f.passphrase {
 		return sqlError("28000", "incorrect key")
 	}
 	return nil

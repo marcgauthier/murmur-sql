@@ -27,9 +27,11 @@ commands:
   backup <data-dir> <dest-dir>
   restore <backup-dir> <dest-dir>
   keys <data-dir>
+  rekey <data-dir> --new-passphrase <value> | --new-key-hex <64-hex>
   hash-password [--password <value>]  (reads stdin when omitted)
 options:
   --json --passphrase <value> --key-hex <64-hex>
+  --new-passphrase <value> --new-key-hex <64-hex>
   --fresh-node-id[=<32-hex>] --fresh-db-id[=<32-hex>]
   -h, --help  -v, --version
 `
@@ -122,7 +124,7 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 	}
 	var positional []string
 	jsonOut := false
-	var passphrase, password, keyHex *string
+	var passphrase, password, keyHex, newPassphrase, newKeyHex *string
 	request := engine.AdminRequest{}
 	for i := 0; i < len(args); i++ {
 		name, value, equal := strings.Cut(args[i], "=")
@@ -137,7 +139,7 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 			jsonOut = true
 		case "--backup":
 			request.Backup = true
-		case "--password", "--passphrase", "--key-hex":
+		case "--password", "--passphrase", "--key-hex", "--new-passphrase", "--new-key-hex":
 			v, e := option(args, &i, name)
 			if e != nil {
 				fmt.Fprintln(errOut, e)
@@ -150,6 +152,10 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 				passphrase = &v
 			case "--key-hex":
 				keyHex = &v
+			case "--new-passphrase":
+				newPassphrase = &v
+			case "--new-key-hex":
+				newKeyHex = &v
 			}
 		case "--fresh-node-id", "--fresh-db-id":
 			var id [16]byte
@@ -214,7 +220,7 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 	}
 	n := 2
 	switch op {
-	case "status", "inspect", "verify", "keys":
+	case "status", "inspect", "verify", "keys", "rekey":
 	case "backup", "restore":
 		n = 3
 	default:
@@ -230,6 +236,10 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 	if n == 3 {
 		request.Destination = positional[2]
 	}
+	if keyHex != nil && passphrase != nil {
+		fmt.Fprintln(errOut, "set exactly one of --key-hex and --passphrase")
+		return 1
+	}
 	if keyHex != nil {
 		b, e := hex.DecodeString(strings.TrimSpace(*keyHex))
 		if e != nil || len(b) != 32 {
@@ -239,12 +249,42 @@ func Admin(ctx context.Context, args []string, in io.Reader, out, errOut io.Writ
 		copy(request.Key[:], b)
 		clear(b)
 	} else if passphrase != nil {
-		request.Key = auth.ResolvePassphrase(*passphrase)
+		// Unified with SQL: a 64-hex secret is always a raw key.
+		if auth.IsRawKey(*passphrase) {
+			request.Key = auth.ResolveKey(*passphrase)
+		} else {
+			request.Passphrase = *passphrase
+		}
 	} else {
 		copy(request.Key[:], "0123456789abcdef0123456789abcdef")
 		fmt.Fprintln(errOut, "warning: no --key-hex or --passphrase given; using the built-in development key")
 	}
 	defer clear(request.Key[:])
+	defer func() { request.Passphrase = "" }()
+	if op == "rekey" {
+		if (newKeyHex != nil) == (newPassphrase != nil) {
+			fmt.Fprintln(errOut, "rekey needs exactly one of --new-key-hex and --new-passphrase")
+			return 1
+		}
+		if newKeyHex != nil {
+			b, e := hex.DecodeString(strings.TrimSpace(*newKeyHex))
+			if e != nil || len(b) != 32 {
+				fmt.Fprintln(errOut, "new-key-hex must be exactly 32 bytes (64 hex characters)")
+				return 1
+			}
+			copy(request.NewKey[:], b)
+			clear(b)
+		} else if auth.IsRawKey(*newPassphrase) {
+			request.NewKey = auth.ResolveKey(*newPassphrase)
+		} else {
+			request.NewPassphrase = *newPassphrase
+		}
+		defer clear(request.NewKey[:])
+		defer func() { request.NewPassphrase = "" }()
+	} else if newKeyHex != nil || newPassphrase != nil {
+		fmt.Fprintln(errOut, "--new-key-hex and --new-passphrase need the rekey command")
+		return 1
+	}
 	result, e := f.Admin(ctx, request)
 	if e != nil && result == nil {
 		fmt.Fprintln(errOut, e)
