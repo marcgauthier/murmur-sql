@@ -103,6 +103,8 @@ const (
 	PolicySet
 	PolicyMin
 	PolicyMax
+	PolicyJson
+	PolicyList
 )
 
 // MergePolicy* aliases for the replication-facing policy names.
@@ -112,6 +114,8 @@ const (
 	MergePolicySet     = PolicySet
 	MergePolicyMin     = PolicyMin
 	MergePolicyMax     = PolicyMax
+	MergePolicyJson    = PolicyJson
+	MergePolicyList    = PolicyList
 )
 
 // String renders the policy name.
@@ -127,6 +131,10 @@ func (p MergePolicy) String() string {
 		return "Min"
 	case PolicyMax:
 		return "Max"
+	case PolicyJson:
+		return "Json"
+	case PolicyList:
+		return "List"
 	}
 	return "Unknown"
 }
@@ -140,14 +148,20 @@ const (
 	PolicyOpRemove
 	PolicyOpMin
 	PolicyOpMax
+	PolicyOpJsonSet
+	PolicyOpJsonRemove
+	PolicyOpListAppend
+	PolicyOpListRemove
 )
 
-// PolicyOperation is one policy merge step: a counter delta or a
-// set/min/max operand value.
+// PolicyOperation is one policy merge step: a counter delta, a
+// set/min/max/list operand value, or a JSON path write (Path plus V,
+// or Path alone for removal).
 type PolicyOperation struct {
 	Tag   PolicyOpTag
 	Delta int64
 	V     Value
+	Path  string
 }
 
 // PolicyIntent is a pending policy merge step.

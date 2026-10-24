@@ -327,7 +327,7 @@ func (r ReplicationConfig) Validate() error {
 			return errors.New("merge policy key must be table.column")
 		}
 		switch strings.ToLower(p) {
-		case "lww", "counter", "set", "min", "max":
+		case "lww", "counter", "set", "min", "max", "json", "list":
 		default:
 			return errors.New("unknown merge policy")
 		}

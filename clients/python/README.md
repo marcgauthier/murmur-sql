@@ -45,7 +45,7 @@ with murmur.connect(murmur.Config(
 | JSON and JSONB | SQLite JSON functions through parameterized SQL |
 | Replication peers | `peer_add`, `peer_remove`, `peer_retire`, `peer_sync`, `show_peers`, `show_replication` |
 | Retention | `show_retention`, `retention_collect` |
-| CRDT policy operations | `policy_counter_add`, `policy_set_add`, `policy_set_remove`, `policy_min`, `policy_max` |
+| CRDT policy operations | `policy_counter_add`, `policy_set_add`, `policy_set_remove`, `policy_min`, `policy_max`, `policy_json_set`, `policy_json_remove`, `policy_list_append`, `policy_list_remove` |
 | Bridge ownership release | `bridge_release(table, key, column=None)` |
 
 ## Restrictions
@@ -113,6 +113,7 @@ db.policy_set_add("stats", "tags", "row-1", "blue")
 db.policy_set_remove("stats", "tags", "row-1", "blue")
 db.policy_min("stats", "lowest", "row-1", -1.5)
 db.policy_max("stats", "highest", "row-1", 42)
+db.policy_counter_add("pairs", "n", [1, "x"], 5)
 released = db.bridge_release("notes", "row-1", "title")
 ```
 

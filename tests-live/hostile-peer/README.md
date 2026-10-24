@@ -96,5 +96,5 @@ converged and responsive throughout.
 ## Run
 
 ```sh
-MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target cargo test --manifest-path tests-live/hostile-peer/Cargo.toml -- --nocapture
+MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh hostile-peer
 ```

@@ -31,8 +31,7 @@ completion, and all digests must converge without any snapshot transfer.
   in Go).
 - Harness knobs apply: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`,
-  `CARGO_TARGET_DIR`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 ## Pass criteria
 
@@ -105,6 +104,5 @@ completion, and all digests must converge without any snapshot transfer.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/txchunk-resume/Cargo.toml
+  go test -count=1 ./tests-live/txchunk-resume/
 ```

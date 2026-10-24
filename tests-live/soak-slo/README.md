@@ -8,7 +8,7 @@ transactions at most 5,000, a 512 MiB Spool budget, and no storage error.
 `MURMUR_SLO_DURATION_SECONDS` defaults to 5 seconds; the soak runner defaults
 to 7,200 seconds. `MURMUR_SLO_SETTLE_SECONDS` defaults to 30 seconds.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

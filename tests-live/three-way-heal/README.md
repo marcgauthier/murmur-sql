@@ -9,7 +9,7 @@ nodes must converge to the same exact rows and the same later conflict winner.
 `MURMUR_THREE_WAY_HEAL_ORDER` defaults to `0,1,2,3` and
 `MURMUR_THREE_WAY_HEAL_ORDER_B` to `3,2,1,0`. Both must be permutations of the
 four cross-pair links. Database work and diagnostics use SQL through
-`clients/rust`; process and peer fault controls belong to the live harness.
+the `goharness` SQL client; process and peer fault controls belong to the live harness.
 No embedded database is linked or opened by this scenario.
 
 ```sh

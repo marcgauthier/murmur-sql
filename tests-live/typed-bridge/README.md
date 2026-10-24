@@ -8,7 +8,7 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/typed-bridge/`
 Two single-node `murmur-server` clusters form the Low (exporter) and High
 (importer) bridge domains sharing one staging directory
 (`runtime/typed-bridge-low/staging/`, stream `typed-stream`). One
-`#[tokio::test]` (`typed_bridge_imports_into_native_rime`, from
+`TestTypedBridgeImportsIntoNativeRime` (from
 `TestBridgeImportsIntoNativeRIME`) proves the Go pass criteria: a typed row
 inserted on Low is exported and imported through High's typed durable path
 (`high_low::import`, with schema/column mapping and transaction
@@ -29,7 +29,7 @@ post-release value is still 1 after the restart.
 
 Standard harness knobs only (`MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
 `MURMUR_LIVE_UNLOCK_STALL_SECONDS`, `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`,
-`MURMUR_SERVER_BIN`, `CARGO_TARGET_DIR`). Convergence waits are 30 s with
+`MURMUR_SERVER_BIN`). Convergence waits are 30 s with
 50 ms polls, matching the Go timeouts.
 
 ## Deviations from the Go original
@@ -40,7 +40,7 @@ Standard harness knobs only (`MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   configs come from the harness `[replication.bridge]` rendering
   (`BridgeNodeConfig`: role/domain/directory/stream/recipient/secrets/
   trust maps); key derivation (ed25519 signer key, X25519 recipient)
-  uses scenario-local `ed25519-dalek`/`x25519-dalek` dev-dependencies
+  uses in-module `murmur/replication` `PublicKey`/`RecipientPublic`
   mirroring the product's derivation. Both domains run
   `MURMUR SET TABLE live_typed_records REPLICATED true` before any
   writes so row content enters the replication log the bridge exports.
@@ -75,6 +75,5 @@ Standard harness knobs only (`MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/typed-bridge/Cargo.toml
+  go test -count=1 ./tests-live/typed-bridge/
 ```

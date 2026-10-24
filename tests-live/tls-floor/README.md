@@ -17,19 +17,18 @@ while TLS 1.3 succeeds, and a 2-node SQL cluster converges over it.
 - Mesh positive control (marker over QUIC) is unchanged: 1 row, 60 s.
 - TLS 1.1/1.0 API negatives become one TLS-1.2-only QUIC negative (the
   boundary probe): versions pinned to exactly 1.2 so the ClientHello
-  genuinely emits it. rustls 0.23 removed TLS 1.0/1.1 entirely, so
+  genuinely emits it. quic-go exposes no TLS 1.0/1.1 API, so
   those versions are inexpressible — the 1.2 leg covers the floor.
 - Server-side-rejection proof mirrors Go's `isRemoteRejection`: the
   failure must be a peer crypto close (0x100-0x1ff), not a local build
   error and not a bare timeout — else the test fails as unproven
-  rather than passing vacuously. (Go's own quic-go stack gates such
-  dials locally, which is why Go guards QUIC via constructors; quinn
-  builds the config, so the live probe works here.)
+  rather than passing vacuously. (quic-go has no constructor rejection:
+  the probe pins `MaxVersion` to 1.2 and asserts the dial fails.)
 - TLS 1.2 API positive becomes a TLS 1.3 QUIC positive (handshake +
-  stream open). Go's negotiated-version readback has no analog: quinn
-  exposes no negotiated-version introspection, so completing against
+  stream open). Negotiated-version readback has no quic-go analog — it
+  exposes no introspection — so completing against
   a 1.3-only server is the proof.
-- Go's QUIC constructor-guard test maps to the live negative leg (the
+- The QUIC constructor-guard check maps to the live negative leg (the
   product's TLS constructors are private; the live probe is stronger).
 
 ## Pass criteria
@@ -43,6 +42,5 @@ while TLS 1.3 succeeds, and a 2-node SQL cluster converges over it.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
   cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/tls-floor/Cargo.toml
 ```

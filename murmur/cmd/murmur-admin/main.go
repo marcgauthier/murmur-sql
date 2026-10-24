@@ -6,13 +6,16 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/marcgauthier/murmur-sql/keyprovider"
 	"github.com/marcgauthier/murmur-sql/murmur"
+	"github.com/marcgauthier/murmur-sql/murmur/compression"
 	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
@@ -33,6 +36,8 @@ type globalOpts struct {
 	isBackup       bool
 	freshNodeID    *[16]byte
 	freshDBID      *[16]byte
+	maxPasses      int
+	outDir         *string
 }
 
 func (o *globalOpts) resolveCredential(dir string) (murmur.Credential, error) {
@@ -109,6 +114,8 @@ Commands:
   restore  <backup-dir> <dest-dir>         Restore backup into clean destination directory
   keys     <data-dir>                      Inspect key registry and active data keys
   rekey    <data-dir>                      Re-protect the store under a new key or passphrase
+  compact  <data-dir>                      Offline compaction (server must be stopped)
+  repair   <data-dir> [--out=<dir>]        Salvage readable records into a new directory
 
 Options:
   --json                                  Output structured JSON format
@@ -120,6 +127,8 @@ Options:
   --backup                                Treat target directory as backup archive in `+"`verify`"+`
   --fresh-node-id[=<hex>]                 Assign new node identity on restore
   --fresh-db-id[=<hex>]                   Assign new database identity on restore
+  --max-passes=<n>                        Cap compact passes (default: run until quiescent)
+  --out=<dir>                             Repair destination (default: <data-dir>.salvaged)
   -v, --version                           Print version
   -h, --help                              Print help
 `, version)
@@ -154,6 +163,37 @@ func openExistingDB(path string, cred murmur.Credential) (*murmur.Database, erro
 		return nil, fmt.Errorf("failed to open database: %v", err)
 	}
 	return db, nil
+}
+
+// offlineSpoolOptions maps an admin credential to spool open options
+// for the offline commands (compact, repair): the murmur data
+// directory is the spool directory. It mirrors murmur's storage
+// mapping (see spoolOptionsWithCredential): the zstd user codec
+// reads the store's id-128 blocks, and block/cache/segment sizing
+// matches so rewritten files keep the store's standard shape.
+// Background reclamation stays off: compact drives ReclaimStep
+// explicitly. Plaintext stores ignore key material, exactly like a
+// database open.
+func offlineSpoolOptions(dataDir string, cred murmur.Credential) spool.Options {
+	mopts := murmur.DefaultOptions()
+	opts := spool.DefaultOptions(dataDir)
+	opts.MasterKey = append([]byte(nil), cred.Key...)
+	opts.Passphrase = cred.Passphrase
+	opts.Codec = compression.MustZstd(mopts.CompressionLevel)
+	opts.TargetBlockBytes = mopts.SpoolBlockBytes
+	opts.ReadCacheBytes = mopts.SpoolCacheBytes
+	opts.Workers = mopts.StorageWorkers
+	opts.Durability = spool.DurabilitySync
+	opts.MaxSegmentSize = int64(mopts.SegmentBytes)
+	opts.ReclaimInterval = -1
+	return opts
+}
+
+// offlineCodec returns the block codec murmur stores write: repair
+// registers it for reading the source and standardizes the
+// destination on it.
+func offlineCodec() compression.Codec {
+	return compression.MustZstd(murmur.DefaultOptions().CompressionLevel)
 }
 
 func printJSON(v any) error {
@@ -697,6 +737,193 @@ func cmdRekey(dataDir string, opts *globalOpts) error {
 	return nil
 }
 
+// compact command
+
+type compactReport struct {
+	DataDir           string `json:"data_dir"`
+	Passes            int    `json:"passes"`
+	Quiesced          bool   `json:"quiesced"`
+	SegmentsBefore    uint64 `json:"segments_before"`
+	SegmentsAfter     uint64 `json:"segments_after"`
+	DiskBytesBefore   uint64 `json:"disk_bytes_before"`
+	DiskBytesAfter    uint64 `json:"disk_bytes_after"`
+	DeadRecordsBefore uint64 `json:"dead_records_before"`
+	DeadRecordsAfter  uint64 `json:"dead_records_after"`
+	LiveRecords       uint64 `json:"live_records"`
+	Compactions       uint64 `json:"compactions"`
+	ReclaimedBytes    uint64 `json:"reclaimed_bytes"`
+}
+
+func cmdCompact(dataDir string, opts *globalOpts) error {
+	if _, err := os.Stat(dataDir); err != nil {
+		return fmt.Errorf("directory does not exist: %s", dataDir)
+	}
+	if opts.maxPasses < 0 {
+		return fmt.Errorf("--max-passes must be >= 0")
+	}
+	cred, err := opts.resolveCredential(dataDir)
+	if err != nil {
+		return err
+	}
+	st, err := spool.Open(offlineSpoolOptions(dataDir, cred))
+	if err != nil {
+		if errors.Is(err, spool.ErrLocked) {
+			return fmt.Errorf("store is locked (server running?): stop the server and retry: %v", err)
+		}
+		return fmt.Errorf("failed to open store: %v", err)
+	}
+	before := st.Stats()
+	// Exclusive open (LOCK): no writer can interleave, so the
+	// until-quiescent loop provably terminates. --max-passes is
+	// an escape hatch, not the norm.
+	passes := 0
+	quiesced := false
+	for {
+		if opts.maxPasses > 0 && passes >= opts.maxPasses {
+			break
+		}
+		worked, err := st.ReclaimStep()
+		passes++
+		if err != nil {
+			_ = st.Close()
+			return fmt.Errorf("compaction pass %d failed: %v", passes, err)
+		}
+		if !worked {
+			quiesced = true
+			break
+		}
+	}
+	after := st.Stats()
+	if err := st.Close(); err != nil {
+		return fmt.Errorf("close after compact failed: %v", err)
+	}
+	var reclaimed uint64
+	if after.DiskBytes < before.DiskBytes {
+		reclaimed = before.DiskBytes - after.DiskBytes
+	}
+	report := compactReport{
+		DataDir: dataDir, Passes: passes, Quiesced: quiesced,
+		SegmentsBefore: before.Segments, SegmentsAfter: after.Segments,
+		DiskBytesBefore: before.DiskBytes, DiskBytesAfter: after.DiskBytes,
+		DeadRecordsBefore: before.DeadRecords, DeadRecordsAfter: after.DeadRecords,
+		LiveRecords: after.LiveRecords, Compactions: after.Compactions - before.Compactions,
+		ReclaimedBytes: reclaimed,
+	}
+	if opts.json {
+		return printJSON(report)
+	}
+	fmt.Println("PASS: Offline compaction complete.")
+	fmt.Printf("Data Directory:      %s\n", report.DataDir)
+	fmt.Printf("Passes:              %d (%s)\n", report.Passes, map[bool]string{true: "quiesced", false: "capped by --max-passes"}[report.Quiesced])
+	fmt.Printf("Segments:            %d -> %d\n", report.SegmentsBefore, report.SegmentsAfter)
+	fmt.Printf("Disk Bytes:          %d -> %d (reclaimed %d)\n", report.DiskBytesBefore, report.DiskBytesAfter, report.ReclaimedBytes)
+	fmt.Printf("Dead Records:        %d -> %d\n", report.DeadRecordsBefore, report.DeadRecordsAfter)
+	fmt.Printf("Live Records:        %d\n", report.LiveRecords)
+	fmt.Printf("Compactions:         %d\n", report.Compactions)
+	return nil
+}
+
+// repair command
+
+type repairGap struct {
+	File   uint64 `json:"file"`
+	Start  int64  `json:"start"`
+	End    int64  `json:"end"`
+	Reason string `json:"reason"`
+	Detail string `json:"detail"`
+}
+
+type repairReport struct {
+	SourceDir  string      `json:"source_dir"`
+	DestDir    string      `json:"dest_dir"`
+	Records    int64       `json:"records"`
+	Files      int         `json:"files"`
+	Gaps       []repairGap `json:"gaps"`
+	GapCount   int         `json:"gap_count"`
+	Verified   bool        `json:"verified"`
+	DatabaseID *string     `json:"database_id"`
+}
+
+func cmdRepair(dataDir string, opts *globalOpts) error {
+	if _, err := os.Stat(dataDir); err != nil {
+		return fmt.Errorf("directory does not exist: %s", dataDir)
+	}
+	destDir := dataDir + ".salvaged"
+	if opts.outDir != nil {
+		destDir = *opts.outDir
+	}
+	if _, err := os.Stat(destDir); err == nil {
+		return fmt.Errorf("destination path already exists: %s", destDir)
+	}
+	cred, err := opts.resolveCredential(dataDir)
+	if err != nil {
+		return err
+	}
+	zc := offlineCodec()
+	rep, err := spool.Salvage(spool.SalvageOptions{
+		SrcDir:     dataDir,
+		DestDir:    destDir,
+		MasterKey:  cred.Key,
+		Passphrase: cred.Passphrase,
+		Codecs:     []compression.Codec{zc},
+		Codec:      zc,
+	})
+	if err != nil {
+		if errors.Is(err, spool.ErrLocked) {
+			return fmt.Errorf("store is locked (server running?): stop the server and retry: %v", err)
+		}
+		return fmt.Errorf("salvage failed (destination left for forensics): %v", err)
+	}
+	gaps := make([]repairGap, 0, len(rep.Gaps))
+	for _, g := range rep.Gaps {
+		gaps = append(gaps, repairGap{
+			File: g.File, Start: g.Start, End: g.End,
+			Reason: string(g.Reason), Detail: g.Detail,
+		})
+	}
+	// Prove the salvaged store opens as a database before handing
+	// it to the operator: spool-readable is necessary, not
+	// sufficient.
+	report := repairReport{
+		SourceDir: dataDir, DestDir: destDir,
+		Records: rep.Records, Files: rep.Files, Gaps: gaps, GapCount: len(gaps),
+	}
+	db, err := openExistingDB(destDir, cred)
+	if err != nil {
+		report.Verified = false
+		if opts.json {
+			_ = printJSON(report)
+		}
+		return fmt.Errorf("salvaged store failed database verification (destination left for forensics): %v", err)
+	}
+	id := hexID(db.DatabaseID())
+	report.DatabaseID = &id
+	_ = db.Close()
+	report.Verified = true
+	if opts.json {
+		return printJSON(report)
+	}
+	if len(gaps) == 0 {
+		fmt.Println("PASS: Store salvaged with no gaps; destination verified as a database.")
+	} else {
+		fmt.Printf("PASS: Store salvaged with %d gap(s); destination verified as a database.\n", len(gaps))
+		fmt.Println("Gaps (unrecoverable source byte ranges):")
+		for _, g := range gaps {
+			end := fmt.Sprintf("%d", g.End)
+			if g.End < 0 {
+				end = "?"
+			}
+			fmt.Printf("  • segment %d bytes %d-%s (%s): %s\n", g.File, g.Start, end, g.Reason, g.Detail)
+		}
+	}
+	fmt.Printf("Source:       %s (untouched)\n", report.SourceDir)
+	fmt.Printf("Destination:  %s\n", report.DestDir)
+	fmt.Printf("Records:      %d from %d file(s)\n", report.Records, report.Files)
+	fmt.Printf("Database ID:  %s\n", *report.DatabaseID)
+	fmt.Println("Next: point the server at the destination, or move it over the source while stopped.")
+	return nil
+}
+
 func randomID16() ([16]byte, error) {
 	var id [16]byte
 	_, err := rand.Read(id[:])
@@ -787,6 +1014,27 @@ func run() int {
 				return 1
 			}
 			opts.freshDBID = &id
+		case strings.HasPrefix(arg, "--max-passes="):
+			n, err := strconv.Atoi(strings.TrimPrefix(arg, "--max-passes="))
+			if err != nil || n < 0 {
+				fmt.Fprintf(os.Stderr, "Error: --max-passes must be >= 0\n")
+				return 1
+			}
+			opts.maxPasses = n
+		case arg == "--max-passes" && i+1 < len(args):
+			i++
+			n, err := strconv.Atoi(args[i])
+			if err != nil || n < 0 {
+				fmt.Fprintf(os.Stderr, "Error: --max-passes must be >= 0\n")
+				return 1
+			}
+			opts.maxPasses = n
+		case strings.HasPrefix(arg, "--out="):
+			v := strings.TrimPrefix(arg, "--out=")
+			opts.outDir = &v
+		case arg == "--out" && i+1 < len(args):
+			i++
+			opts.outDir = &args[i]
 		default:
 			positional = append(positional, arg)
 		}
@@ -840,6 +1088,18 @@ func run() int {
 			result = fmt.Errorf("missing <data-dir>. Usage: murmur-admin rekey <data-dir> --new-passphrase <str> | --new-key-hex <hex>")
 		} else {
 			result = cmdRekey(cmdArgs[0], opts)
+		}
+	case "compact":
+		if len(cmdArgs) == 0 {
+			result = fmt.Errorf("missing <data-dir>. Usage: murmur-admin compact <data-dir> [--max-passes <n>]")
+		} else {
+			result = cmdCompact(cmdArgs[0], opts)
+		}
+	case "repair":
+		if len(cmdArgs) == 0 {
+			result = fmt.Errorf("missing <data-dir>. Usage: murmur-admin repair <data-dir> [--out <dir>]")
+		} else {
+			result = cmdRepair(cmdArgs[0], opts)
 		}
 	default:
 		result = fmt.Errorf("unknown command: %q. Run 'murmur-admin --help' for usage.", cmd)

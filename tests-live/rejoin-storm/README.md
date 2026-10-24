@@ -5,7 +5,7 @@ survivor commits and flushes 30 more SQL rows. Both stopped processes restart
 concurrently, rejoin the mesh, and must recover every acknowledged row. SQL
 status must show received replication traffic and no final replication error.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

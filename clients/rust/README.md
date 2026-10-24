@@ -49,7 +49,7 @@ exposes the raw `tokio_postgres::Client`.
 | Encrypted file transfer and cursors | `upload_file`, `download_file`, `list_files`, `search_files` (`FileCursor`) |
 | Replication peers | `peer_add`, `peer_remove`, `peer_retire`, `peer_sync`, `show_peers`, `show_replication` |
 | Retention | `show_retention`, `retention_collect` |
-| CRDT policy ops | `policy_counter_add`, `policy_set_add`, `policy_set_remove`, `policy_min`, `policy_max` (`PolicyValue`) |
+| CRDT policy ops | `policy_counter_add`, `policy_set_add`, `policy_set_remove`, `policy_min`, `policy_max`, `policy_json_set`, `policy_json_remove`, `policy_list_append`, `policy_list_remove` (`PolicyValue`, `PolicyKey` for composite keys) |
 | Bridge ownership release | `bridge_release(table, key, Option<column>) -> bool` |
 | Managed FTS and vector indexes | `set_column_fts`, `column_fts`, `set_column_vector`, `column_vectors`, `refresh_indexes` |
 | JSON and JSONB | SQLite JSON functions through parameterized SQL |

@@ -350,6 +350,10 @@ func replicationConfig(r config.ReplicationConfig) (*replication.Config, error) 
 			p = replication.PolicyMin
 		case "max":
 			p = replication.PolicyMax
+		case "json":
+			p = replication.PolicyJson
+		case "list":
+			p = replication.PolicyList
 		default:
 			p = replication.PolicyLww
 		}

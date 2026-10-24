@@ -18,6 +18,49 @@ def test_policy_literals():
     assert _literal(100.0) == "100.0"
 
 
+def test_policy_key_forms():
+    from murmur.commands import _policy_key
+    assert _policy_key("k") == ("'k'", "")
+    assert _policy_key(["a", 9, 2.5]) == ("KEY 'a' 9 2.5", "VALUE ")
+    for bad in ([], [True], 7, None):
+        with pytest.raises(ValueError):
+            _policy_key(bad)
+
+
+def test_policy_builders_render_composite_keys():
+    class Recording(murmur.Connection):
+        def __init__(self):
+            self.sent = []
+
+        def execute(self, sql, params=()):
+            self.sent.append(sql)
+            return []
+
+    db = Recording()
+    db.policy_counter_add("t", "c", "k", 1)
+    db.policy_counter_add("t", "c", ["a", 9], 1)
+    db.policy_min("t", "c", [1.5], -1)
+    db.policy_json_set("t", "c", "k", "a", 1)
+    db.policy_json_set("t", "c", ["a", 9], "b", None)
+    db.policy_json_remove("t", "c", ["a", 9], "b")
+    db.policy_list_append("t", "c", "k", 1)
+    db.policy_list_append("t", "c", ["a", 9], None)
+    db.policy_list_remove("t", "c", "k", "x")
+    assert db.sent == [
+        "MURMUR POLICY COUNTER_ADD 't' 'c' 'k' 1",
+        "MURMUR POLICY COUNTER_ADD 't' 'c' KEY 'a' 9 VALUE 1",
+        "MURMUR POLICY MIN 't' 'c' KEY 1.5 VALUE -1",
+        "MURMUR POLICY JSON_SET 't' 'c' KEY 'k' PATH 'a' VALUE 1",
+        "MURMUR POLICY JSON_SET 't' 'c' KEY 'a' 9 PATH 'b' VALUE NULL",
+        "MURMUR POLICY JSON_REMOVE 't' 'c' KEY 'a' 9 PATH 'b'",
+        "MURMUR POLICY LIST_APPEND 't' 'c' 'k' 1",
+        "MURMUR POLICY LIST_APPEND 't' 'c' KEY 'a' 9 VALUE NULL",
+        "MURMUR POLICY LIST_REMOVE 't' 'c' 'k' 'x'",
+    ]
+    with pytest.raises(ValueError):
+        db.policy_json_set("t", "c", "k", "", 1)
+
+
 class PartialWriter:
     def __init__(self):
         self.output = bytearray()

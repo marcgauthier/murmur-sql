@@ -262,17 +262,48 @@ func parseCommand(sql string) (commandSpec, error) {
 			c.types[2] = engine.Int8
 		}
 	case "POLICY":
-		if len(ts) != 6 {
-			return invalid()
-		}
 		switch upper(1) {
-		case "COUNTER_ADD", "SET_ADD", "SET_REMOVE", "MIN", "MAX":
-			take("POLICY "+upper(1), 2)
+		case "COUNTER_ADD", "SET_ADD", "SET_REMOVE", "MIN", "MAX", "JSON_SET", "JSON_REMOVE", "LIST_APPEND", "LIST_REMOVE":
 		default:
 			return invalid()
 		}
-		if upper(1) == "COUNTER_ADD" {
-			c.types[3] = engine.Int8
+		op := upper(1)
+		legacy := op != "JSON_SET" && op != "JSON_REMOVE" && len(ts) == 6
+		if legacy {
+			take("POLICY "+op, 2)
+		} else if len(ts) >= 8 && upper(4) == "KEY" && upper(len(ts)-2) == "VALUE" && op != "JSON_REMOVE" {
+			// Composite form: KEY <k1> [<k2>...] [PATH <p>] VALUE
+			// <v>. The markers are bare keywords, so quoted
+			// 'KEY'/'VALUE'/'PATH' still parse as key material.
+			// The engine resolves key arity from the table
+			// schema. JSON_SET alone takes PATH, fixed at the
+			// fourth position from the end.
+			args := append([]token{ts[2], ts[3]}, append([]token{}, ts[5:len(ts)-2]...)...)
+			if op == "JSON_SET" {
+				if len(ts) < 10 || upper(len(ts)-4) != "PATH" {
+					return invalid()
+				}
+				args = append(args[:len(args)-2], args[len(args)-1])
+			}
+			c.operation = "POLICY " + op
+			c.args = append(args, ts[len(ts)-1])
+			c.types = make([]uint32, len(c.args))
+			for i := range c.types {
+				c.types[i] = engine.Text
+			}
+		} else if op == "JSON_REMOVE" && len(ts) >= 8 && upper(4) == "KEY" && upper(len(ts)-2) == "PATH" {
+			// Removal form: KEY <k1> [<k2>...] PATH <p>.
+			c.operation = "POLICY JSON_REMOVE"
+			c.args = append(append([]token{ts[2], ts[3]}, ts[5:len(ts)-2]...), ts[len(ts)-1])
+			c.types = make([]uint32, len(c.args))
+			for i := range c.types {
+				c.types[i] = engine.Text
+			}
+		} else {
+			return invalid()
+		}
+		if op == "COUNTER_ADD" {
+			c.types[len(c.types)-1] = engine.Int8
 		}
 	case "BRIDGE":
 		if upper(1) != "RELEASE" || (len(ts) != 4 && len(ts) != 6) || (len(ts) == 6 && upper(4) != "COLUMN") {
@@ -483,6 +514,25 @@ func (c commandSpec) values(params []engine.Value) ([]engine.Value, error) {
 	return out, nil
 }
 
+// coercePolicyLiteral renders a typeless policy literal: integers,
+// then finite reals, else the text stands.
+func coercePolicyLiteral(args []engine.Value, i int) error {
+	v := args[i].(string)
+	if n, e := strconv.ParseInt(v, 10, 64); e == nil {
+		args[i] = n
+		return nil
+	}
+	f, e := strconv.ParseFloat(v, 64)
+	if e != nil {
+		return nil
+	}
+	if math.IsNaN(f) || math.IsInf(f, 0) {
+		return sqlError("22023", "policy value must be finite")
+	}
+	args[i] = f
+	return nil
+}
+
 // packSecret encodes an unlock secret for the engine: raw keys as key
 // bytes, passphrases as text. The engine selects the envelope KDF.
 func packSecret(secret string) engine.Value {
@@ -578,14 +628,21 @@ func (c commandSpec) execute(ctx context.Context, s *session, params []engine.Va
 		clear(key[:])
 		defer clearSecret(args[1])
 	case "POLICY MIN", "POLICY MAX":
-		v := args[3].(string)
-		if n, e := strconv.ParseInt(v, 10, 64); e == nil {
-			args[3] = n
-		} else if f, e := strconv.ParseFloat(v, 64); e == nil {
-			if math.IsNaN(f) || math.IsInf(f, 0) {
-				return result, sqlError("22023", "policy value must be finite")
+		if e := coercePolicyLiteral(args, len(args)-1); e != nil {
+			return result, e
+		}
+	case "POLICY JSON_SET", "POLICY LIST_APPEND", "POLICY LIST_REMOVE":
+		// JSON and list values keep quoted text textual so
+		// '{"a":"123"}' is expressible; only bare literals coerce
+		// to numbers, and a bare NULL writes null. Appends and
+		// removes coerce identically so removes match.
+		last := c.args[len(args)-1]
+		if !last.quoted && strings.EqualFold(last.value, "NULL") {
+			args[len(args)-1] = nil
+		} else if !last.quoted {
+			if e := coercePolicyLiteral(args, len(args)-1); e != nil {
+				return result, e
 			}
-			args[3] = f
 		}
 	case "BACKUP DOWNLOAD":
 		if args[1].(int64) < 0 || args[2].(int64) <= 0 || args[2].(int64) > 16<<20 {

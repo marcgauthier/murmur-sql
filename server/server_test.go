@@ -125,6 +125,8 @@ func (f *fixtureEngine) Command(ctx context.Context, id uint64, c engine.Command
 		return engine.Result{Tag: "RESTORE"}, nil
 	case "FLUSH":
 		return engine.Result{Tag: "FLUSH"}, nil
+	case "POLICY COUNTER_ADD", "POLICY SET_ADD", "POLICY SET_REMOVE", "POLICY MIN", "POLICY MAX", "POLICY JSON_SET", "POLICY JSON_REMOVE", "POLICY LIST_APPEND", "POLICY LIST_REMOVE":
+		return engine.Result{Tag: "POLICY"}, nil
 	case "ROTATE KEY":
 		match := func(v engine.Value) bool {
 			switch t := v.(type) {

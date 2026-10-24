@@ -104,25 +104,45 @@ func (d *database) Command(ctx context.Context, id uint64, c engine.Command) (en
 		err = d.db.Backup(args[0].(string))
 	case "PEER ADD", "PEER REMOVE", "PEER RETIRE", "PEER SYNC", "SHOW PEERS", "SHOW REPLICATION", "SHOW RETENTION", "SHOW HEAD", "RETENTION COLLECT", "BRIDGE RELEASE", "WAIT FOR", "WAIT FOR LAG":
 		out, err = d.replicationCommand(ctx, c)
-	case "POLICY COUNTER_ADD", "POLICY SET_ADD", "POLICY SET_REMOVE", "POLICY MIN", "POLICY MAX":
+	case "POLICY COUNTER_ADD", "POLICY SET_ADD", "POLICY SET_REMOVE", "POLICY MIN", "POLICY MAX", "POLICY JSON_SET", "POLICY JSON_REMOVE", "POLICY LIST_APPEND", "POLICY LIST_REMOVE":
 		if d.db.Replication() == nil {
 			return out, userError("55000", "replication is not enabled")
 		}
 		out.Tag = "POLICY"
+		key, rest, e := d.policyKey(c.Operation, c.Arguments)
+		if e != nil {
+			return out, e
+		}
 		_, err = d.db.Transaction(func(sql *murmur.Sql) (any, error) {
-			table, column, key := args[0].(string), args[1].(string), []murmur.Value{murmur.TextValue(args[2].(string))}
+			table, column := args[0].(string), args[1].(string)
 			var e error
 			switch c.Operation {
 			case "POLICY COUNTER_ADD":
-				e = sql.CounterAdd(table, key, column, args[3].(int64))
+				e = sql.CounterAdd(table, key, column, rest[0].(int64))
 			case "POLICY SET_ADD":
-				e = sql.SetAdd(table, key, column, murmur.TextValue(args[3].(string)))
+				e = sql.SetAdd(table, key, column, murmur.TextValue(rest[0].(string)))
 			case "POLICY SET_REMOVE":
-				e = sql.SetRemove(table, key, column, murmur.TextValue(args[3].(string)))
+				e = sql.SetRemove(table, key, column, murmur.TextValue(rest[0].(string)))
 			case "POLICY MIN":
-				e = sql.Min(table, key, column, policyValue(args[3]))
+				e = sql.Min(table, key, column, policyValue(rest[0]))
 			case "POLICY MAX":
-				e = sql.Max(table, key, column, policyValue(args[3]))
+				e = sql.Max(table, key, column, policyValue(rest[0]))
+			case "POLICY JSON_SET":
+				path, ok := rest[0].(string)
+				if !ok {
+					return nil, userError("22023", "json path must be text")
+				}
+				e = sql.JsonSet(table, key, column, path, policyValue(rest[1]))
+			case "POLICY JSON_REMOVE":
+				path, ok := rest[0].(string)
+				if !ok {
+					return nil, userError("22023", "json path must be text")
+				}
+				e = sql.JsonRemove(table, key, column, path)
+			case "POLICY LIST_APPEND":
+				e = sql.ListAppend(table, key, column, policyValue(rest[0]))
+			case "POLICY LIST_REMOVE":
+				e = sql.ListRemove(table, key, column, policyValue(rest[0]))
 			}
 			return nil, e
 		})
@@ -144,6 +164,52 @@ func policyValue(v any) murmur.Value {
 		return murmur.TextValue(v)
 	}
 	return murmur.NullValue()
+}
+
+// policyKey resolves a policy command's key components against the table
+// schema: arity must cover the table key, and each wire string coerces
+// by its key column's declared type. Already-typed components pass
+// through as the caller's explicit choice. The trailing arguments past
+// the key are returned for the operation: [value], or [path, value]
+// for JSON_SET and [path] for JSON_REMOVE.
+func (d *database) policyKey(op string, args []engine.Value) ([]murmur.Value, []engine.Value, error) {
+	schema, e := d.db.Schema()
+	if e != nil {
+		return nil, nil, translate(e)
+	}
+	table := args[0].(string)
+	var t *murmur.Table
+	for i := range schema.Tables {
+		if schema.Tables[i].Name == table {
+			t = &schema.Tables[i]
+			break
+		}
+	}
+	if t == nil {
+		return nil, nil, translate(murmur.ErrSchemaMismatch)
+	}
+	cols := murmur.ApplicationColumns(t)
+	want := 1
+	switch op {
+	case "POLICY JSON_SET":
+		want = 2
+	}
+	if len(args)-2-len(cols) != want {
+		return nil, nil, userError("22023", fmt.Sprintf("%s on %s wants %d key components", op, table, len(cols)))
+	}
+	key := make([]murmur.Value, len(cols))
+	for i, c := range cols {
+		v := args[2+i]
+		if s, ok := v.(string); ok {
+			var e error
+			if key[i], e = murmur.CoerceKeyValue(c, s); e != nil {
+				return nil, nil, translate(e)
+			}
+			continue
+		}
+		key[i] = policyValue(v)
+	}
+	return key, args[2+len(cols):], nil
 }
 func sat(n uint64) int64 {
 	if n > math.MaxInt64 {

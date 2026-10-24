@@ -4,7 +4,7 @@ Two tests verify forwarding along a three-node chain with exact peer counts
 (1, 2, 1) and no direct endpoint link, and automatic seed-based discovery into a
 full mesh. SQL inserts from multiple origins must converge to exact ordered rows.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

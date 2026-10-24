@@ -48,6 +48,5 @@ converges with every node at the new epoch.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
   cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/migration-crash/Cargo.toml
 ```

@@ -84,7 +84,7 @@ honest snapshot path with bit-identical digests.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/corrupt-snapshot/Cargo.toml
+go test -count=1 ./tests-live/corrupt-snapshot/
 ```
 
 The raw-QUIC attacker is the shared harness fixture

@@ -45,20 +45,18 @@ Convergence waits are 30 s with 50 ms polls, matching the Go timeouts.
   is the row identity. The table is flagged replicated on each node before
   any row exists.
 - OR_SET projections decode from the stored blob (`\x<hex>` over the
-  simple protocol, hex-decoded, then postcard-decoded with a test-only
-  mirror of the product `Value` enum, same variant order); the harness
+  simple protocol, hex-decoded, then decoded with `murmur.DecodeValues`); the harness
   exposes no set-projection read API.
 - `UnlockNode` + `WaitNodeReady` after `StartNode` collapse into the harness
   `start_node` (same dir + key respawn under the unlock watchdog); QUIC/mTLS
   and the origin-key trust the Go README mentions are provisioned by the
-  harness (`rcgen` CA + per-node certs, mutual `trusted_origins`).
+  harness (stdlib-x509 CA + per-node certs, mutual `trusted_origins`).
 - The node 2 restart rebinds fresh ports, so the 1 <-> 2 edges are
-  re-added explicitly after `start_node` (peers still dial the old
-  address otherwise), followed by `sync_all` to hurry convergence.
+  re-added explicitly after `StartNode` (peers still dial the old
+  address otherwise), followed by `SyncAll` to hurry convergence.
 
 ## Compile gate (only gate; never run)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/merge-policies/Cargo.toml
+  go test -count=1 ./tests-live/merge-policies/
 ```

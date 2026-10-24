@@ -145,6 +145,9 @@ These command families are parsed and executed through the native adapter:
 | Read-your-write | `MURMUR SHOW HEAD`, `MURMUR WAIT FOR 'origin' 42`, `MURMUR WAIT FOR LAG 0` |
 | Merge policies | `MURMUR POLICY COUNTER_ADD counters value 'key' 1`, `MURMUR POLICY SET_ADD tags values 'key' 'tag'` |
 | Extrema | `MURMUR POLICY MIN readings value 'key' 3`, `MURMUR POLICY MAX readings value 'key' 9` |
+| Composite policy keys | `MURMUR POLICY COUNTER_ADD pairs n KEY 1 'x' VALUE 5` (one component per key column, typed by column) |
+| JSON merge | `MURMUR POLICY JSON_SET docs doc KEY 'd1' PATH 'a' VALUE 1`, `MURMUR POLICY JSON_REMOVE docs doc KEY 'd1' PATH 'a'` (bare `NULL` writes JSON null; quoted numerics stay text) |
+| List merge | `MURMUR POLICY LIST_APPEND nums list 'n1' 2`, `MURMUR POLICY LIST_REMOVE nums list KEY 'n1' VALUE 2` (removes drop every matching element; `NULL` matches JSON null; duplicates survive appends) |
 | Bridge ownership | `MURMUR BRIDGE RELEASE items 'key' COLUMN name` |
 | Key rotation | `MURMUR ROTATE KEY 'previous' 'new'`, `MURMUR ROTATE DATA KEY`, `MURMUR SHOW KEYS`, `MURMUR PRUNE KEYS` |
 | Backups | `MURMUR BACKUP SAVE`, `MURMUR BACKUP LIST`, `MURMUR RESTORE FROM 'name.murmur-backup' KEY 'secret'` |
@@ -152,6 +155,18 @@ These command families are parsed and executed through the native adapter:
 Vector dimensions are 1–8192, with `l2`, `cosine`, or `l1` distances. Flags accept
 true/false, on/off, yes/no, or 1/0. Non-file administration commands do not accept
 bound parameters; quote literal secrets/names with SQL single-quote escaping.
+
+### Merge policy semantics
+
+Policy columns are declared in configuration (`merge_policies` maps
+`table.column` to `counter`, `set`, `min`, `max`, or `json`); policies
+for tables created later attach on migration. Direct SQL writes to a
+policy column fail: use the `POLICY` ops. `json` columns hold flat
+objects of int/real/text/null values and project canonical JSON text
+(sorted keys). Concurrent writes to different paths union; concurrent
+writes to one path resolve deterministically to the same value on
+every node. A remove retires what it observed: an unobserved
+concurrent write survives, and a later write revives the path.
 
 ### Rotation sessions and rollback
 
@@ -314,6 +329,31 @@ data directory. `rekey` re-protects the store under `--new-key-hex` or
 ```sh
 bin/murmur-admin rekey ./data --passphrase old-secret --new-passphrase new-secret
 ```
+
+`compact` and `repair` are the offline storage-maintenance commands. Both
+refuse to run while the server holds the store (the LOCK file) and take
+the same credential flags as every other command:
+
+```sh
+bin/murmur-admin compact ./data --passphrase example
+bin/murmur-admin repair ./data --out ./data.fixed --passphrase example
+```
+
+`compact` rewrites the store in place until no pass reclaims anything
+(`--max-passes` caps the loop; the default runs to quiescence) and
+reports segment, byte, and dead-record counts before and after. Run it
+after bulk deletes or heavy update churn that the 30s background
+reclaimer has not caught up with.
+
+`repair` salvages a damaged store into a new directory (default
+`<data-dir>.salvaged`, which must not exist) and never modifies the
+source. Every authenticated record keeps its sequence; byte ranges that
+fail framing or authentication become gaps, listed with segment id,
+offsets, and cause (`corrupt`, `auth`, `torn-tail`, `incomplete-group`,
+`missing-file`). The destination is opened as a database before repair
+succeeds, so a PASS means the output is usable; with gaps, compare row
+counts against a backup before promoting it. A wrong key fails the run
+without writing anything: gaps never mean "wrong key".
 
 Migration notes: databases created through SQL before passphrase support
 open with the same secret (legacy mapping) and migrate on the first

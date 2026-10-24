@@ -152,7 +152,10 @@ func TestPolicyOperations(t *testing.T) {
 		"    \"stats.count\": \"counter\"\n" +
 		"    \"stats.tags\": \"set\"\n" +
 		"    \"stats.highest\": \"max\"\n" +
-		"    \"stats.lowest\": \"min\"\n"
+		"    \"stats.lowest\": \"min\"\n" +
+		"    \"pairs.n\": \"counter\"\n" +
+		"    \"docs.doc\": \"json\"\n" +
+		"    \"nums.list\": \"list\"\n"
 	_, dbs, _ := meshDBs(t, []string{dir}, policies)
 	db := dbs[0]
 	if _, err := db.ExecContext(ctx, `CREATE TABLE stats(key TEXT NOT NULL PRIMARY KEY,
@@ -195,6 +198,88 @@ func TestPolicyOperations(t *testing.T) {
 	}
 	if _, err := db.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'stats' 'count' 'missing' 1"); codeOf(err) != "02000" {
 		t.Fatalf("missing: code = %q, want 02000 (%v)", codeOf(err), err)
+	}
+	if _, err := db.ExecContext(ctx, `CREATE TABLE pairs(a INTEGER NOT NULL, b TEXT NOT NULL,
+		n INTEGER NOT NULL, PRIMARY KEY (a, b))`); err != nil {
+		t.Fatalf("create pairs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO pairs VALUES ($1, $2, $3)", 1, "x", 10); err != nil {
+		t.Fatalf("insert pairs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'pairs' 'n' KEY 1 'x' VALUE 5"); err != nil {
+		t.Fatalf("composite: %v", err)
+	}
+	var n int64
+	if err := db.QueryRowContext(ctx, "SELECT n FROM pairs WHERE a = $1 AND b = $2", 1, "x").Scan(&n); err != nil {
+		t.Fatalf("select pairs: %v", err)
+	}
+	if n != 15 {
+		t.Fatalf("pairs.n = %d, want 15", n)
+	}
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY COUNTER_ADD 'pairs' 'n' KEY 1 VALUE 1"); codeOf(err) != "22023" {
+		t.Fatalf("short key: code = %q, want 22023 (%v)", codeOf(err), err)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE docs(key TEXT NOT NULL PRIMARY KEY, doc TEXT)"); err != nil {
+		t.Fatalf("create docs: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO docs VALUES ($1, NULL)", "d1"); err != nil {
+		t.Fatalf("insert docs: %v", err)
+	}
+	for _, stmt := range []string{
+		"MURMUR POLICY JSON_SET 'docs' 'doc' KEY 'd1' PATH 'b' VALUE 'x'",
+		"MURMUR POLICY JSON_SET 'docs' 'doc' KEY 'd1' PATH 'a' VALUE 1",
+		"MURMUR POLICY JSON_SET 'docs' 'doc' KEY 'd1' PATH 'z' VALUE NULL",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("json set: %v (%s)", err, stmt)
+		}
+	}
+	var doc string
+	if err := db.QueryRowContext(ctx, "SELECT doc FROM docs WHERE key = $1", "d1").Scan(&doc); err != nil {
+		t.Fatalf("select docs: %v", err)
+	}
+	if doc != `{"a":1,"b":"x","z":null}` {
+		t.Fatalf("doc = %s", doc)
+	}
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY JSON_REMOVE 'docs' 'doc' KEY 'd1' PATH 'b'"); err != nil {
+		t.Fatalf("json remove: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT doc FROM docs WHERE key = $1", "d1").Scan(&doc); err != nil {
+		t.Fatalf("select docs: %v", err)
+	}
+	if doc != `{"a":1,"z":null}` {
+		t.Fatalf("doc = %s", doc)
+	}
+	if _, err := db.ExecContext(ctx, "CREATE TABLE nums(key TEXT NOT NULL PRIMARY KEY, list TEXT)"); err != nil {
+		t.Fatalf("create nums: %v", err)
+	}
+	if _, err := db.ExecContext(ctx, "INSERT INTO nums VALUES ($1, NULL)", "n1"); err != nil {
+		t.Fatalf("insert nums: %v", err)
+	}
+	for _, stmt := range []string{
+		"MURMUR POLICY LIST_APPEND 'nums' 'list' 'n1' 2",
+		"MURMUR POLICY LIST_APPEND 'nums' 'list' KEY 'n1' VALUE 'x'",
+		"MURMUR POLICY LIST_APPEND 'nums' 'list' 'n1' 2",
+	} {
+		if _, err := db.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("list append: %v (%s)", err, stmt)
+		}
+	}
+	var list string
+	if err := db.QueryRowContext(ctx, "SELECT list FROM nums WHERE key = $1", "n1").Scan(&list); err != nil {
+		t.Fatalf("select nums: %v", err)
+	}
+	if list != `[2,"x",2]` {
+		t.Fatalf("list = %s", list)
+	}
+	if _, err := db.ExecContext(ctx, "MURMUR POLICY LIST_REMOVE 'nums' 'list' KEY 'n1' VALUE 2"); err != nil {
+		t.Fatalf("list remove: %v", err)
+	}
+	if err := db.QueryRowContext(ctx, "SELECT list FROM nums WHERE key = $1", "n1").Scan(&list); err != nil {
+		t.Fatalf("select nums: %v", err)
+	}
+	if list != `["x"]` {
+		t.Fatalf("list = %s", list)
 	}
 }
 

@@ -78,6 +78,5 @@ Convergence waits are 20 s with 50 ms polls, matching the Go
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/files-soak/Cargo.toml
+  go test -count=1 ./tests-live/files-soak/
 ```

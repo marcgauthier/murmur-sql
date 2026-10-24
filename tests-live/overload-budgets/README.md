@@ -34,13 +34,12 @@ insert latency under 10 s while both nodes stay responsive.
   HTTP API; the table is explicitly flagged replicated on each node, and the
   convergence digest is a sorted `Debug` row dump rather than a SHA-256 over
   ordered lines (same criterion: identical ordered row sets).
-- The 8 blast writers are borrowed async futures inside one
-  `tokio::join!` (no thread scope); per-insert latencies aggregate the
+- The 8 blast writers are goroutines inside one `WaitGroup`; per-insert latencies aggregate the
   same p99 bound.
-- Each blast writer flushes every 10 inserts: Rust session capture can
+- Each blast writer flushes every 10 inserts: session capture can
   combine pending transactions, so the 400 unflushed rows would sign as
-  one capture past the 64 KiB replication budget (`58000`), while Go
-  captures per HTTP write. The flush restores Go's per-write capture
+  one capture past the 64 KiB replication budget (`58000`), while the archive
+  suite captured per HTTP write. The flush restores per-write capture
   granularity; the post-rejection probe retries replayable `40001`
   pressure per the documented back-off-and-retry contract.
 - `WaitNodeReady` maps to a `MURMUR SHOW REPLICATION` peer-count plus
@@ -50,8 +49,7 @@ insert latency under 10 s while both nodes stay responsive.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/overload-budgets/Cargo.toml
+  go test -count=1 ./tests-live/overload-budgets/
 ```
 
 ## Env knobs

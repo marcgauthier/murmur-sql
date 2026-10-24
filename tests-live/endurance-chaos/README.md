@@ -141,9 +141,9 @@ Transient write errors during chaos are counted, never fatal.
   GC-specific `spedsql_gc_failures_total` under chaos.
 - Spool pressure comes from `MURMUR SHOW METRICS SPOOL` (`disk_bytes`);
   mesh membership from `MURMUR SHOW PEERS` (connected rows per node).
-- Writers, the status sampler, and the disk cycler run as tokio tasks
-  sharing the cluster through one async mutex; the director runs on
-  the test task. Every cluster touch locks, and each write re-checks
+- Writers, the status sampler, and the disk cycler run as goroutines
+  sharing the cluster through one mutex; the director runs on the
+  test goroutine. Every cluster touch locks, and each write re-checks
   its target's alive flag under the same lock, so lifecycle
   (stop/start) and reads never race (this replaces the old shared
   `Database` handle table, which has no multi-process equivalent).
@@ -156,6 +156,5 @@ Transient write errors during chaos are counted, never fatal.
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/endurance-chaos/Cargo.toml
+  go test -count=1 ./tests-live/endurance-chaos/
 ```

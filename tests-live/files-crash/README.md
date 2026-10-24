@@ -107,6 +107,5 @@ post-crash fetch wait alone is 90 s (deviation below).
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/files-crash/Cargo.toml
+  go test -count=1 ./tests-live/files-crash/
 ```

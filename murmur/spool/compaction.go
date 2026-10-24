@@ -52,16 +52,33 @@ func (s *Store) LastReclaimErr() error {
 // is below CompactionMinFreeBytes. Tombstone drops and dead-file
 // deletion always run: they are cheap and free space.
 func (s *Store) Reclaim() error {
+	_, err := s.reclaimPass()
+	return err
+}
+
+// ReclaimStep runs a single reclamation pass like Reclaim and
+// reports whether the pass did any work: dropped tombstones,
+// deleted dead files, or rewrote a segment. Offline compaction
+// loops it until it reports no work, which is a fixed point: with
+// no concurrent writers, a pass that changes nothing leaves the
+// store in a state where every later pass also changes nothing, so
+// the loop terminates. Under concurrent writers new garbage can
+// arrive between passes; cap the loop.
+func (s *Store) ReclaimStep() (bool, error) {
+	return s.reclaimPass()
+}
+
+func (s *Store) reclaimPass() (bool, error) {
 	s.reclaimMu.Lock()
 	defer s.reclaimMu.Unlock()
 	if s.closed.Load() {
-		return ErrClosed
+		return false, ErrClosed
 	}
 	if err := s.checkTerminal(); err != nil {
-		return err
+		return false, err
 	}
 	if err := s.checkMaint(); err != nil {
-		return err
+		return false, err
 	}
 	start := time.Now()
 	defer func() {
@@ -75,30 +92,40 @@ func (s *Store) Reclaim() error {
 	// still reference the files evaluated below.
 	id, err := s.flushInternal(s.opts.Durability, false)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if err := s.waitForGroup(id, false); err != nil {
-		return err
+		return false, err
 	}
-	if err := s.dropTombs(); err != nil {
-		return err
+	worked := false
+	if w, err := s.dropTombs(); err != nil {
+		return worked, err
+	} else if w {
+		worked = true
 	}
-	if err := s.deleteDeadFiles(); err != nil {
-		return err
+	if w, err := s.deleteDeadFiles(); err != nil {
+		return worked, err
+	} else if w {
+		worked = true
 	}
 	if pressured {
-		return nil
+		return worked, nil
 	}
 	if min := s.opts.CompactionMinFreeBytes; min > 0 {
 		free, err := freeBytes(filepath.Join(s.dir, segmentsDirName))
 		if err != nil {
-			return err
+			return worked, err
 		}
 		if free < uint64(min) {
-			return nil
+			return worked, nil
 		}
 	}
-	return s.compactOne()
+	if w, err := s.compactOne(); err != nil {
+		return worked, err
+	} else if w {
+		worked = true
+	}
+	return worked, nil
 }
 
 // dropTombs discards deletion markers only after proving no older
@@ -109,13 +136,13 @@ func (s *Store) Reclaim() error {
 // for tombstoned keys; a file whose live records are gone and whose
 // markers' older values live only inside it drains with the file's
 // deletion in the same pass.
-func (s *Store) dropTombs() error {
+func (s *Store) dropTombs() (bool, error) {
 	tombs := make(map[string]tombMark)
 	s.idx.scanTombs(func(key string, tm tombMark) {
 		tombs[key] = tm
 	})
 	if len(tombs) < s.opts.TombProofThreshold {
-		return nil
+		return false, nil
 	}
 	// Tombs only drop from drained (zero-live-record) files; when
 	// every file still holds live data the full-spool validation
@@ -129,7 +156,7 @@ func (s *Store) dropTombs() error {
 		}
 	}
 	if !anyDrained {
-		return nil
+		return false, nil
 	}
 
 	// seenFiles tracks, per tombstoned key, value locations: the
@@ -163,7 +190,7 @@ func (s *Store) dropTombs() error {
 			return nil
 		})
 		if err != nil {
-			return err
+			return false, err
 		}
 	}
 	// A file drains when it holds no live records and every marker
@@ -172,6 +199,7 @@ func (s *Store) dropTombs() error {
 	for key, tm := range tombs {
 		byFile[tm.file] = append(byFile[tm.file], key)
 	}
+	dropped := false
 	for file, keys := range byFile {
 		snap, ok := s.fstats.snapshot(file)
 		if !ok || snap.stats.LiveRecords != 0 {
@@ -192,10 +220,11 @@ func (s *Store) dropTombs() error {
 			tm := tombs[key]
 			if _, ok := s.idx.dropTomb(key, tm.seq, tm.file); ok {
 				s.fstats.tombDropped(tm.file)
+				dropped = true
 			}
 		}
 	}
-	return nil
+	return dropped, nil
 }
 
 // deleteDeadFiles unlinks sealed files with no live records and no
@@ -203,7 +232,7 @@ func (s *Store) dropTombs() error {
 // can reference them afterwards. Membership is published before
 // unlinking: a crash between publish and unlink leaves an unlisted
 // file that open sweeps.
-func (s *Store) deleteDeadFiles() error {
+func (s *Store) deleteDeadFiles() (bool, error) {
 	active := s.seg.activeID()
 	segDir := filepath.Join(s.dir, segmentsDirName)
 	removed := false
@@ -225,36 +254,36 @@ func (s *Store) deleteDeadFiles() error {
 		if err := s.publishMemberRemoval(id); err != nil {
 			s.fstats.setState(id, SegmentSealed)
 			s.setTerminal(err)
-			return fmt.Errorf("spool: publish removal of segment %d: %w", id, err)
+			return removed, fmt.Errorf("spool: publish removal of segment %d: %w", id, err)
 		}
 		if err := s.faults.trip("delete"); err != nil {
-			return fmt.Errorf("spool: remove segment %d: %w", id, err)
+			return removed, fmt.Errorf("spool: remove segment %d: %w", id, err)
 		}
 		if err := os.Remove(filepath.Join(segDir, segmentFileName(id))); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("spool: remove segment %d: %w", id, err)
+			return removed, fmt.Errorf("spool: remove segment %d: %w", id, err)
 		}
 		s.fstats.remove(id)
 		removed = true
 	}
 	if removed {
 		if err := s.faults.trip("dirsync"); err != nil {
-			return fmt.Errorf("spool: sync segments dir: %w", err)
+			return removed, fmt.Errorf("spool: sync segments dir: %w", err)
 		}
 		if err := dirSync(segDir); err != nil {
-			return fmt.Errorf("spool: sync segments dir: %w", err)
+			return removed, fmt.Errorf("spool: sync segments dir: %w", err)
 		}
 	}
-	return nil
+	return removed, nil
 }
 
 // compactOne rewrites the oldest eligible sealed segment into a
 // replacement segment preserving logical sequences, publishes the
 // swap under one manifest generation, then unlinks the victim. It
-// returns nil when nothing is eligible.
-func (s *Store) compactOne() error {
+// reports whether it rewrote (or deleted) a segment.
+func (s *Store) compactOne() (bool, error) {
 	id, ok := s.pickCompaction()
 	if !ok {
-		return nil
+		return false, nil
 	}
 	s.fstats.setState(id, SegmentCompacting)
 	defer func() {
@@ -264,13 +293,19 @@ func (s *Store) compactOne() error {
 	}()
 	live, err := s.selectLive(id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if len(live) == 0 {
 		// Fully dead already; deletion happens below.
-		return s.deleteOneFile(id)
+		if err := s.deleteOneFile(id); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return s.rewriteLive(id, live)
+	if err := s.rewriteLive(id, live); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // pickCompaction selects the oldest sealed segment whose
@@ -290,6 +325,16 @@ func (s *Store) pickCompaction() (uint64, bool) {
 		// Files with no live value records stay on the deletion
 		// path and are never rewritten.
 		if snap.stats.LiveRecords == 0 {
+			continue
+		}
+		// Files with no dead records would rewrite into
+		// themselves: every record is still live, so a rewrite
+		// reproduces the file byte-equivalent while burning a
+		// full rewrite. Skipping them keeps reclamation
+		// convergent: without this, a tomb-heavy file below the
+		// tomb-proof threshold rewrites on every pass forever,
+		// online and offline.
+		if snap.stats.DeadRecords == 0 {
 			continue
 		}
 		total := snap.stats.TotalBytes

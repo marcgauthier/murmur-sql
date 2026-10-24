@@ -3,13 +3,14 @@ package murmur
 import (
 	"bytes"
 	"math/bits"
+	"sort"
 
 	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 	"github.com/marcgauthier/murmur-sql/murmur/replication"
 	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
-// PolicyState is durable causal state for one counter/set cell.
+// PolicyState is durable causal state for one counter/set/json/list cell.
 type PolicyState struct {
 	Version    Version
 	Domain     [16]byte
@@ -88,6 +89,11 @@ func PolicyStateKey(s *PolicyState) ([]byte, error) {
 }
 
 // ConfigurePolicy applies configured merge policies to schema columns.
+// Entries for tables or columns not yet in the schema are skipped:
+// policies are declared up front in configuration while tables arrive
+// via later migrations, and ConfigurePolicy re-runs on every migrate.
+// A genuinely misspelled entry stays loud at op time, when the column
+// fails the policy match instead.
 func ConfigurePolicy(schema *Schema, config *replication.Config) error {
 	if config == nil {
 		return nil
@@ -95,7 +101,7 @@ func ConfigurePolicy(schema *Schema, config *replication.Config) error {
 	for col, policy := range config.MergePolicies {
 		t := findTableByName(schema, col.Table)
 		if t == nil {
-			return invalidErr("unknown policy table %s", col.Table)
+			continue
 		}
 		appKeyCol := false
 		if t.ApplicationKey != nil {
@@ -107,7 +113,7 @@ func ConfigurePolicy(schema *Schema, config *replication.Config) error {
 		}
 		c := findColumnByName(t, col.Column)
 		if c == nil {
-			return invalidErr("unknown policy column %s", col.Column)
+			continue
 		}
 		if c.PrimaryKey > 0 || appKeyCol {
 			return invalidErr("primary key merge policy")
@@ -123,6 +129,10 @@ func ConfigurePolicy(schema *Schema, config *replication.Config) error {
 			c.Policy = MergePolicyMin
 		case replication.PolicyMax:
 			c.Policy = MergePolicyMax
+		case replication.PolicyJson:
+			c.Policy = MergePolicyJson
+		case replication.PolicyList:
+			c.Policy = MergePolicyList
 		}
 	}
 	return nil
@@ -153,7 +163,7 @@ func MaterializePolicyState(o *Opened, changes *[]spool.Mutation, intents []Poli
 	for i := range o.Schema.Tables {
 		t := &o.Schema.Tables[i]
 		for _, c := range t.Columns {
-			if c.Policy == MergePolicyCounter || c.Policy == MergePolicySet {
+			if c.Policy == MergePolicyCounter || c.Policy == MergePolicySet || c.Policy == MergePolicyJson || c.Policy == MergePolicyList {
 				tables[t.ID] = t
 				break
 			}
@@ -240,7 +250,7 @@ func MaterializePolicyState(o *Opened, changes *[]spool.Mutation, intents []Poli
 		}
 		key := []byte(ref.key)
 		for _, column := range table.Columns {
-			if column.Policy != MergePolicyCounter && column.Policy != MergePolicySet {
+			if column.Policy != MergePolicyCounter && column.Policy != MergePolicySet && column.Policy != MergePolicyJson && column.Policy != MergePolicyList {
 				continue
 			}
 			cell := findCellByColumn(meta, column.ID)
@@ -267,6 +277,18 @@ func MaterializePolicyState(o *Opened, changes *[]spool.Mutation, intents []Poli
 			if err != nil {
 				return err
 			}
+			seed := encodeOne(func(e *postcard.Encoder) {
+				e.String(ref.table)
+				e.Raw(key)
+				encodeVersion(e, meta.Generation)
+				e.Raw(domain[:])
+				encodeVersion(e, branch)
+				encodeVersion(e, scope)
+				encodeVersion(e, basis)
+			})
+			sum := hash(seed)
+			var transaction [16]byte
+			copy(transaction[:], sum[:16])
 			var causal *replication.Causal
 			switch column.Policy {
 			case MergePolicyCounter:
@@ -287,22 +309,37 @@ func MaterializePolicyState(o *Opened, changes *[]spool.Mutation, intents []Poli
 				default:
 					return invalidErr("set requires a BLOB")
 				}
-				seed := encodeOne(func(e *postcard.Encoder) {
-					e.String(ref.table)
-					e.Raw(key)
-					encodeVersion(e, meta.Generation)
-					e.Raw(domain[:])
-					encodeVersion(e, branch)
-					encodeVersion(e, scope)
-					encodeVersion(e, basis)
-				})
-				sum := hash(seed)
-				var transaction [16]byte
-				copy(transaction[:], sum[:16])
 				for index, value := range values {
 					set.Add(EncodeValue(value), replication.Tag{Database: domain, Transaction: transaction, Operation: uint32(index)})
 				}
 				causal = &replication.Causal{Set: set}
+			case MergePolicyJson:
+				doc, err := ParseJsonDoc(initial)
+				if err != nil {
+					return err
+				}
+				js := &replication.JsonMap{}
+				paths := make([]string, 0, len(doc))
+				for path := range doc {
+					paths = append(paths, path)
+				}
+				sort.Strings(paths)
+				for index, path := range paths {
+					// Seed tags leave database and node zero so
+					// rebase can tell them from real tags.
+					js.Set(path, EncodeValue(doc[path]), replication.Tag{Transaction: transaction, Operation: uint32(index)})
+				}
+				causal = &replication.Causal{Json: js}
+			case MergePolicyList:
+				list, err := ParseListDoc(initial)
+				if err != nil {
+					return err
+				}
+				ls := &replication.ListSet{}
+				for index, value := range list {
+					ls.Append(EncodeValue(value), replication.Tag{Transaction: transaction, Operation: uint32(index)})
+				}
+				causal = &replication.Causal{List: ls}
 			}
 			state := &PolicyState{Version: version, Domain: domain, Branch: branch, Scope: scope,
 				Baseline: initial, Basis: basis, Table: ref.table, Column: column.ID,
@@ -330,6 +367,14 @@ func MaterializePolicyState(o *Opened, changes *[]spool.Mutation, intents []Poli
 					state.Causal.Set.Add(EncodeValue(intent.Operation.V), replication.Tag{Database: o.Identity.Database, Node: o.Identity.Node, Transaction: intent.ID, Operation: 0})
 				case state.Causal.Set != nil && intent.Operation.Tag == PolicyOpRemove:
 					state.Causal.Set.Remove(EncodeValue(intent.Operation.V))
+				case state.Causal.Json != nil && intent.Operation.Tag == PolicyOpJsonSet:
+					state.Causal.Json.Set(intent.Operation.Path, EncodeValue(intent.Operation.V), replication.Tag{Database: o.Identity.Database, Node: o.Identity.Node, Transaction: intent.ID, Operation: 0})
+				case state.Causal.Json != nil && intent.Operation.Tag == PolicyOpJsonRemove:
+					state.Causal.Json.Remove(intent.Operation.Path)
+				case state.Causal.List != nil && intent.Operation.Tag == PolicyOpListAppend:
+					state.Causal.List.Append(EncodeValue(intent.Operation.V), replication.Tag{Database: o.Identity.Database, Node: o.Identity.Node, Transaction: intent.ID, Operation: 0})
+				case state.Causal.List != nil && intent.Operation.Tag == PolicyOpListRemove:
+					state.Causal.List.Remove(EncodeValue(intent.Operation.V))
 				default:
 					return corruptErr("causal operation mismatch")
 				}
@@ -405,6 +450,27 @@ func PolicyProjection(state *PolicyState) (Value, error) {
 			values = append(values, v)
 		}
 		return BlobValue(EncodeValues(values)), nil
+	case state.Causal.Json != nil:
+		doc := make(map[string]Value, len(state.Causal.Json.Paths))
+		for path, b := range state.Causal.Json.Live() {
+			v, err := DecodeValue(b)
+			if err != nil {
+				return Value{}, err
+			}
+			doc[path] = v
+		}
+		return RenderJsonDoc(doc)
+	case state.Causal.List != nil:
+		blobs := state.Causal.List.Values()
+		list := make([]Value, 0, len(blobs))
+		for _, b := range blobs {
+			v, err := DecodeValue(b)
+			if err != nil {
+				return Value{}, err
+			}
+			list = append(list, v)
+		}
+		return RenderListDoc(list)
 	}
 	return Value{}, corruptErr("causal projection")
 }
@@ -474,7 +540,9 @@ func JoinPolicyStates(o *Opened, records []replication.Record, state *ReplicaSta
 			}
 			counterOK := policy.Causal.Counter != nil && column.Policy == MergePolicyCounter
 			setOK := policy.Causal.Set != nil && column.Policy == MergePolicySet
-			if !counterOK && !setOK {
+			jsonOK := policy.Causal.Json != nil && column.Policy == MergePolicyJson
+			listOK := policy.Causal.List != nil && column.Policy == MergePolicyList
+			if !counterOK && !setOK && !jsonOK && !listOK {
 				return nil, ErrSchemaMismatch
 			}
 			cell := findStateCell(row, policy.Column)
@@ -539,7 +607,7 @@ func JoinPolicyStates(o *Opened, records []replication.Record, state *ReplicaSta
 			return nil, ErrSchemaMismatch
 		}
 		for _, column := range table.Columns {
-			if column.Policy != MergePolicyCounter && column.Policy != MergePolicySet {
+			if column.Policy != MergePolicyCounter && column.Policy != MergePolicySet && column.Policy != MergePolicyJson && column.Policy != MergePolicyList {
 				continue
 			}
 			domain, branch, scope, basis, err := HighLowPolicyScope(o, &row, column.ID, ordinary)
@@ -701,6 +769,42 @@ func stripSeedTags(set *replication.Set) {
 	}
 }
 
+func stripListSeedTags(s *replication.ListSet) {
+	for tag := range s.Appends {
+		if tag.Node == [16]byte{} {
+			delete(s.Appends, tag)
+		}
+	}
+	for tag := range s.Removals {
+		if tag.Node == [16]byte{} {
+			delete(s.Removals, tag)
+		}
+	}
+}
+
+func stripJsonSeedTags(m *replication.JsonMap) {
+	for path, writes := range m.Paths {
+		for tag := range writes {
+			if tag.Node == [16]byte{} {
+				delete(writes, tag)
+			}
+		}
+		if len(writes) == 0 {
+			delete(m.Paths, path)
+		}
+	}
+	for path, tags := range m.Removals {
+		for tag := range tags {
+			if tag.Node == [16]byte{} {
+				delete(tags, tag)
+			}
+		}
+		if len(tags) == 0 {
+			delete(m.Removals, path)
+		}
+	}
+}
+
 func rebaseOrphan(winner, orphan *PolicyState) (bool, error) {
 	if orphan.Domain != winner.Domain || orphan.Branch != winner.Branch || orphan.Basis.Compare(winner.Basis) > 0 {
 		return false, nil
@@ -709,6 +813,12 @@ func rebaseOrphan(winner, orphan *PolicyState) (bool, error) {
 	if !ValuesEqual(source.Baseline, winner.Baseline) {
 		if source.Causal.Set != nil {
 			stripSeedTags(source.Causal.Set)
+		}
+		if source.Causal.Json != nil {
+			stripJsonSeedTags(source.Causal.Json)
+		}
+		if source.Causal.List != nil {
+			stripListSeedTags(source.Causal.List)
 		}
 		source.Baseline = winner.Baseline
 	}
@@ -724,11 +834,23 @@ func joinPolicyState(target, source *PolicyState) error {
 		if target.Causal.Set != nil {
 			stripSeedTags(target.Causal.Set)
 		}
+		if target.Causal.Json != nil {
+			stripJsonSeedTags(target.Causal.Json)
+		}
+		if target.Causal.List != nil {
+			stripListSeedTags(target.Causal.List)
+		}
 		target.Baseline = source.Baseline
 		target.Basis = source.Basis
 	} else if source.Basis.Compare(target.Basis) < 0 {
 		if source.Causal.Set != nil {
 			stripSeedTags(source.Causal.Set)
+		}
+		if source.Causal.Json != nil {
+			stripJsonSeedTags(source.Causal.Json)
+		}
+		if source.Causal.List != nil {
+			stripListSeedTags(source.Causal.List)
 		}
 	} else if !ValuesEqual(source.Baseline, target.Baseline) {
 		return corruptErr("different causal baselines for one identity")

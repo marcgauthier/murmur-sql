@@ -58,10 +58,9 @@ written on node1 must reach node2 but never node3.
 - `waitConverged` sorts each node's names before the ordered comparison
   (Go's `TypedNames` arrives ordered; SQL `SELECT` without `ORDER BY`
   does not guarantee order).
-- Goroutine writers become borrowed writer futures inside one
-  `tokio::join!` with the flap driver (no `'static` spawn); the stop
-  flag is set on every driver exit path so a failed phase cannot hang
-  the join. Written/failed counters stay `AtomicI64`.
+- Writers are goroutines joined with the flap driver by a `WaitGroup`;
+  the stop flag is set on every driver exit path so a failed phase
+  cannot hang the join. Written/failed counters stay `atomic.Int64`.
 - Cycle count uses a local `env_int` helper (the harness only provides
   `env_seconds` for duration knobs).
 - Directory logging shows label/dir/SQL/replication addresses (plus PIDs
@@ -70,16 +69,14 @@ written on node1 must reach node2 but never node3.
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/flap-partition/Cargo.toml
+  go test -count=1 ./tests-live/flap-partition/
 ```
 
 ## Run (pilot scenario: run until green)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --manifest-path /home/marc/MURMUR-SQL/tests-live/flap-partition/Cargo.toml
+  MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh flap-partition
 ```
 
-`MURMUR_SERVER_BIN` reuses a prebuilt `--features replication` server
-instead of the one cargo build the harness triggers.
+`MURMUR_SERVER_BIN` reuses a prebuilt server instead of the one
+`go build` run.sh performs.

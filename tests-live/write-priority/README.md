@@ -18,7 +18,7 @@ converge exactly.
 `MURMUR_LIVE_WRITE_PRIORITY_SECONDS` defaults to 12 seconds;
 `MURMUR_LIVE_WRITE_PRIORITY_SYNC_TIMEOUT_SECONDS` defaults to 120 seconds.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

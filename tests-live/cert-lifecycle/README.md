@@ -78,6 +78,5 @@ to a fresh cert and show full reconvergence plus a bidirectional write.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/cert-lifecycle/Cargo.toml
+  go test -count=1 ./tests-live/cert-lifecycle/
 ```

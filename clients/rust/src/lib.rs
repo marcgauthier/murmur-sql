@@ -266,6 +266,38 @@ impl From<&str> for PolicyValue {
     }
 }
 
+/// A policy-op row key: one TEXT key (legacy form) or a composite
+/// KEY ... VALUE list of INTEGER, REAL, or TEXT components.
+#[derive(Clone, Debug, PartialEq)]
+pub enum PolicyKey {
+    One(String),
+    Many(Vec<PolicyValue>),
+}
+
+impl From<&str> for PolicyKey {
+    fn from(v: &str) -> Self {
+        PolicyKey::One(v.to_string())
+    }
+}
+
+impl From<String> for PolicyKey {
+    fn from(v: String) -> Self {
+        PolicyKey::One(v)
+    }
+}
+
+impl From<Vec<PolicyValue>> for PolicyKey {
+    fn from(v: Vec<PolicyValue>) -> Self {
+        PolicyKey::Many(v)
+    }
+}
+
+impl<const N: usize> From<[PolicyValue; N]> for PolicyKey {
+    fn from(v: [PolicyValue; N]) -> Self {
+        PolicyKey::Many(v.to_vec())
+    }
+}
+
 /// `'...'` with embedded quotes doubled, for MURMUR command words.
 fn quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
@@ -328,6 +360,55 @@ fn policy_literal(value: &PolicyValue) -> Result<String> {
         }
         PolicyValue::Text(s) => Ok(quote(s)),
     }
+}
+
+/// Render a policy key span plus the value separator: `(key_span,
+/// value_prefix)`. Single keys keep the legacy form.
+fn policy_key_span(key: &PolicyKey) -> Result<(String, &'static str)> {
+    match key {
+        PolicyKey::One(s) => Ok((quote(s), "")),
+        PolicyKey::Many(parts) => {
+            if parts.is_empty() {
+                return Err(Error::Invalid(
+                    "policy key needs at least one component".into(),
+                ));
+            }
+            let mut span = String::from("KEY");
+            for p in parts {
+                span.push(' ');
+                span.push_str(&policy_literal(p)?);
+            }
+            Ok((span, "VALUE "))
+        }
+    }
+}
+
+/// Render a policy key span with the KEY marker always present, for
+/// operations without a legacy form.
+fn policy_key_marked(key: &PolicyKey) -> Result<String> {
+    match key {
+        PolicyKey::One(s) => Ok(format!("KEY {}", quote(s))),
+        PolicyKey::Many(parts) => {
+            if parts.is_empty() {
+                return Err(Error::Invalid(
+                    "policy key needs at least one component".into(),
+                ));
+            }
+            let mut span = String::from("KEY");
+            for p in parts {
+                span.push(' ');
+                span.push_str(&policy_literal(p)?);
+            }
+            Ok(span)
+        }
+    }
+}
+
+fn check_policy_path(path: &str) -> Result<()> {
+    if path.is_empty() {
+        return Err(Error::Invalid("json path must not be empty".into()));
+    }
+    Ok(())
 }
 
 fn text_bool(value: &str) -> bool {
@@ -891,22 +972,24 @@ impl Client {
         text_int(&r[0], "collected")
     }
 
-    /// Add `delta` to a `counter` column on the single-TEXT-key `key` row.
-    /// The column must carry the matching `replication.merge_policies` entry
-    /// (`22023` otherwise); a missing row fails with `02000`.
+    /// Add `delta` to a `counter` column on the `key` row, addressed by
+    /// one TEXT key or a composite key list. The column must carry the
+    /// matching `replication.merge_policies` entry (`22023` otherwise); a
+    /// missing row fails with `02000`.
     pub async fn policy_counter_add(
         &self,
         table: &str,
         column: &str,
-        key: &str,
+        key: impl Into<PolicyKey>,
         delta: i64,
     ) -> Result<()> {
         check_policy_target(table, column)?;
+        let (ks, vp) = policy_key_span(&key.into())?;
         self.simple(&format!(
-            "MURMUR POLICY COUNTER_ADD {} {} {} {delta}",
+            "MURMUR POLICY COUNTER_ADD {} {} {} {vp}{delta}",
             quote(table),
             quote(column),
-            quote(key)
+            ks
         ))
         .await
         .map(|_| ())
@@ -918,15 +1001,16 @@ impl Client {
         &self,
         table: &str,
         column: &str,
-        key: &str,
+        key: impl Into<PolicyKey>,
         value: &str,
     ) -> Result<()> {
         check_policy_target(table, column)?;
+        let (ks, vp) = policy_key_span(&key.into())?;
         self.simple(&format!(
-            "MURMUR POLICY SET_ADD {} {} {} {}",
+            "MURMUR POLICY SET_ADD {} {} {} {vp}{}",
             quote(table),
             quote(column),
-            quote(key),
+            ks,
             quote(value)
         ))
         .await
@@ -938,15 +1022,16 @@ impl Client {
         &self,
         table: &str,
         column: &str,
-        key: &str,
+        key: impl Into<PolicyKey>,
         value: &str,
     ) -> Result<()> {
         check_policy_target(table, column)?;
+        let (ks, vp) = policy_key_span(&key.into())?;
         self.simple(&format!(
-            "MURMUR POLICY SET_REMOVE {} {} {} {}",
+            "MURMUR POLICY SET_REMOVE {} {} {} {vp}{}",
             quote(table),
             quote(column),
-            quote(key),
+            ks,
             quote(value)
         ))
         .await
@@ -958,16 +1043,17 @@ impl Client {
         &self,
         table: &str,
         column: &str,
-        key: &str,
+        key: impl Into<PolicyKey>,
         value: PolicyValue,
     ) -> Result<()> {
         check_policy_target(table, column)?;
         let literal = policy_literal(&value)?;
+        let (ks, vp) = policy_key_span(&key.into())?;
         self.simple(&format!(
-            "MURMUR POLICY MIN {} {} {} {literal}",
+            "MURMUR POLICY MIN {} {} {} {vp}{literal}",
             quote(table),
             quote(column),
-            quote(key)
+            ks
         ))
         .await
         .map(|_| ())
@@ -978,16 +1064,114 @@ impl Client {
         &self,
         table: &str,
         column: &str,
-        key: &str,
+        key: impl Into<PolicyKey>,
         value: PolicyValue,
     ) -> Result<()> {
         check_policy_target(table, column)?;
         let literal = policy_literal(&value)?;
+        let (ks, vp) = policy_key_span(&key.into())?;
         self.simple(&format!(
-            "MURMUR POLICY MAX {} {} {} {literal}",
+            "MURMUR POLICY MAX {} {} {} {vp}{literal}",
             quote(table),
             quote(column),
-            quote(key)
+            ks
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Write one flat path of a `json` column. `None` writes JSON null.
+    pub async fn policy_json_set(
+        &self,
+        table: &str,
+        column: &str,
+        key: impl Into<PolicyKey>,
+        path: &str,
+        value: Option<PolicyValue>,
+    ) -> Result<()> {
+        check_policy_target(table, column)?;
+        check_policy_path(path)?;
+        let literal = match value {
+            None => "NULL".to_string(),
+            Some(v) => policy_literal(&v)?,
+        };
+        let ks = policy_key_marked(&key.into())?;
+        self.simple(&format!(
+            "MURMUR POLICY JSON_SET {} {} {} PATH {} VALUE {literal}",
+            quote(table),
+            quote(column),
+            ks,
+            quote(path)
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Delete one flat path of a `json` column.
+    pub async fn policy_json_remove(
+        &self,
+        table: &str,
+        column: &str,
+        key: impl Into<PolicyKey>,
+        path: &str,
+    ) -> Result<()> {
+        check_policy_target(table, column)?;
+        check_policy_path(path)?;
+        let ks = policy_key_marked(&key.into())?;
+        self.simple(&format!(
+            "MURMUR POLICY JSON_REMOVE {} {} {} PATH {}",
+            quote(table),
+            quote(column),
+            ks,
+            quote(path)
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Append one element to a `list` column. `None` appends JSON null.
+    pub async fn policy_list_append(
+        &self,
+        table: &str,
+        column: &str,
+        key: impl Into<PolicyKey>,
+        value: Option<PolicyValue>,
+    ) -> Result<()> {
+        check_policy_target(table, column)?;
+        let literal = match value {
+            None => "NULL".to_string(),
+            Some(v) => policy_literal(&v)?,
+        };
+        let (ks, vp) = policy_key_span(&key.into())?;
+        self.simple(&format!(
+            "MURMUR POLICY LIST_APPEND {} {} {} {vp}{literal}",
+            quote(table),
+            quote(column),
+            ks
+        ))
+        .await
+        .map(|_| ())
+    }
+
+    /// Drop every list element equal to `value` (`None` matches JSON null).
+    pub async fn policy_list_remove(
+        &self,
+        table: &str,
+        column: &str,
+        key: impl Into<PolicyKey>,
+        value: Option<PolicyValue>,
+    ) -> Result<()> {
+        check_policy_target(table, column)?;
+        let literal = match value {
+            None => "NULL".to_string(),
+            Some(v) => policy_literal(&v)?,
+        };
+        let (ks, vp) = policy_key_span(&key.into())?;
+        self.simple(&format!(
+            "MURMUR POLICY LIST_REMOVE {} {} {} {vp}{literal}",
+            quote(table),
+            quote(column),
+            ks
         ))
         .await
         .map(|_| ())

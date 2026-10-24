@@ -72,9 +72,12 @@ connection IDs. Use those IDs to isolate and clean up transfer handles.
 | `PEER SYNC`, `RETENTION COLLECT` | none |
 | `WAIT FOR` | origin hex string, sequence int64, optional timeout-seconds int64 (default 30) |
 | `WAIT FOR LAG` | lag-bound int64, optional timeout-seconds int64 (default 30) |
-| `POLICY COUNTER_ADD` | table, column, single-TEXT row key, int64 delta |
-| `POLICY SET_ADD`, `POLICY SET_REMOVE` | table, column, single-TEXT row key, text value |
-| `POLICY MIN`, `POLICY MAX` | table, column, single-TEXT row key, int64/float64/string value |
+| `POLICY COUNTER_ADD` | table, column, one row-key component per table-key column, int64 delta |
+| `POLICY SET_ADD`, `POLICY SET_REMOVE` | table, column, one row-key component per table-key column, text value |
+| `POLICY MIN`, `POLICY MAX` | table, column, one row-key component per table-key column, int64/float64/string value |
+| `POLICY JSON_SET` | table, column, key components, text path, int64/float64/string/null value |
+| `POLICY JSON_REMOVE` | table, column, key components, text path |
+| `POLICY LIST_APPEND`, `POLICY LIST_REMOVE` | table, column, one row-key component per table-key column, int64/float64/string/null element |
 | `BRIDGE RELEASE` | table, single-TEXT row key, optional column name |
 | `BACKUP DIRECTORY` | shell-allocated destination path for a consistent checkpoint directory |
 | `RESTORE DIRECTORY` | unpacked checkpoint path, current raw-key []byte |

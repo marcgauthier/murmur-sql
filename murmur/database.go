@@ -241,6 +241,41 @@ func (s *Sql) Max(table string, key []Value, column string, value Value) error {
 	return s.operation(table, key, column, PolicyOperation{Tag: PolicyOpMax, V: value})
 }
 
+// JsonSet writes one flat path of a JSON object cell.
+func (s *Sql) JsonSet(table string, key []Value, column, path string, value Value) error {
+	if path == "" {
+		return invalidErr("json path must not be empty")
+	}
+	if err := CheckPolicyScalar(value); err != nil {
+		return err
+	}
+	return s.operation(table, key, column, PolicyOperation{Tag: PolicyOpJsonSet, Path: path, V: value})
+}
+
+// JsonRemove deletes one flat path of a JSON object cell.
+func (s *Sql) JsonRemove(table string, key []Value, column, path string) error {
+	if path == "" {
+		return invalidErr("json path must not be empty")
+	}
+	return s.operation(table, key, column, PolicyOperation{Tag: PolicyOpJsonRemove, Path: path})
+}
+
+// ListAppend appends one scalar element to a list cell.
+func (s *Sql) ListAppend(table string, key []Value, column string, value Value) error {
+	if err := CheckPolicyScalar(value); err != nil {
+		return err
+	}
+	return s.operation(table, key, column, PolicyOperation{Tag: PolicyOpListAppend, V: value})
+}
+
+// ListRemove drops every list element equal to the value.
+func (s *Sql) ListRemove(table string, key []Value, column string, value Value) error {
+	if err := CheckPolicyScalar(value); err != nil {
+		return err
+	}
+	return s.operation(table, key, column, PolicyOperation{Tag: PolicyOpListRemove, V: value})
+}
+
 func (s *Sql) operation(table string, key []Value, column string, operation PolicyOperation) error {
 	if s.intents == nil {
 		return invalidErr("policy operations require a transaction")
@@ -269,6 +304,10 @@ func (s *Sql) operation(table string, key []Value, column string, operation Poli
 		required = MergePolicyMin
 	case PolicyOpMax:
 		required = MergePolicyMax
+	case PolicyOpJsonSet, PolicyOpJsonRemove:
+		required = MergePolicyJson
+	case PolicyOpListAppend, PolicyOpListRemove:
+		required = MergePolicyList
 	}
 	if c.Policy != required || len(key) != len(ApplicationColumns(t)) {
 		return invalidErr("operation does not match column policy or primary key")
@@ -355,6 +394,38 @@ func (s *Sql) operation(table string, key []Value, column string, operation Poli
 			after = operation.V
 		} else {
 			after = before
+		}
+	case PolicyOpJsonSet, PolicyOpJsonRemove:
+		doc, err := ParseJsonDoc(before)
+		if err != nil {
+			return err
+		}
+		if operation.Tag == PolicyOpJsonSet {
+			doc[operation.Path] = operation.V
+		} else {
+			delete(doc, operation.Path)
+		}
+		if after, err = RenderJsonDoc(doc); err != nil {
+			return err
+		}
+	case PolicyOpListAppend, PolicyOpListRemove:
+		list, err := ParseListDoc(before)
+		if err != nil {
+			return err
+		}
+		if operation.Tag == PolicyOpListAppend {
+			list = append(list, operation.V)
+		} else {
+			kept := list[:0]
+			for _, v := range list {
+				if !ValuesEqual(v, operation.V) {
+					kept = append(kept, v)
+				}
+			}
+			list = kept
+		}
+		if after, err = RenderListDoc(list); err != nil {
+			return err
 		}
 	}
 	// Only this fixed statement bypasses policy assignment restrictions.

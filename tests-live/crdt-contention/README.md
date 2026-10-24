@@ -34,7 +34,7 @@ None beyond the standard harness knobs (`MURMUR_LIVE_RUNTIME`,
 - Plain SQL on a replicated table (`contention(id TEXT NOT NULL PRIMARY KEY, ...)`
   with explicit `NOT NULL` constraint per PG wire requirements) instead of
   the typed-contention HTTP API (`TypedContentionInsert`/`Update`/`Read`);
-  contention runs as borrowed `tokio::join!` futures in the pilot style.
+  contention runs as goroutines joined by a `sync.WaitGroup`.
 - Session counts come from `MURMUR SHOW REPLICATION` (`peers` column)
   instead of `/v1/status` (`connected_peers`).
 
@@ -42,6 +42,5 @@ None beyond the standard harness knobs (`MURMUR_LIVE_RUNTIME`,
 
 ```sh
 MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server \
-  CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target \
-  cargo test --manifest-path tests-live/crdt-contention/Cargo.toml -- --nocapture
+  MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh crdt-contention
 ```

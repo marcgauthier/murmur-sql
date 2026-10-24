@@ -41,9 +41,9 @@ everywhere.
   Row identity in assertions is `name@id`.
 - Session counts come from `MURMUR SHOW REPLICATION` (`peers` column)
   instead of `/v1/status` (`connected_peers`).
-- Writers are `tokio::spawn` tasks sharing the cluster behind one async
-  mutex (the harness `kill_node`/`start_node` legs need `&mut`, so the
-  pilot's borrowed `tokio::join!` shape cannot run writers across kills).
+- Writers are goroutines sharing the cluster behind one mutex (the
+  harness `KillNode`/`StartNode` legs need exclusive access, so writers
+  cannot run across kills in a borrowed join shape).
   A `running` flag per node, cleared before the kill and re-checked under
   the lock, keeps writers off the stopped victim (whose `Cluster::node`
   would panic); every insert carries a 10 s wire timeout so a kill can
@@ -61,6 +61,5 @@ everywhere.
 
 ```sh
 MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server \
-  CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target \
-  cargo test --manifest-path tests-live/crash-loop/Cargo.toml -- --nocapture
+  MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh crash-loop
 ```

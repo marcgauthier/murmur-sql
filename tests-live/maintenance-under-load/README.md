@@ -10,7 +10,7 @@ and score values. A post-maintenance SQL insert must still replicate.
 `MURMUR_MAINT_LOAD_MAX_INSERTS` to 4,000 per writer, and
 `MURMUR_MAINT_LOAD_GC_TIMEOUT` to 150 seconds (seconds or an s/m/h suffix).
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

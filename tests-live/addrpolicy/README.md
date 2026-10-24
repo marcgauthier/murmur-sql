@@ -26,5 +26,5 @@ and replicates, while the denied Node 2 keeps its writes local.
 ## How to run
 
 ```sh
-MURMUR_SERVER_BIN=../../target/debug/murmur-server cargo test --manifest-path tests-live/addrpolicy/Cargo.toml -- --nocapture
+MURMUR_SERVER_BIN=../../target/debug/murmur-server MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh addrpolicy
 ```

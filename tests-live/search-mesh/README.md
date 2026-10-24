@@ -13,7 +13,7 @@ replica:
 - FTS disable dropping the index and re-enable rebuilding it,
 - MATCH and KNN still working after a replica restart (rebuild from rows).
 
-All database operations use explicit SQL through `clients/rust` against
+All database operations use explicit SQL through the `goharness` SQL client against
 live `murmur-server` child processes. No embedded database handles are
 linked or opened.
 

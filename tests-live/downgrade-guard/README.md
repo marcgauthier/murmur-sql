@@ -1,6 +1,6 @@
 # Downgrade guard through live SQL
 
-The test writes rows with SQL through `clients/rust`, flushes them, and stops
+The test writes rows with SQL through the `goharness` SQL client, flushes them, and stops
 the Murmur-SQL server. It copies the durable directory, then launches an
 engine-owned artifact injector to mark only that copy with the next unsupported
 format. A live server must reject the copied store during SQL unlock without

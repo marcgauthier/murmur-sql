@@ -60,8 +60,8 @@ matching the Go timeouts.
   re-copied through a 5 s stability window and both High nodes must still
   show exactly the 10 names.
 - Bridge keys are fixed test constants; only public-key derivation
-  (`ed25519-dalek`, `x25519-dalek` with the product's `static_secrets`
-  feature) lives in the scenario. Each outbox/inbox dir lives under its
+  (stdlib `crypto/ed25519`, X25519 via `golang.org/x/crypto/curve25519`)
+  lives in the scenario. Each outbox/inbox dir lives under its
   cluster's runtime dir so it is retained on failure and cleaned on pass.
 - `MURMUR SET TABLE ... REPLICATED true` runs on all four nodes: bridge
   capture reads the replication log, which only carries replicated
@@ -86,6 +86,5 @@ a fail-open divergence from the Go gate.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/bridge-two-streams/Cargo.toml
+  go test -count=1 ./tests-live/bridge-two-streams/
 ```

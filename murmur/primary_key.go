@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"unicode/utf8"
 
@@ -548,6 +549,31 @@ func affinityOf(c *Column) int {
 		return 3
 	default:
 		return 2
+	}
+}
+
+// CoerceKeyValue renders one wire key component for a key column,
+// following the column affinity: integers and finite reals parse,
+// text passes through verbatim, and anything else fails loudly so a
+// mistyped key errors instead of silently missing its row.
+func CoerceKeyValue(c *Column, s string) (Value, error) {
+	switch affinityOf(c) {
+	case 1:
+		return TextValue(s), nil
+	case 2:
+		n, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return Value{}, invalidErr("policy key %q is not an integer", s)
+		}
+		return IntValue(n), nil
+	case 3:
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+			return Value{}, invalidErr("policy key %q is not a finite real", s)
+		}
+		return RealValue(f), nil
+	default:
+		return Value{}, invalidErr("policy keys over BLOB columns are not supported")
 	}
 }
 

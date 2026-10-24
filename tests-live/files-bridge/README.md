@@ -74,12 +74,11 @@ pattern).
 - Fixed test seeds replace the Go generated bridge key files (Low
   bundle-signer seed, High X25519 receiver secret); the High receiver
   pins the Low signer public key and trusts both Low origin keys.
-  Public keys are derived with scenario-only registry deps
-  (`ed25519-dalek`, `x25519-dalek`, same versions as the product).
+  Public keys are derived with the in-module `murmur/replication`
+  helpers (`PublicKey`/`RecipientPublic`, same logic as the product).
 
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/files-bridge/Cargo.toml
+  go test -count=1 ./tests-live/files-bridge/
 ```

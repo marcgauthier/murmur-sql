@@ -118,7 +118,14 @@ func isDuplicateClose(conn quicConn, err error) bool {
 		return true
 	}
 	if conn != nil {
-		return isDuplicateErr(conn.Context().Err())
+		// Cause, not Err: quic-go cancels the connection
+		// context with the close error as cause, so Err
+		// reports only context.Canceled while Cause
+		// recovers the ApplicationError. This fallback is
+		// what recognizes duplicate closes after a wrap
+		// (protocolErr stringifies the chain) destroyed the
+		// primary match.
+		return isDuplicateErr(context.Cause(conn.Context()))
 	}
 	return false
 }
@@ -126,7 +133,12 @@ func isDuplicateClose(conn quicConn, err error) bool {
 func isDuplicateErr(err error) bool {
 	var appErr *quic.ApplicationError
 	if errors.As(err, &appErr) {
-		return appErr.Remote && appErr.ErrorCode == 0 && appErr.ErrorMessage == duplicateCloseReason
+		// Either side: the far side's tie-break close arrives
+		// remote, while our own tie-break (session replace in
+		// the engine) closes a conn we then read or write
+		// locally. Both are routine mutual-dial churn, never
+		// engine failure; any other code or reason stays loud.
+		return appErr.ErrorCode == 0 && appErr.ErrorMessage == duplicateCloseReason
 	}
 	return false
 }

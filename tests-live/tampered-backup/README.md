@@ -3,13 +3,13 @@
 Create a thirty-row backup and corrupt its header, flip a payload byte, or truncate it. Upload/restore must reject each bad archive and a fresh client must still read the untouched live data. The pristine archive must restore the exact original rows.
 
 Each node is a separate `murmur-server` process. Application operations use
-[`murmur-client`](../../clients/rust/README.md) over the PostgreSQL wire protocol;
+the `goharness` SQL client over the PostgreSQL wire protocol;
 these tests do not open an embedded database.
 
 Run from the repository root:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path tests-live/tampered-backup/Cargo.toml -- --nocapture
+MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh tampered-backup
 ```
 
 The process harness builds `murmur-server` and `murmur-admin` with the

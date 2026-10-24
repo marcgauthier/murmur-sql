@@ -87,7 +87,7 @@ func encodeMergePolicy(e *postcard.Encoder, p MergePolicy) {
 
 func decodeMergePolicy(d *postcard.Decoder) MergePolicy {
 	v := d.Discriminant()
-	if v > 4 {
+	if v > 6 {
 		d.Fail(corruptErr("bad merge policy"))
 	}
 	return MergePolicy(v)
@@ -100,6 +100,11 @@ func encodePolicyOperation(e *postcard.Encoder, op PolicyOperation) {
 	switch op.Tag {
 	case PolicyOpCounter:
 		e.I64(op.Delta)
+	case PolicyOpJsonSet:
+		e.String(op.Path)
+		encodeValue(e, op.V)
+	case PolicyOpJsonRemove:
+		e.String(op.Path)
 	default:
 		encodeValue(e, op.V)
 	}
@@ -117,6 +122,14 @@ func decodePolicyOperation(d *postcard.Decoder) PolicyOperation {
 		return PolicyOperation{Tag: PolicyOpMin, V: decodeValue(d)}
 	case 4:
 		return PolicyOperation{Tag: PolicyOpMax, V: decodeValue(d)}
+	case 5:
+		return PolicyOperation{Tag: PolicyOpJsonSet, Path: d.String(), V: decodeValue(d)}
+	case 6:
+		return PolicyOperation{Tag: PolicyOpJsonRemove, Path: d.String()}
+	case 7:
+		return PolicyOperation{Tag: PolicyOpListAppend, V: decodeValue(d)}
+	case 8:
+		return PolicyOperation{Tag: PolicyOpListRemove, V: decodeValue(d)}
 	default:
 		d.Fail(corruptErr("bad policy operation"))
 		return PolicyOperation{}

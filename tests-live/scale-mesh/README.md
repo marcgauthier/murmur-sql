@@ -5,7 +5,7 @@ Ten live servers converge on 400 rows from two origins (300 on node 1,
 peers never exceed fanout 4. Every node must hold identical ordered row values;
 the convergence deadline is 300 seconds.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

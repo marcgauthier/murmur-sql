@@ -174,7 +174,7 @@ func (v *Value) UnmarshalJSON(data []byte) error {
 
 // MarshalJSON renders the policy name.
 func (p MergePolicy) MarshalJSON() ([]byte, error) {
-	if p > PolicyMax {
+	if p > PolicyList {
 		return nil, fmt.Errorf("murmur: bad merge policy %d", p)
 	}
 	return marshalNoEscape(p.String())
@@ -197,6 +197,10 @@ func (p *MergePolicy) UnmarshalJSON(data []byte) error {
 		*p = PolicyMin
 	case "Max":
 		*p = PolicyMax
+	case "Json":
+		*p = PolicyJson
+	case "List":
+		*p = PolicyList
 	default:
 		return fmt.Errorf("murmur: bad merge policy %q", s)
 	}

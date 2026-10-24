@@ -10,5 +10,6 @@
 murmur-service-*.log
 **/target/
 **/runtime/
+**/failures/
 **/__pycache__/
 **/.pytest_cache/

@@ -3,13 +3,13 @@
 Race the same ADD COLUMN on two servers while a third writes 60 acknowledged records. Require a successful migration, one complete column on every server, every acknowledged record, and replicated writes to the new column from each server.
 
 Each node is a separate `murmur-server` process. Application operations use
-[`murmur-client`](../../clients/rust/README.md) over the PostgreSQL wire protocol;
+the `goharness` SQL client over the PostgreSQL wire protocol;
 these tests do not open an embedded database.
 
 Run from the repository root:
 
 ```sh
-CARGO_TARGET_DIR="$PWD/target" cargo test --manifest-path tests-live/migration-concurrency/Cargo.toml -- --nocapture
+MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh migration-concurrency
 ```
 
 The process harness builds `murmur-server` and `murmur-admin` with the

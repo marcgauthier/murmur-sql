@@ -25,5 +25,5 @@ Both restarts are clean and fast, lose zero acknowledged writes, and the cluster
 ## How to run
 
 ```sh
-MURMUR_SERVER_BIN=../../target/debug/murmur-server cargo test --manifest-path tests-live/graceful-shutdown/Cargo.toml -- --nocapture
+MURMUR_SERVER_BIN=../../target/debug/murmur-server MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh graceful-shutdown
 ```

@@ -16,7 +16,8 @@
 //   - FLUSH, REFRESH INDEXES, PEER SYNC, RETENTION COLLECT succeed;
 //     malformed PEER ADD/REMOVE/RETIRE fail with 22023.
 //   - POLICY COUNTER_ADD/MIN/MAX/SET_ADD/SET_REMOVE apply through the
-//     configured merge policies and read back over SQL.
+//     configured merge policies and read back over SQL, including
+//     composite KEY ... VALUE keys on a multi-column-key table.
 //   - BACKUP SAVE/LIST/DOWNLOAD round-trip; RESTORE FROM reverts a
 //     sentinel row written after the backup.
 //   - Unconfigured surfaces fail cleanly: BRIDGE RELEASE and FILE LIST
@@ -61,9 +62,12 @@ const (
 	// the FTS target; emb (BLOB) is the vector target.
 	opsDDL = "CREATE TABLE ops(id INTEGER PRIMARY KEY, note TEXT NOT NULL, emb BLOB)"
 	// countersDDL carries one column per merge policy. Policy keys arrive
-	// over the wire as TEXT, so the key column is TEXT; set cells must be
-	// BLOB or NULL.
+	// over the wire as TEXT and coerce by key-column type; set cells must
+	// be BLOB or NULL.
 	countersDDL = "CREATE TABLE counters(k TEXT NOT NULL PRIMARY KEY, n INTEGER NOT NULL, lo INTEGER NOT NULL, hi INTEGER NOT NULL, tags BLOB)"
+	// pairsDDL pins composite policy keys: two key columns of mixed
+	// type addressed through KEY ... VALUE.
+	pairsDDL = "CREATE TABLE pairs(a INTEGER NOT NULL, b TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (a, b))"
 	// user and password are the scratch admin credential.
 	user     = "admin"
 	password = "test-password"
@@ -389,6 +393,7 @@ func serveOne(t *testing.T, dir string, creds *pairCreds, idx int, passHash stri
 		"counters.lo":   "min",
 		"counters.hi":   "max",
 		"counters.tags": "set",
+		"pairs.n":       "counter",
 	}
 	configPath := filepath.Join(dir, "config.yaml")
 	if _, err := os.Stat(configPath); err != nil {
@@ -574,12 +579,14 @@ func TestMurmurOpsOverWire(t *testing.T) {
 	mustFail(t, w0, "MURMUR FLUSH NOW", "42601", "flush with args")
 	mustFail(t, w0, "MURMUR SHOW EVERYTHING", "42601", "bad show")
 
-	// Baseline schema on both nodes. The policy table comes first: the
-	// engine validates every configured merge policy on each migrate.
+	// Baseline schema on both nodes. Policies for not-yet-created
+	// tables defer, so creation order is unconstrained.
 	for i, w := range []*wireConn{w0, w1} {
 		mustExec(t, w, countersDDL, "create counters")
 		mustExec(t, w, opsDDL, "create ops")
+		mustExec(t, w, pairsDDL, "create pairs")
 		mustExec(t, w, "INSERT INTO counters(k, n, lo, hi) VALUES('k1', 0, 100, 0)", "seed counters")
+		mustExec(t, w, "INSERT INTO pairs(a, b, n) VALUES(1, 'x', 10)", "seed pairs")
 		t.Logf("node %d schema ready", i)
 	}
 
@@ -704,6 +711,13 @@ func TestMurmurOpsOverWire(t *testing.T) {
 	mustExec(t, w0, "MURMUR POLICY SET_REMOVE 'counters' 'tags' 'k1' 'blue'", "set remove 2")
 	mustFail(t, w0, "MURMUR POLICY COUNTER_ADD 'counters' 'n' 'missing' 1", "02000", "policy missing row")
 	mustFail(t, w0, "MURMUR POLICY FROBNICATE 'counters' 'n' 'k1' 1", "42601", "bad policy op")
+	mustExec(t, w0, "MURMUR POLICY COUNTER_ADD 'pairs' 'n' KEY 1 'x' VALUE 5", "composite counter add")
+	pairRow := queryOne(t, w0, "SELECT n FROM pairs WHERE a = 1 AND b = 'x'", "composite readback")
+	if pairRow[0] != "15" {
+		t.Fatalf("pairs.n after composite add = %q, want 15", pairRow[0])
+	}
+	mustFail(t, w0, "MURMUR POLICY COUNTER_ADD 'pairs' 'n' KEY 1 VALUE 1", "22023", "composite short key")
+	mustFail(t, w0, "MURMUR POLICY COUNTER_ADD 'pairs' 'n' KEY 'nan' 'x' VALUE 1", "22023", "composite mistyped key")
 
 	// Leg 7: unconfigured surfaces fail cleanly over the wire.
 	mustFail(t, w0, "MURMUR BRIDGE RELEASE 'counters' 'k1'", "55000", "bridge disabled")

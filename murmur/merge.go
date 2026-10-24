@@ -111,7 +111,7 @@ func mergeRow(schema *Schema, rows map[RowID]*RowState, row *RowState, floors ma
 			case vc > 0:
 				*target = cell
 			case vc == 0 && !ValuesEqual(cell.Value, target.Value) &&
-				policy != PolicyCounter && policy != PolicySet:
+				policy != PolicyCounter && policy != PolicySet && policy != PolicyJson && policy != PolicyList:
 				return RowID{}, corruptErr("different values for identical version")
 			}
 		}

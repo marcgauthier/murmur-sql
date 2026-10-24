@@ -2,6 +2,8 @@ package replication
 
 import (
 	"testing"
+
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 )
 
 func TestCounterAddJoinValue(t *testing.T) {
@@ -186,5 +188,204 @@ func TestPolicyCodecRoundtrips(t *testing.T) {
 		if err == nil {
 			t.Fatalf("%s: truncated accepted", name)
 		}
+	}
+}
+
+func TestJsonMapSetRemoveJoin(t *testing.T) {
+	tag := func(op uint32) Tag {
+		return Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(3), Operation: op}
+	}
+	m := &JsonMap{}
+	// Later sets overwrite regardless of tag order (intra-batch recency).
+	m.Set("a", []byte("1"), tag(2))
+	m.Set("a", []byte("0"), tag(1))
+	m.Set("b", []byte("x"), tag(1))
+	if got := m.Live(); len(got) != 2 || string(got["a"]) != "0" {
+		t.Fatalf("live = %+v, want a/0 b/x", got)
+	}
+	// Removal retires the observed entry whatever the tag order; a
+	// later set revives the path.
+	m.Remove("a")
+	if got := m.Live(); len(got) != 1 {
+		t.Fatalf("after remove live = %+v", got)
+	}
+	m.Set("a", []byte("2"), tag(4))
+	if got := m.Live(); len(got) != 2 || string(got["a"]) != "2" {
+		t.Fatalf("revived = %+v", got)
+	}
+	// Join takes the per-path highest tag both ways.
+	o := &JsonMap{}
+	o.Set("a", []byte("9"), tag(9))
+	o.Set("c", []byte("z"), tag(1))
+	m.Join(o)
+	o.Join(m)
+	for i, jm := range []*JsonMap{m, o} {
+		got := jm.Live()
+		if len(got) != 3 || string(got["a"]) != "9" || string(got["c"]) != "z" {
+			t.Fatalf("map %d live = %+v", i, got)
+		}
+	}
+	// An observed remove propagates through joins; an unobserved
+	// concurrent set survives it.
+	o.Remove("a")
+	m.Join(o)
+	o.Join(m)
+	for i, jm := range []*JsonMap{m, o} {
+		if got := jm.Live(); len(got) != 2 {
+			t.Fatalf("map %d live = %+v, want b/c", i, got)
+		}
+	}
+	r := &JsonMap{}
+	r.Set("a", []byte("late"), tag(7))
+	m.Join(r)
+	r.Join(m)
+	for i, jm := range []*JsonMap{m, r} {
+		got := jm.Live()
+		if len(got) != 3 || string(got["a"]) != "late" {
+			t.Fatalf("map %d live = %+v, want concurrent set to survive", i, got)
+		}
+	}
+}
+
+func TestCausalJsonJoin(t *testing.T) {
+	x := &Causal{Json: &JsonMap{}}
+	y := &Causal{Json: &JsonMap{}}
+	x.Json.Set("a", []byte("1"), Tag{Database: idOf(1), Node: idOf(2)})
+	if err := x.Join(y); err != nil {
+		t.Fatal(err)
+	}
+	if err := y.Join(x); err != nil {
+		t.Fatal(err)
+	}
+	if len(y.Json.Live()) != 1 {
+		t.Fatal("json join lost path")
+	}
+	if err := x.Join(&Causal{Counter: &Counter{}}); err == nil {
+		t.Fatal("mixed json/counter join accepted")
+	}
+}
+
+func TestJsonCodecRoundtrips(t *testing.T) {
+	m := &JsonMap{}
+	m.Set("b", []byte("x"), Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(3), Operation: 7})
+	m.Set("a", []byte("y"), Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(4)})
+	m.Remove("b")
+	back, err := DecodeJsonMap(EncodeJsonMap(m))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := back.Live()
+	if len(got) != 1 || string(got["a"]) != "y" {
+		t.Fatalf("roundtrip live = %+v", got)
+	}
+	causal, err := DecodeCausal(EncodeCausal(&Causal{Json: m}))
+	if err != nil || causal.Json == nil {
+		t.Fatalf("causal roundtrip = %+v, %v", causal, err)
+	}
+	if _, err = DecodeJsonMap(EncodeJsonMap(m)[:len(EncodeJsonMap(m))-1]); err == nil {
+		t.Fatal("truncated json accepted")
+	}
+	backPolicy, err := decodeOne(encode(func(e *postcard.Encoder) { encodePolicy(e, PolicyJson) }), decodePolicy)
+	if err != nil || backPolicy != PolicyJson {
+		t.Fatalf("policy roundtrip = %v, %v", backPolicy, err)
+	}
+}
+
+func TestJsonMapSequentialRemoveHides(t *testing.T) {
+	// A remove that observes a set must hide the path whatever the
+	// tag order: sequential set-then-remove always reads back removed.
+	hi := Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(3), Operation: 9}
+	lo := Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(3), Operation: 1}
+	m := &JsonMap{}
+	m.Set("a", []byte("v"), hi)
+	m.Remove("a")
+	if got := m.Live(); len(got) != 0 {
+		t.Fatalf("live after observed remove = %+v, want empty", got)
+	}
+	_ = lo
+}
+
+func TestListSetAppendRemoveJoin(t *testing.T) {
+	tag := func(op uint32) Tag {
+		return Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(3), Operation: op}
+	}
+	l := &ListSet{}
+	// Duplicates render twice, in tag order.
+	l.Append([]byte("b"), tag(2))
+	l.Append([]byte("a"), tag(1))
+	l.Append([]byte("b"), tag(3))
+	if got := stringifyList(l.Values()); len(got) != 3 || got[0] != "a" || got[1] != "b" || got[2] != "b" {
+		t.Fatalf("values = %v", got)
+	}
+	// Remove retires every observed tag with the value.
+	l.Remove([]byte("b"))
+	if got := stringifyList(l.Values()); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("after remove = %v", got)
+	}
+	// A later append revives the value.
+	l.Append([]byte("b"), tag(4))
+	if got := stringifyList(l.Values()); len(got) != 2 {
+		t.Fatalf("revived = %v", got)
+	}
+	// Join unions appends and tombstones both ways.
+	o := &ListSet{}
+	o.Append([]byte("c"), tag(5))
+	l.Join(o)
+	o.Join(l)
+	for i, ls := range []*ListSet{l, o} {
+		if got := stringifyList(ls.Values()); len(got) != 3 {
+			t.Fatalf("list %d = %v", i, got)
+		}
+	}
+}
+
+func stringifyList(in [][]byte) []string {
+	out := make([]string, 0, len(in))
+	for _, b := range in {
+		out = append(out, string(b))
+	}
+	return out
+}
+
+func TestCausalListJoin(t *testing.T) {
+	x := &Causal{List: &ListSet{}}
+	y := &Causal{List: &ListSet{}}
+	x.List.Append([]byte("v"), Tag{Database: idOf(1), Node: idOf(2)})
+	if err := x.Join(y); err != nil {
+		t.Fatal(err)
+	}
+	if err := y.Join(x); err != nil {
+		t.Fatal(err)
+	}
+	if len(y.List.Values()) != 1 {
+		t.Fatal("list join lost element")
+	}
+	if err := x.Join(&Causal{Set: &Set{}}); err == nil {
+		t.Fatal("mixed list/set join accepted")
+	}
+}
+
+func TestListCodecRoundtrips(t *testing.T) {
+	l := &ListSet{}
+	l.Append([]byte("b"), Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(3), Operation: 7})
+	l.Append([]byte("a"), Tag{Database: idOf(1), Node: idOf(2), Transaction: idOf(4)})
+	l.Remove([]byte("b"))
+	back, err := DecodeListSet(EncodeListSet(l))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := stringifyList(back.Values()); len(got) != 1 || got[0] != "a" {
+		t.Fatalf("roundtrip = %v", got)
+	}
+	causal, err := DecodeCausal(EncodeCausal(&Causal{List: l}))
+	if err != nil || causal.List == nil {
+		t.Fatalf("causal roundtrip = %+v, %v", causal, err)
+	}
+	if _, err = DecodeListSet(EncodeListSet(l)[:len(EncodeListSet(l))-1]); err == nil {
+		t.Fatal("truncated list accepted")
+	}
+	backPolicy, err := decodeOne(encode(func(e *postcard.Encoder) { encodePolicy(e, PolicyList) }), decodePolicy)
+	if err != nil || backPolicy != PolicyList {
+		t.Fatalf("policy roundtrip = %v, %v", backPolicy, err)
 	}
 }

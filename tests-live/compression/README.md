@@ -46,6 +46,5 @@ and measures the on-disk data directory.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/compression/Cargo.toml
+  go test -count=1 ./tests-live/compression/
 ```

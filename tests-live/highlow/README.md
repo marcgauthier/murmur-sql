@@ -5,7 +5,7 @@ Go source: `/media/marc/2TB/Archives/MURMUR/tests-live/highlow/`
 
 ## What it proves
 
-Eight async `#[tokio::test]` fns (distinct `runtime/` names so parallel
+Eight test fns (distinct `runtime/` names so parallel
 execution stays isolated) port the eight Go tests one for one over a
 `contacts(id, name, score)` table plus an `email` column for the schema
 leg. Low and High are separate `murmur-server` clusters driven over the
@@ -128,11 +128,10 @@ Convergence waits are 30 s with 50 ms polls, matching the Go timeouts.
   `tests/bridge_files.rs` fixed-key convention; clusters never interact
   across tests. Each test owns 2-4 `runtime/` names (one `RESULT` line
   each). Public keys are derived with scenario-only registry deps
-  (`ed25519-dalek`, `x25519-dalek`, same versions as the product).
+  (in-module `murmur/replication` `PublicKey`/`RecipientPublic`, same logic as the product).
 
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/highlow/Cargo.toml
+  go test -count=1 ./tests-live/highlow/
 ```

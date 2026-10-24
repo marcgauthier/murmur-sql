@@ -43,9 +43,9 @@ everywhere.
   instead of `/v1/status` (`connected_peers`).
 - Digests are FNV-1a/64 over sorted names instead of SHA-256 (only
   cross-node equality within one process is asserted).
-- Writers are `tokio::spawn` tasks sharing the cluster behind one async
-  mutex (the harness `kill_node`/`start_node` legs need `&mut`, so the
-  pilot's borrowed `tokio::join!` shape cannot run writers across kills).
+- Writers are goroutines sharing the cluster behind one mutex (the
+  harness `KillNode`/`StartNode` legs need exclusive access, so writers
+  cannot run across kills in a borrowed join shape).
   A `running` flag per node, cleared before each kill and re-checked
   under the lock, keeps writers off a stopped node (whose
   `Cluster::node` would panic); every insert carries a 10 s wire timeout
@@ -58,5 +58,5 @@ everywhere.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/crash-recovery/Cargo.toml
+go test -count=1 ./tests-live/crash-recovery/
 ```

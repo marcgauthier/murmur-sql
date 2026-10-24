@@ -17,6 +17,8 @@ const (
 	PolicySet
 	PolicyMin
 	PolicyMax
+	PolicyJson
+	PolicyList
 )
 
 // Counter is a grow-only per-actor counter pair.
@@ -215,6 +217,8 @@ func (s *Set) Values() [][]byte {
 type Causal struct {
 	Counter *Counter
 	Set     *Set
+	Json    *JsonMap
+	List    *ListSet
 }
 
 // Join merges same-kind causal state.
@@ -225,6 +229,12 @@ func (c *Causal) Join(other *Causal) error {
 		return nil
 	case c.Set != nil && other.Set != nil:
 		c.Set.Join(other.Set)
+		return nil
+	case c.Json != nil && other.Json != nil:
+		c.Json.Join(other.Json)
+		return nil
+	case c.List != nil && other.List != nil:
+		c.List.Join(other.List)
 		return nil
 	}
 	return protocolErr("merge policy changed")
@@ -244,6 +254,10 @@ func decodePolicy(d *postcard.Decoder) Policy {
 		return PolicyMin
 	case 4:
 		return PolicyMax
+	case 5:
+		return PolicyJson
+	case 6:
+		return PolicyList
 	}
 	d.Fail(protocolErr("bad merge policy"))
 	return PolicyLww
@@ -367,11 +381,286 @@ func EncodeSet(s *Set) []byte { return encode(func(e *postcard.Encoder) { encode
 // DecodeSet parses a set.
 func DecodeSet(b []byte) (*Set, error) { return decodeOne(b, decodeSet) }
 
+// JsonMap is a flat JSON object: an OR-set of tagged writes per
+// path, resolving to the highest unretired tag. A set retires the
+// writes it observed, so the last write in a batch wins locally;
+// joins union writes and tombstones, so concurrent writes to one
+// path resolve to the same value on every node while unobserved
+// concurrent sets survive removes. Like Set, superseded writes are
+// kept, not garbage-collected. Seed writes carry zero-database,
+// zero-node tags so rebase can strip them.
+type JsonMap struct {
+	Paths    map[string]map[Tag][]byte
+	Removals map[string]map[Tag]bool
+}
+
+// Set records one path write, retiring the writes it observed.
+func (m *JsonMap) Set(path string, value []byte, tag Tag) {
+	if m.Paths == nil {
+		m.Paths = make(map[string]map[Tag][]byte)
+	}
+	writes := m.Paths[path]
+	if writes == nil {
+		writes = make(map[Tag][]byte)
+		m.Paths[path] = writes
+	}
+	if len(writes) > 0 {
+		if m.Removals == nil {
+			m.Removals = make(map[string]map[Tag]bool)
+		}
+		tombs := m.Removals[path]
+		if tombs == nil {
+			tombs = make(map[Tag]bool)
+			m.Removals[path] = tombs
+		}
+		for t := range writes {
+			tombs[t] = true
+		}
+	}
+	writes[tag] = value
+}
+
+// Remove retires the observed path writes; a later set revives the
+// path. A remove with nothing observed is a no-op.
+func (m *JsonMap) Remove(path string) {
+	writes := m.Paths[path]
+	if len(writes) == 0 {
+		return
+	}
+	if m.Removals == nil {
+		m.Removals = make(map[string]map[Tag]bool)
+	}
+	tombs := m.Removals[path]
+	if tombs == nil {
+		tombs = make(map[Tag]bool)
+		m.Removals[path] = tombs
+	}
+	for t := range writes {
+		tombs[t] = true
+	}
+}
+
+// Join unions path writes and tombstones.
+func (m *JsonMap) Join(other *JsonMap) {
+	if m.Paths == nil {
+		m.Paths = make(map[string]map[Tag][]byte)
+	}
+	if m.Removals == nil {
+		m.Removals = make(map[string]map[Tag]bool)
+	}
+	for path, writes := range other.Paths {
+		mine := m.Paths[path]
+		if mine == nil {
+			mine = make(map[Tag][]byte)
+			m.Paths[path] = mine
+		}
+		for tag, value := range writes {
+			mine[tag] = value
+		}
+	}
+	for path, tags := range other.Removals {
+		mine := m.Removals[path]
+		if mine == nil {
+			mine = make(map[Tag]bool)
+			m.Removals[path] = mine
+		}
+		for tag := range tags {
+			mine[tag] = true
+		}
+	}
+}
+
+// Live returns each path's highest unretired write.
+func (m *JsonMap) Live() map[string][]byte {
+	out := make(map[string][]byte, len(m.Paths))
+	for path, writes := range m.Paths {
+		var best Tag
+		var value []byte
+		found := false
+		for tag, v := range writes {
+			if m.Removals[path][tag] {
+				continue
+			}
+			if !found || tagLess(best, tag) {
+				best, value, found = tag, v, true
+			}
+		}
+		if found {
+			out[path] = value
+		}
+	}
+	return out
+}
+
+func encodeJsonMap(e *postcard.Encoder, m *JsonMap) {
+	paths := make([]string, 0, len(m.Paths))
+	for k := range m.Paths {
+		paths = append(paths, k)
+	}
+	sort.Strings(paths)
+	e.Len(len(paths))
+	for _, k := range paths {
+		e.ByteString([]byte(k))
+		writes := m.Paths[k]
+		tags := make([]Tag, 0, len(writes))
+		for t := range writes {
+			tags = append(tags, t)
+		}
+		sort.Slice(tags, func(i, j int) bool { return tagLess(tags[i], tags[j]) })
+		e.Len(len(tags))
+		for _, t := range tags {
+			encodeTag(e, t)
+			e.ByteString(writes[t])
+		}
+	}
+	tombs := make([]string, 0, len(m.Removals))
+	for k := range m.Removals {
+		tombs = append(tombs, k)
+	}
+	sort.Strings(tombs)
+	e.Len(len(tombs))
+	for _, k := range tombs {
+		e.ByteString([]byte(k))
+		encodeTagSet(e, m.Removals[k])
+	}
+}
+
+func decodeJsonMap(d *postcard.Decoder) *JsonMap {
+	m := &JsonMap{Paths: make(map[string]map[Tag][]byte)}
+	for n := d.Len(); n > 0; n-- {
+		path := string(d.Bytes())
+		writes := make(map[Tag][]byte)
+		for k := d.Len(); k > 0; k-- {
+			t := decodeTag(d)
+			writes[t] = d.Bytes()
+		}
+		m.Paths[path] = writes
+	}
+	m.Removals = make(map[string]map[Tag]bool)
+	for n := d.Len(); n > 0; n-- {
+		m.Removals[string(d.Bytes())] = decodeTagSet(d)
+	}
+	return m
+}
+
+// EncodeJsonMap serializes a JSON map.
+func EncodeJsonMap(m *JsonMap) []byte {
+	return encode(func(e *postcard.Encoder) { encodeJsonMap(e, m) })
+}
+
+// DecodeJsonMap parses a JSON map.
+func DecodeJsonMap(b []byte) (*JsonMap, error) { return decodeOne(b, decodeJsonMap) }
+
+// ListSet is a JSON array: an OR-set of tagged appends rendering in
+// tag order. Duplicates render once per live tag; removal retires
+// every observed tag carrying the value, so an unobserved concurrent
+// append survives while a later append revives the value. Seed
+// appends carry zero-database, zero-node tags so rebase can strip
+// them. Like Set, retired appends are kept, not garbage-collected.
+type ListSet struct {
+	Appends  map[Tag][]byte
+	Removals map[Tag]bool
+}
+
+// Append records one element write.
+func (s *ListSet) Append(value []byte, tag Tag) {
+	if s.Appends == nil {
+		s.Appends = make(map[Tag][]byte)
+	}
+	s.Appends[tag] = value
+}
+
+// Remove retires every observed tag carrying the value; an append
+// the remove never observed survives it.
+func (s *ListSet) Remove(value []byte) {
+	for tag, v := range s.Appends {
+		if !bytes.Equal(v, value) {
+			continue
+		}
+		if s.Removals == nil {
+			s.Removals = make(map[Tag]bool)
+		}
+		s.Removals[tag] = true
+	}
+}
+
+// Join unions appends and tombstones.
+func (s *ListSet) Join(other *ListSet) {
+	if s.Appends == nil {
+		s.Appends = make(map[Tag][]byte)
+	}
+	if s.Removals == nil {
+		s.Removals = make(map[Tag]bool)
+	}
+	for tag, value := range other.Appends {
+		s.Appends[tag] = value
+	}
+	for tag := range other.Removals {
+		s.Removals[tag] = true
+	}
+}
+
+// Values returns live elements in tag order.
+func (s *ListSet) Values() [][]byte {
+	tags := make([]Tag, 0, len(s.Appends))
+	for tag := range s.Appends {
+		if s.Removals[tag] {
+			continue
+		}
+		tags = append(tags, tag)
+	}
+	sort.Slice(tags, func(i, j int) bool { return tagLess(tags[i], tags[j]) })
+	out := make([][]byte, 0, len(tags))
+	for _, tag := range tags {
+		out = append(out, s.Appends[tag])
+	}
+	return out
+}
+
+func encodeListSet(e *postcard.Encoder, s *ListSet) {
+	tags := make([]Tag, 0, len(s.Appends))
+	for t := range s.Appends {
+		tags = append(tags, t)
+	}
+	sort.Slice(tags, func(i, j int) bool { return tagLess(tags[i], tags[j]) })
+	e.Len(len(tags))
+	for _, t := range tags {
+		encodeTag(e, t)
+		e.ByteString(s.Appends[t])
+	}
+	encodeTagSet(e, s.Removals)
+}
+
+func decodeListSet(d *postcard.Decoder) *ListSet {
+	s := &ListSet{Appends: make(map[Tag][]byte)}
+	for n := d.Len(); n > 0; n-- {
+		t := decodeTag(d)
+		s.Appends[t] = d.Bytes()
+	}
+	s.Removals = decodeTagSet(d)
+	return s
+}
+
+// EncodeListSet serializes a list set.
+func EncodeListSet(s *ListSet) []byte {
+	return encode(func(e *postcard.Encoder) { encodeListSet(e, s) })
+}
+
+// DecodeListSet parses a list set.
+func DecodeListSet(b []byte) (*ListSet, error) { return decodeOne(b, decodeListSet) }
+
 func encodeCausal(e *postcard.Encoder, c *Causal) {
-	if c.Counter != nil {
+	switch {
+	case c.Counter != nil:
 		e.Discriminant(0)
 		encodeCounter(e, c.Counter)
-	} else {
+	case c.Json != nil:
+		e.Discriminant(2)
+		encodeJsonMap(e, c.Json)
+	case c.List != nil:
+		e.Discriminant(3)
+		encodeListSet(e, c.List)
+	default:
 		e.Discriminant(1)
 		encodeSet(e, c.Set)
 	}
@@ -383,6 +672,10 @@ func decodeCausal(d *postcard.Decoder) *Causal {
 		return &Causal{Counter: decodeCounter(d)}
 	case 1:
 		return &Causal{Set: decodeSet(d)}
+	case 2:
+		return &Causal{Json: decodeJsonMap(d)}
+	case 3:
+		return &Causal{List: decodeListSet(d)}
 	}
 	d.Fail(protocolErr("bad causal state"))
 	return nil

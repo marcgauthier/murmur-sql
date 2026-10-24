@@ -1189,11 +1189,17 @@ func (c *engineCore) accept(conn quicConn) error {
 	stream, err := conn.AcceptStream(acceptCtx)
 	cancel()
 	if err != nil {
+		if isDuplicateClose(conn, err) {
+			return nil
+		}
 		return unavailableErr("stream timeout")
 	}
 	hello, err := readMessageTimeout(stream, 5*time.Second, "hello timeout")
 	if err != nil {
 		stream.Close()
+		if isDuplicateClose(conn, err) {
+			return nil
+		}
 		return err
 	}
 	db, node := c.backend.Identity()
@@ -1221,6 +1227,13 @@ func (c *engineCore) accept(conn quicConn) error {
 	}
 	if err := WriteMessage(stream, &welcome); err != nil {
 		stream.Close()
+		// The dialer may have lost the tie-break and closed with
+		// duplicate reason while we wrote: routine churn, not an
+		// engine error. Guard before wrapping: protocolErr would
+		// destroy the chain the predicate matches on.
+		if isDuplicateClose(conn, err) {
+			return nil
+		}
 		return protocolErr("%v", err)
 	}
 	return c.session(conn, stream, id, false, hello.Fetch, hello.Schema)

@@ -5,7 +5,7 @@ Acknowledged baseline rows are flushed before each real server restart. Writers
 on both surviving nodes continue issuing SQL while the stopped node restarts;
 every acknowledged row must converge on all three nodes after each round.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

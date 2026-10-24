@@ -5,7 +5,7 @@ Four SQL workers commit 240 rows on one node while its peer commits another
 and remote scheduler acquisitions and debt no greater than one second. Every
 local commit is timed; the test checks all latency samples.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

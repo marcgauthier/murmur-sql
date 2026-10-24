@@ -52,6 +52,5 @@ space plus a restart must recover to exact convergence.
 
 ```sh
 MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server \
-  CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target \
-  cargo test --manifest-path tests-live/diskfull-live/Cargo.toml -- --nocapture
+  MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh diskfull-live
 ```

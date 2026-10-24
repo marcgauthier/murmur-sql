@@ -59,6 +59,5 @@ None beyond the standard harness knobs (`MURMUR_LIVE_RUNTIME`,
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/churn-retirement/Cargo.toml
+  go test -count=1 ./tests-live/churn-retirement/
 ```

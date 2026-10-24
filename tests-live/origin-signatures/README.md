@@ -80,6 +80,5 @@ None beyond the shared `MURMUR_LIVE_RUNTIME` / `MURMUR_LIVE_FAILURES` /
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/origin-signatures/Cargo.toml
+  go test -count=1 ./tests-live/origin-signatures/
 ```

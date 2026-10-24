@@ -111,8 +111,13 @@ replication:
   retention_interval: "1m"
   minimum_retained: 1000
   maximum_offline: "7d"
+  # merge_policies maps "table.column" to a merge policy. Names:
+  # counter, set, min, max, json, list (lww is the default and need not be
+  # listed). Entries for tables created later attach on migration.
   # merge_policies:
   #   "items.count": "counter"
+  #   "docs.doc": "json"
+  #   "nums.list": "list"
 
   # Per-table replication flags, keyed by stable table ID. Missing entries mean
   # local-only; set true to replicate. `MURMUR SET TABLE <name> REPLICATED true|false`

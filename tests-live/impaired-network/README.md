@@ -53,6 +53,5 @@ per-row visibility latencies are recorded with relaxed p95 bounds.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/impaired-network/Cargo.toml
+  go test -count=1 ./tests-live/impaired-network/
 ```

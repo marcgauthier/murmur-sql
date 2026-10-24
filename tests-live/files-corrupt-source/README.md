@@ -91,7 +91,6 @@ the retry-persistence window is 500 ms (~5 background fetch cycles).
 ## Compile check
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/files-corrupt-source/Cargo.toml
+  go test -count=1 ./tests-live/files-corrupt-source/
 ```
 

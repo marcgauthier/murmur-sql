@@ -42,6 +42,37 @@ def _literal(value: Union[int, float, str]) -> str:
     raise ValueError("murmur: policy values must be int, finite float or str")
 
 
+PolicyKey = Union[str, List[Union[int, float, str]]]
+
+
+def _policy_key(key: PolicyKey) -> tuple:
+    """Render a policy key span plus the value separator.
+
+    A plain string keeps the legacy single-key form; a list uses the
+    KEY ... VALUE form. Returns (key_span, value_prefix)."""
+    if isinstance(key, str):
+        return _quote(key), ""
+    if not isinstance(key, (list, tuple)) or len(key) == 0:
+        raise ValueError("murmur: policy key must be a string or a non-empty list")
+    return "KEY " + " ".join(_literal(k) for k in key), "VALUE "
+
+
+def _policy_key_marked(key: PolicyKey) -> str:
+    """Render a policy key span with the KEY marker always present,
+    for operations without a legacy form."""
+    if isinstance(key, str):
+        return "KEY " + _quote(key)
+    if not isinstance(key, (list, tuple)) or len(key) == 0:
+        raise ValueError("murmur: policy key must be a string or a non-empty list")
+    return "KEY " + " ".join(_literal(k) for k in key)
+
+
+def _policy_path(path: str) -> str:
+    if not isinstance(path, str) or not path:
+        raise ValueError("murmur: json path must be a non-empty string")
+    return _quote(path)
+
+
 @dataclass
 class VectorOptions:
     dimensions: int
@@ -192,22 +223,47 @@ class AdminCommands:
         """Run one bounded collection pass and return the deleted log count."""
         return int(self.execute("MURMUR RETENTION COLLECT")[0][0])
 
-    def policy_counter_add(self, table: str, column: str, key: str, delta: int) -> None:
+    def policy_counter_add(self, table: str, column: str, key: PolicyKey, delta: int) -> None:
         if type(delta) is not int:
             raise ValueError("murmur: counter delta must be int64")
-        self.execute(f"MURMUR POLICY COUNTER_ADD {_target(table, column)} {_quote(key)} {_literal(delta)}")
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY COUNTER_ADD {_target(table, column)} {ks} {vp}{_literal(delta)}")
 
-    def policy_set_add(self, table: str, column: str, key: str, value: str) -> None:
-        self.execute(f"MURMUR POLICY SET_ADD {_target(table, column)} {_quote(key)} {_quote(value)}")
+    def policy_set_add(self, table: str, column: str, key: PolicyKey, value: str) -> None:
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY SET_ADD {_target(table, column)} {ks} {vp}{_quote(value)}")
 
-    def policy_set_remove(self, table: str, column: str, key: str, value: str) -> None:
-        self.execute(f"MURMUR POLICY SET_REMOVE {_target(table, column)} {_quote(key)} {_quote(value)}")
+    def policy_set_remove(self, table: str, column: str, key: PolicyKey, value: str) -> None:
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY SET_REMOVE {_target(table, column)} {ks} {vp}{_quote(value)}")
 
-    def policy_min(self, table: str, column: str, key: str, value: Union[int, float, str]) -> None:
-        self.execute(f"MURMUR POLICY MIN {_target(table, column)} {_quote(key)} {_literal(value)}")
+    def policy_min(self, table: str, column: str, key: PolicyKey, value: Union[int, float, str]) -> None:
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY MIN {_target(table, column)} {ks} {vp}{_literal(value)}")
 
-    def policy_max(self, table: str, column: str, key: str, value: Union[int, float, str]) -> None:
-        self.execute(f"MURMUR POLICY MAX {_target(table, column)} {_quote(key)} {_literal(value)}")
+    def policy_max(self, table: str, column: str, key: PolicyKey, value: Union[int, float, str]) -> None:
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY MAX {_target(table, column)} {ks} {vp}{_literal(value)}")
+
+    def policy_json_set(self, table: str, column: str, key: PolicyKey, path: str,
+                        value: Union[int, float, str, None]) -> None:
+        literal = "NULL" if value is None else _literal(value)
+        self.execute(f"MURMUR POLICY JSON_SET {_target(table, column)} {_policy_key_marked(key)} PATH {_policy_path(path)} VALUE {literal}")
+
+    def policy_json_remove(self, table: str, column: str, key: PolicyKey, path: str) -> None:
+        self.execute(f"MURMUR POLICY JSON_REMOVE {_target(table, column)} {_policy_key_marked(key)} PATH {_policy_path(path)}")
+
+    def policy_list_append(self, table: str, column: str, key: PolicyKey,
+                           value: Union[int, float, str, None]) -> None:
+        literal = "NULL" if value is None else _literal(value)
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY LIST_APPEND {_target(table, column)} {ks} {vp}{literal}")
+
+    def policy_list_remove(self, table: str, column: str, key: PolicyKey,
+                           value: Union[int, float, str, None]) -> None:
+        literal = "NULL" if value is None else _literal(value)
+        ks, vp = _policy_key(key)
+        self.execute(f"MURMUR POLICY LIST_REMOVE {_target(table, column)} {ks} {vp}{literal}")
 
     def bridge_release(self, table: str, key: str, column: Optional[str] = None) -> bool:
         """Release High ownership; false means busy (retry). Single-TEXT-key rows only."""

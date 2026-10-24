@@ -46,8 +46,7 @@ snapshot.
   instead of waiting out the engine's 60 s collection interval.
 - Harness knobs apply: `MURMUR_LIVE_RUNTIME`, `MURMUR_LIVE_FAILURES`,
   `MURMUR_LIVE_UNLOCK_STALL_SECONDS`,
-  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`,
-  `CARGO_TARGET_DIR`.
+  `MURMUR_LIVE_UNLOCK_TIMEOUT_SECONDS`, `MURMUR_SERVER_BIN`.
 
 ## Deviations from the Go original
 
@@ -89,6 +88,5 @@ snapshot.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/snapshot-resync/Cargo.toml
+  go test -count=1 ./tests-live/snapshot-resync/
 ```

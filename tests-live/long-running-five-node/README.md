@@ -12,7 +12,7 @@ successfully replicated post-soak write.
 `MURMUR_FIVE_NODE_SETTLE_SECONDS` to 120. The soak runner requests 3,600 seconds.
 Short runs require an appropriately short write interval to meet progress gates.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use

@@ -309,6 +309,12 @@ async fn replication_commands_need_enabled_replication() {
         murmur_client::Error::Invalid(_)
     ));
     assert!(matches!(
+        db.policy_counter_add("t", "c", Vec::<murmur_client::PolicyValue>::new(), 1)
+            .await
+            .unwrap_err(),
+        murmur_client::Error::Invalid(_)
+    ));
+    assert!(matches!(
         db.bridge_release("", "k", None).await.unwrap_err(),
         murmur_client::Error::Invalid(_)
     ));
@@ -388,7 +394,7 @@ async fn peer_mesh_show_and_retention() {
 #[tokio::test]
 async fn policy_crdt_operations() {
     let dir = tempfile::tempdir().unwrap();
-    let policies = "  merge_policies:\n    \"stats.count\": \"counter\"\n    \"stats.tags\": \"set\"\n    \"stats.highest\": \"max\"\n    \"stats.lowest\": \"min\"\n";
+    let policies = "  merge_policies:\n    \"stats.count\": \"counter\"\n    \"stats.tags\": \"set\"\n    \"stats.highest\": \"max\"\n    \"stats.lowest\": \"min\"\n    \"pairs.n\": \"counter\"\n    \"docs.doc\": \"json\"\n    \"nums.list\": \"list\"\n";
     let opts = support::replication_options(dir.path(), policies);
     let server = support::start(dir, opts);
     let db = Client::connect(&support::config(&server, "policy-key"))
@@ -454,6 +460,112 @@ async fn policy_crdt_operations() {
             .code(),
         Some("02000")
     );
+    // Composite keys address multi-column-key rows through KEY ... VALUE.
+    db.execute(
+        "CREATE TABLE pairs(a INTEGER NOT NULL, b TEXT NOT NULL, n INTEGER NOT NULL, PRIMARY KEY (a, b))",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO pairs VALUES (1, 'x', 10)", &[])
+        .await
+        .unwrap();
+    use murmur_client::PolicyValue;
+    db.policy_counter_add("pairs", "n", vec![PolicyValue::Integer(1), "x".into()], 5)
+        .await
+        .unwrap();
+    let row = db
+        .query("SELECT n FROM pairs WHERE a = 1 AND b = 'x'", &[])
+        .await
+        .unwrap();
+    assert_eq!(row[0].get::<_, i64>(0), 15);
+    // A key prefix that does not cover the table key is rejected.
+    assert_eq!(
+        db.policy_counter_add("pairs", "n", vec![PolicyValue::Integer(1)], 1)
+            .await
+            .unwrap_err()
+            .code(),
+        Some("22023")
+    );
+    // JSON paths merge per-path and render canonical object text.
+    db.execute(
+        "CREATE TABLE docs(key TEXT NOT NULL PRIMARY KEY, doc TEXT)",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO docs VALUES ('d1', NULL)", &[])
+        .await
+        .unwrap();
+    db.policy_json_set("docs", "doc", "d1", "b", Some("x".into()))
+        .await
+        .unwrap();
+    db.policy_json_set("docs", "doc", "d1", "a", Some(1i64.into()))
+        .await
+        .unwrap();
+    db.policy_json_set("docs", "doc", "d1", "z", None)
+        .await
+        .unwrap();
+    let row = db
+        .query("SELECT doc FROM docs WHERE key = 'd1'", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        row[0].get::<_, String>(0),
+        r#"{"a":1,"b":"x","z":null}"#.to_string()
+    );
+    db.policy_json_remove("docs", "doc", "d1", "b")
+        .await
+        .unwrap();
+    let row = db
+        .query("SELECT doc FROM docs WHERE key = 'd1'", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        row[0].get::<_, String>(0),
+        r#"{"a":1,"z":null}"#.to_string()
+    );
+    assert!(matches!(
+        db.policy_json_set("docs", "doc", "d1", "", Some(1i64.into()))
+            .await
+            .unwrap_err(),
+        murmur_client::Error::Invalid(_)
+    ));
+    // List appends union in tag order; removes drop every matching element.
+    db.execute(
+        "CREATE TABLE nums(key TEXT NOT NULL PRIMARY KEY, list TEXT)",
+        &[],
+    )
+    .await
+    .unwrap();
+    db.execute("INSERT INTO nums VALUES ('n1', NULL)", &[])
+        .await
+        .unwrap();
+    db.policy_list_append("nums", "list", "n1", Some(2i64.into()))
+        .await
+        .unwrap();
+    db.policy_list_append("nums", "list", "n1", Some("x".into()))
+        .await
+        .unwrap();
+    db.policy_list_append("nums", "list", "n1", Some(2i64.into()))
+        .await
+        .unwrap();
+    let row = db
+        .query("SELECT list FROM nums WHERE key = 'n1'", &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        row[0].get::<_, String>(0),
+        r#"[2,"x",2]"#.to_string()
+    );
+    db.policy_list_remove("nums", "list", "n1", Some(2i64.into()))
+        .await
+        .unwrap();
+    let row = db
+        .query("SELECT list FROM nums WHERE key = 'n1'", &[])
+        .await
+        .unwrap();
+    assert_eq!(row[0].get::<_, String>(0), r#"["x"]"#.to_string());
 }
 
 #[tokio::test]

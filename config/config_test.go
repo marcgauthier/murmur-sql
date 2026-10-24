@@ -55,6 +55,8 @@ func TestStrictConfig(t *testing.T) {
 		"replication:\n  bind: 'db0.example:9001'\n",
 		"replication:\n  enabled: true\n",
 		"replication:\n  dissemination: 'unknown'\n",
+		"replication:\n  merge_policies:\n    t.c: 'frobnicate'\n",
+		"replication:\n  merge_policies:\n    t: 'counter'\n",
 		"backups:\n  dir: ' '\n",
 		"logging:\n  file_prefix: '../bad'\n",
 	} {
@@ -63,6 +65,17 @@ func TestStrictConfig(t *testing.T) {
 				t.Fatal("accepted invalid configuration")
 			}
 		})
+	}
+}
+
+// TestMergePolicyNames pins the accepted merge policy names.
+func TestMergePolicyNames(t *testing.T) {
+	cfg, e := Parse([]byte("replication:\n  merge_policies:\n    t.a: 'lww'\n    t.b: 'counter'\n    t.c: 'set'\n    t.d: 'min'\n    t.e: 'max'\n    t.f: 'json'\n    t.g: 'list'\n"))
+	if e != nil {
+		t.Fatalf("valid policies rejected: %v", e)
+	}
+	if len(cfg.Replication.MergePolicies) != 7 {
+		t.Fatalf("policies = %+v", cfg.Replication.MergePolicies)
 	}
 }
 

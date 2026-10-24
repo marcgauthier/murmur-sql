@@ -35,10 +35,13 @@ The module replacements point to the root SQL module and vendored zstd.
 
 ## Live scenarios
 
-The retained Rust scenario sources remain regression specifications. The runner
-builds Go server binaries or accepts `MURMUR_SERVER_BIN`; it still requires Rust
-for scenario harnesses and clients. Some adversarial fixtures depend on the
-original Rust engine's public protocol types.
+The 74 live scenario suites under `tests-live/` are Go test packages
+driven by `tests-live/run.sh`, which builds Go server binaries or
+accepts `MURMUR_SERVER_BIN`. The suites were migrated from Rust and
+the Rust sources removed; adversarial fixtures use the in-module
+`murmur/replication` protocol types plus stdlib crypto. The only
+remaining Rust is the `clients/rust` SDK, which the suites do not
+use. Scenario details live in `tests-live/README.md`.
 
 ```sh
 go build -o bin/ ./cmd/murmur-server ./cmd/murmur-admin
@@ -47,9 +50,9 @@ MURMUR_ENGINE_INTEGRATION=1 tests-live/run.sh gate
 ```
 
 The environment switch is an explicit opt-in to expensive live scenarios, not
-an indication that an engine adapter is missing. MURMUR-GO now uses QUIC, but
-neither Rust attacker fixture compatibility nor cross-language peering has been
-validated by this port.
+an indication that an engine adapter is missing. The suites run against the
+Go server's QUIC mesh; attacker fixtures speak the wire protocol directly,
+so no cross-language peering layer remains to validate.
 
 Priority cases for the later pass: first unlock into absent/empty storage;
 wrong-key immutability; concurrent connections; parameter/result type stability;

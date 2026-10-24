@@ -63,10 +63,9 @@ Scope (same as Go): version churn only; deletes are out of scope
   `%032x` format; only the `name` column churns (as in Go).
 - The table is explicitly flagged replicated on each node; the Go
   fixture tables replicate by default.
-- Concurrency via borrowed updater futures inside one `tokio::join!`
-  with the measurement driver (no `'static` spawn; the stop flag is
-  set on every driver exit path so a failed phase cannot hang the
-  join) instead of goroutines + `WaitGroup`; per-op `flush()`
+- Concurrency via goroutines + `WaitGroup` with the measurement
+  driver (the stop flag is set on every driver exit path so a failed
+  phase cannot hang the join); per-op `flush()`
   publishes each write to replication; per-op errors are counted
   (`update_errs`) rather than failing fast, as in Go.
 - Aggressive retention maps onto the harness
@@ -109,6 +108,5 @@ Scope (same as Go): version churn only; deletes are out of scope
 
 ```sh
 MURMUR_SERVER_BIN=/home/marc/MURMUR-SQL/target/debug/murmur-server \
-  CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/target \
-  cargo test --manifest-path tests-live/gc-balance/Cargo.toml -- --nocapture
+  MURMUR_ENGINE_INTEGRATION=1 ./tests-live/run.sh gc-balance
 ```

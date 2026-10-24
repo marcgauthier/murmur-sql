@@ -35,6 +35,5 @@ winners regardless of merge order.
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR/tests-live/target \
   cargo test --no-run --manifest-path /home/marc/MURMUR/tests-live/clock-skew/Cargo.toml
 ```

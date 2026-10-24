@@ -44,8 +44,8 @@ path must be proven (gap-pull needs).
   `last_seen_millis_ago`) instead of `/metrics` gauges. The wire has no
   probe-failure counter, so staleness and session state take the place
   of Go's `probes_failed` detection leg.
-- Writers are borrowed async futures inside one `tokio::join!` with the
-  freeze driver (no thread scope); the frozen node's writer pauses while
+- Writers are goroutines inside one `WaitGroup` with the freeze driver;
+  the frozen node's writer pauses while
   it is suspended.
 - Resume needs only SIGCONT plus an explicit re-mesh (no auto-redial).
 - With default retention the log still holds everything, so catch-up
@@ -58,6 +58,5 @@ path must be proven (gap-pull needs).
 ## Compile check (only gate; never run here)
 
 ```sh
-CARGO_TARGET_DIR=/home/marc/MURMUR-SQL/tests-live/target \
-  cargo test --no-run --manifest-path /home/marc/MURMUR-SQL/tests-live/pause-resume/Cargo.toml
+  go test -count=1 ./tests-live/pause-resume/
 ```

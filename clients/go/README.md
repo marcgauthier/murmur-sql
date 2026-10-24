@@ -181,6 +181,7 @@ MURMUR POLICY SET_ADD stats tags 'row-1' 'blue';
 MURMUR POLICY SET_REMOVE stats tags 'row-1' 'blue';
 MURMUR POLICY MIN stats lowest 'row-1' -1.5;
 MURMUR POLICY MAX stats highest 'row-1' 42;
+MURMUR POLICY COUNTER_ADD pairs n KEY 1 'x' VALUE 5;
 MURMUR BRIDGE RELEASE notes 'row-1' COLUMN title;
 ```
 
@@ -199,7 +200,7 @@ waits for persistence. Managed migrations reject JSON expression indexes,
 
 Peer/retention/policy commands require a replication-enabled server and node
 credentials. Policy operations require a configured matching merge policy and
-one TEXT application key. Bridge release additionally needs a high-receiver
+one row key (composite keys via `KEY ... VALUE`). Bridge release additionally needs a high-receiver
 bridge. These commands do not provide an all-peer durability barrier.
 After key rotation, close the old pool and open a new one with the new key.
 

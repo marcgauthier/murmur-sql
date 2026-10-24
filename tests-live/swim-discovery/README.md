@@ -7,7 +7,7 @@ and requires rediscovery and exact row convergence.
 
 `MURMUR_SWIM_DISCOVERY_SECONDS` defaults to 60 seconds.
 
-All database operations use explicit SQL through `clients/rust` against live
+All database operations use explicit SQL through the `goharness` SQL client against live
 `murmur-server` child processes. Schema setup explicitly enables table
 replication; missing settings never implicitly enable it. Peer topology uses
 `MURMUR SHOW PEERS`; scheduler, persistence, and replication counters use
