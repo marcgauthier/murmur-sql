@@ -71,6 +71,25 @@ Tune the returned pool with standard `SetMaxOpenConns` and `SetMaxIdleConns`,
 or the corresponding `Config` fields. A single manual unlock on `*sql.DB`
 would not unlock every connection; the connection hook in `Open` handles that.
 
+`Config.Standbys` lists failover servers, tried in order after `Host`/`Port`:
+
+```go
+murmur.Config{
+    // Host, User, Password, Key, ...
+    Standbys: []murmur.HostPort{{Host: "db2", Port: 5432}},
+}
+```
+
+Transport failures (refused/reset connections, EOF, class `08` and `57P0x`
+errors) move to the next healthy host and black the failed host out with
+exponential backoff (200ms doubling, 5s cap); the pool returns to earlier
+hosts as they recover. Auth failures never fail over. Retried statements
+are at-least-once: an unacknowledged write may already have executed, so
+use idempotent statements or fixed primary keys and treat `23505` as
+acknowledged. In-flight transactions cannot migrate hosts: a failure
+inside `Tx` aborts that transaction, and the next `Begin` lands on a
+healthy host.
+
 TLS mirrors PostgreSQL `sslmode`:
 
 ```go

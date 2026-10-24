@@ -40,6 +40,7 @@ func newStubBackend(node NodeId, schema []byte) *stubBackend {
 
 func (b *stubBackend) Identity() (NodeId, NodeId) { return stubDatabase, b.node }
 func (b *stubBackend) CancelPending()             {}
+func (b *stubBackend) InvalidateProgress()        {}
 func (b *stubBackend) Get(key []byte) ([]byte, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

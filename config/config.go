@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"net/netip"
 	"net/url"
 	"os"
@@ -157,6 +158,54 @@ func pointer(s *string) string {
 }
 func nonempty(s string) bool { return strings.TrimSpace(s) != "" }
 func socket(s string) error  { _, e := netip.ParseAddrPort(s); return e }
+
+// socketOrName validates host:port where host is an IP literal or DNS
+// name. It never resolves: offline validation must not need DNS.
+func socketOrName(s string) error {
+	if _, e := netip.ParseAddrPort(s); e == nil {
+		return nil
+	}
+	host, port, e := net.SplitHostPort(s)
+	if e != nil {
+		return e
+	}
+	if !ValidDNSName(host) {
+		return fmt.Errorf("invalid host %q", host)
+	}
+	p, e := strconv.Atoi(port)
+	if e != nil || p < 1 || p > 65535 {
+		return fmt.Errorf("invalid port %q", port)
+	}
+	return nil
+}
+
+// ValidDNSName reports whether host is a plausible DNS name: dot-separated
+// labels of letters, digits, hyphens, and underscores.
+func ValidDNSName(host string) bool {
+	if len(host) == 0 || len(host) > 253 {
+		return false
+	}
+	name := strings.TrimSuffix(host, ".")
+	if name == "" {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 {
+			return false
+		}
+		for i := 0; i < len(label); i++ {
+			c := label[i]
+			if c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_' {
+				continue
+			}
+			return false
+		}
+		if label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+	}
+	return true
+}
 func (c Config) Validate() error {
 	bad := func(s string) error { return errors.New(s) }
 	if e := socket(c.Server.Bind); e != nil {
@@ -240,13 +289,13 @@ func (r ReplicationConfig) Validate() error {
 		return fmt.Errorf("replication.bind: %w", e)
 	}
 	if r.Advertise != nil {
-		if e := socket(*r.Advertise); e != nil {
-			return e
+		if e := socketOrName(*r.Advertise); e != nil {
+			return fmt.Errorf("replication.advertise %q: %w", *r.Advertise, e)
 		}
 	}
 	for _, s := range r.Bootstrap {
-		if e := socket(s); e != nil {
-			return e
+		if e := socketOrName(s); e != nil {
+			return fmt.Errorf("replication.bootstrap %q: %w", s, e)
 		}
 	}
 	for _, s := range r.AllowedNetworks {

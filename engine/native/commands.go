@@ -102,8 +102,8 @@ func (d *database) Command(ctx context.Context, id uint64, c engine.Command) (en
 	case "BACKUP DIRECTORY":
 		out.Tag = "BACKUP"
 		err = d.db.Backup(args[0].(string))
-	case "PEER ADD", "PEER REMOVE", "PEER RETIRE", "PEER SYNC", "SHOW PEERS", "SHOW REPLICATION", "SHOW RETENTION", "RETENTION COLLECT", "BRIDGE RELEASE":
-		out, err = d.replicationCommand(c)
+	case "PEER ADD", "PEER REMOVE", "PEER RETIRE", "PEER SYNC", "SHOW PEERS", "SHOW REPLICATION", "SHOW RETENTION", "SHOW HEAD", "RETENTION COLLECT", "BRIDGE RELEASE", "WAIT FOR", "WAIT FOR LAG":
+		out, err = d.replicationCommand(ctx, c)
 	case "POLICY COUNTER_ADD", "POLICY SET_ADD", "POLICY SET_REMOVE", "POLICY MIN", "POLICY MAX":
 		if d.db.Replication() == nil {
 			return out, userError("55000", "replication is not enabled")
@@ -165,7 +165,7 @@ func sortedKeys[V any](m map[string]V) []string {
 	sort.Strings(out)
 	return out
 }
-func (d *database) replicationCommand(c engine.Command) (engine.Result, error) {
+func (d *database) replicationCommand(ctx context.Context, c engine.Command) (engine.Result, error) {
 	h := d.db.Replication()
 	if h == nil {
 		return engine.Result{}, userError("55000", "replication is not enabled")
@@ -195,6 +195,50 @@ func (d *database) replicationCommand(c engine.Command) (engine.Result, error) {
 	case "PEER SYNC":
 		err = h.ForceSync()
 		out.Tag = "PEER"
+	case "WAIT FOR", "WAIT FOR LAG":
+		timeout := 30 * time.Second
+		if (c.Operation == "WAIT FOR" && len(a) == 3) || (c.Operation == "WAIT FOR LAG" && len(a) == 2) {
+			secs := a[len(a)-1].(int64)
+			if secs < 0 {
+				err = userError("22023", "timeout must be non-negative")
+				break
+			}
+			timeout = time.Duration(secs) * time.Second
+		}
+		if err == nil {
+			wctx, cancel := context.WithTimeout(ctx, timeout)
+			defer cancel()
+			if c.Operation == "WAIT FOR" {
+				seq := a[1].(int64)
+				var node [16]byte
+				if seq < 0 {
+					err = userError("22023", "sequence must be non-negative")
+				} else if node, err = nodeID(a[0].(string)); err != nil {
+					err = userError("22023", "origin must be 32 hex characters")
+				} else {
+					err = h.WaitForApplied(wctx, node, uint64(seq))
+				}
+			} else {
+				bound := a[0].(int64)
+				if bound < 0 {
+					err = userError("22023", "lag bound must be non-negative")
+				} else {
+					err = h.WaitForLag(wctx, uint64(bound))
+				}
+			}
+		}
+		out.Tag = "WAIT"
+	case "SHOW HEAD":
+		var heads []replication.Progress
+		heads, err = h.LocalProgress()
+		if err == nil {
+			sort.Slice(heads, func(i, j int) bool {
+				return hex.EncodeToString(heads[i].Origin[:]) < hex.EncodeToString(heads[j].Origin[:])
+			})
+			for _, p := range heads {
+				out.Rows = append(out.Rows, []engine.Value{hex.EncodeToString(p.Origin[:]), sat(p.Applied)})
+			}
+		}
 	case "RETENTION COLLECT":
 		var n uint64
 		n, err = h.CollectRetention()
@@ -208,14 +252,17 @@ func (d *database) replicationCommand(c engine.Command) (engine.Result, error) {
 			return hex.EncodeToString(peers[i].NodeID[:]) < hex.EncodeToString(peers[j].NodeID[:])
 		})
 		for _, p := range peers {
-			var address, last any
+			var address, last, progressAgo any
 			if p.Address != nil {
 				address = p.Address.String()
 			}
 			if p.LastSeenMillisAgo != nil {
 				last = sat(*p.LastSeenMillisAgo)
 			}
-			out.Rows = append(out.Rows, []engine.Value{hex.EncodeToString(p.NodeID[:]), address, strconv.FormatBool(p.Connected), last, sat(p.SentWatermark), strconv.FormatBool(p.SchemaAgreed), strconv.FormatBool(p.PushMode)})
+			if p.LastProgressMillisAgo != nil {
+				progressAgo = sat(*p.LastProgressMillisAgo)
+			}
+			out.Rows = append(out.Rows, []engine.Value{hex.EncodeToString(p.NodeID[:]), address, strconv.FormatBool(p.Connected), last, sat(p.SentWatermark), strconv.FormatBool(p.SchemaAgreed), strconv.FormatBool(p.PushMode), sat(p.LagTxns), int64(p.OriginsBehind), progressAgo, int64(p.QueueMessages), p.QueueAvailableBytes, p.MemberState})
 		}
 	case "SHOW REPLICATION":
 		s := h.Status()

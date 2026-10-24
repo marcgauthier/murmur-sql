@@ -27,6 +27,9 @@ type Options struct {
 	QueueBytes int
 	// Single transaction byte budget.
 	TransactionBytes int
+	// Prepared statement cache entries per SQL callback; zero disables
+	// the cache.
+	StmtCacheSize int
 	// Spool segment size target.
 	SegmentBytes int
 	// Target plaintext bytes per independently compressed/encrypted Spool block.
@@ -57,6 +60,7 @@ func DefaultOptions() Options {
 		CaptureBytes:     8 << 20,
 		QueueBytes:       64 << 20,
 		TransactionBytes: 64 << 20,
+		StmtCacheSize:    32,
 		SegmentBytes:     256 << 20,
 		SpoolBlockBytes:  64 << 10,
 		SpoolCacheBytes:  32 << 20,
@@ -87,6 +91,7 @@ func (o *Options) Validate() error {
 		o.TransactionBytes > o.QueueBytes ||
 		o.TransactionBytes == 0 ||
 		o.QueueBytes > 128<<20 ||
+		o.StmtCacheSize < 0 ||
 		o.SpoolBlockBytes == 0 ||
 		o.SpoolBlockBytes > 64<<20 ||
 		o.SegmentBytes <= 64<<20 ||

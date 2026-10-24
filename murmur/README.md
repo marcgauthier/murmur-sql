@@ -48,6 +48,58 @@ name := v.([][]sqlite.Value)[0][0].Str // "ada"
 `Execute`/`Query`/`QueryRow` take `?` placeholders. Statements commit in
 memory; `db.Flush()` waits for the engine's durability boundary.
 
+## Ergonomic queries, bulk loads, and database/sql
+
+Single rows scan into plain variables with no internal value types; a
+query with no rows reports `murmur.ErrNotFound`:
+
+```go
+v, err := db.Read(func(s *murmur.Sql) (any, error) {
+    row, err := s.Row("SELECT name FROM users WHERE id = ?", 1)
+    if err != nil {
+        return nil, err
+    }
+    var name string
+    if err := row.Scan(&name); err != nil {
+        return nil, err
+    }
+    return name, nil
+})
+```
+
+`Rows` streams large results one row at a time instead of buffering
+them; `ExecuteMany` prepares once for a whole batch:
+
+```go
+_, err = db.Transaction(func(s *murmur.Sql) (any, error) {
+    return s.ExecuteMany("INSERT INTO users(id, name) VALUES(?, ?)",
+        []any{1, "ada"},
+        []any{2, "grace"})
+})
+```
+
+`Row`, `Rows`, and the transparent statement cache live only for their
+callback; handles used afterwards fail closed. Repeated identical
+statements reuse cached prepares, sized by `Options.StmtCacheSize`
+(32 by default, zero disables).
+
+For standard tooling, `OpenDB` adapts an open database to `database/sql`:
+
+```go
+sqldb := db.OpenDB() // close before db.Close()
+defer sqldb.Close()
+
+sqldb.Exec(`CREATE TABLE accounts(id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)`)
+tx, _ := sqldb.Begin()
+tx.Exec("UPDATE accounts SET balance = balance - 30 WHERE id = 1")
+tx.Exec("UPDATE accounts SET balance = balance + 30 WHERE id = 2")
+tx.Commit() // one atomic engine transaction
+```
+
+Each statement autocommits; DDL runs through migrations; `Begin` maps
+to one engine transaction. Queries buffer their rows and contexts
+apply before admission only.
+
 ## Keys and reopening
 
 `Open` takes a 32-byte data key and opens (or creates) an encrypted store

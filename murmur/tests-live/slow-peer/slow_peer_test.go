@@ -412,8 +412,10 @@ func TestSlowPeerSnapshotStaysBounded(t *testing.T) {
 	t.Logf("proxy sessions established (relayed=%d bytes)", relayed())
 
 	// During the trickle, sample the donor's spool: pending bytes must
-	// stay under cap (no unbounded slow-peer buffering).
-	var peakPending, peakDisk uint64
+	// stay under cap (no unbounded slow-peer buffering). The donor must
+	// also report the joiner as lagging while the bulk is in flight.
+	var peakPending, peakDisk, peakLag uint64
+	var peakBehind int
 	var sampling atomic.Bool
 	sampling.Store(true)
 	sampleDone := make(chan struct{})
@@ -426,6 +428,14 @@ func TestSlowPeerSnapshotStaysBounded(t *testing.T) {
 			}
 			if m.DiskBytes > peakDisk {
 				peakDisk = m.DiskBytes
+			}
+			for _, p := range cluster.Node(0).Replication().Status().PeersDiagnostics {
+				if p.LagTxns > peakLag {
+					peakLag = p.LagTxns
+				}
+				if p.OriginsBehind > peakBehind {
+					peakBehind = p.OriginsBehind
+				}
 			}
 			time.Sleep(500 * time.Millisecond)
 		}
@@ -459,6 +469,11 @@ func TestSlowPeerSnapshotStaysBounded(t *testing.T) {
 		kbps, peakPending, peakDisk, peakCap)
 	if peakPending > peakCap {
 		t.Fatalf("donor pending bytes peaked at %d, above the %d cap", peakPending, peakCap)
+	}
+	t.Logf("donor peak peer lag during trickle: %d txns across %d origins", peakLag, peakBehind)
+	if peakLag == 0 || peakBehind == 0 {
+		t.Fatalf("donor never reported peer lag during the throttled resync (peak %d txns, %d origins)",
+			peakLag, peakBehind)
 	}
 	// Bulk-exclusivity tripwire: the ~1.2 MB snapshot plus the retained
 	// log tail must all have crossed the proxies. A direct bypass would

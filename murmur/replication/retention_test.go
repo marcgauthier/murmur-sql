@@ -26,6 +26,8 @@ func newTestBackend() *testBackend { return &testBackend{records: make(map[strin
 
 func (b *testBackend) Identity() (NodeId, NodeId) { return idOf(1), idOf(2) }
 
+func (b *testBackend) InvalidateProgress() {}
+
 func (b *testBackend) Get(key []byte) ([]byte, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()

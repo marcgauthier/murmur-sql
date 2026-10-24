@@ -61,7 +61,7 @@ connection IDs. Use those IDs to isolate and clean up transfer handles.
 | Operation | Arguments, in order |
 | --- | --- |
 | `FLUSH`, `REFRESH INDEXES` | none |
-| `SHOW STATUS`, `SHOW PEERS`, `SHOW REPLICATION`, `SHOW RETENTION`, `SHOW TABLES REPLICATION`, `SHOW COLUMNS FTS`, `SHOW COLUMNS VECTOR` | none |
+| `SHOW STATUS`, `SHOW PEERS`, `SHOW REPLICATION`, `SHOW RETENTION`, `SHOW TABLES REPLICATION`, `SHOW COLUMNS FTS`, `SHOW COLUMNS VECTOR`, `SHOW HEAD` | none |
 | `SHOW METRICS` | optional target string: SQLITE or SPOOL, case-insensitive |
 | `SET TABLE` | table name, enabled bool; resolve the stable ID and invoke the sink |
 | `SET COLUMN FTS` | table name, column name, enabled bool |
@@ -70,6 +70,8 @@ connection IDs. Use those IDs to isolate and clean up transfer handles.
 | `PEER ADD` | IP:port string |
 | `PEER REMOVE`, `PEER RETIRE` | node-ID hex string |
 | `PEER SYNC`, `RETENTION COLLECT` | none |
+| `WAIT FOR` | origin hex string, sequence int64, optional timeout-seconds int64 (default 30) |
+| `WAIT FOR LAG` | lag-bound int64, optional timeout-seconds int64 (default 30) |
 | `POLICY COUNTER_ADD` | table, column, single-TEXT row key, int64 delta |
 | `POLICY SET_ADD`, `POLICY SET_REMOVE` | table, column, single-TEXT row key, text value |
 | `POLICY MIN`, `POLICY MAX` | table, column, single-TEXT row key, int64/float64/string value |

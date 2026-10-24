@@ -31,25 +31,34 @@ const (
 	AccessPolicy    uint32 = 4
 )
 
-// Sql is scoped SQL access without hooks or transaction controls.
+// Sql is scoped SQL access without hooks or transaction controls. A handle
+// is valid only inside the Transaction or Read callback that created it.
 type Sql struct {
 	connection *sqlite.Conn
 	schema     *Schema
 	intents    *[]PolicyIntent
 	access     *atomic.Uint32
+	stmts      *stmtCache
+	dead       bool
 }
 
 // Execute runs one statement, returning modified rows.
 func (s *Sql) Execute(sql string, params ...any) (int64, error) {
+	if err := s.checkOpen(); err != nil {
+		return 0, err
+	}
+	if err := rejectTxnVerbs(sql); err != nil {
+		return 0, err
+	}
 	rewritten, err := Rewrite(sql, s.schema)
 	if err != nil {
 		return 0, err
 	}
-	stmt, err := s.connection.Prepare(rewritten)
+	stmt, release, err := s.checkout(sql, rewritten)
 	if err != nil {
-		return 0, sqlErr(err)
+		return 0, err
 	}
-	defer stmt.Close()
+	defer release()
 	if err := stmt.Bind(params...); err != nil {
 		return 0, sqlErr(err)
 	}
@@ -59,8 +68,49 @@ func (s *Sql) Execute(sql string, params ...any) (int64, error) {
 	return s.connection.Changes(), nil
 }
 
+// ExecuteMany runs one update-style statement once per argument set,
+// preparing once for the whole batch, and returns the total modified
+// rows. An empty batch still validates the statement and returns zero.
+func (s *Sql) ExecuteMany(sql string, batches ...[]any) (int64, error) {
+	if err := s.checkOpen(); err != nil {
+		return 0, err
+	}
+	if err := rejectTxnVerbs(sql); err != nil {
+		return 0, err
+	}
+	rewritten, err := Rewrite(sql, s.schema)
+	if err != nil {
+		return 0, err
+	}
+	stmt, err := s.connection.Prepare(rewritten)
+	if err != nil {
+		return 0, sqlErr(err)
+	}
+	defer stmt.Close()
+	var total int64
+	for _, args := range batches {
+		if err := stmt.Bind(args...); err != nil {
+			return 0, sqlErr(err)
+		}
+		if _, err := stmt.Step(); err != nil {
+			return 0, sqlErr(err)
+		}
+		total += s.connection.Changes()
+		if err := stmt.Reset(); err != nil {
+			return 0, sqlErr(err)
+		}
+	}
+	return total, nil
+}
+
 // ExecuteBatch runs rewritten statements.
 func (s *Sql) ExecuteBatch(sql string) error {
+	if err := s.checkOpen(); err != nil {
+		return err
+	}
+	if err := rejectTxnVerbs(sql); err != nil {
+		return err
+	}
 	statements, err := Statements(sql)
 	if err != nil {
 		return err
@@ -77,8 +127,16 @@ func (s *Sql) ExecuteBatch(sql string) error {
 	return nil
 }
 
-// Prepare prepares a rewritten statement.
+// Prepare prepares a rewritten statement. The caller owns the statement
+// and must close it before the callback returns; it never enters the
+// statement cache.
 func (s *Sql) Prepare(sql string) (*sqlite.Stmt, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	if err := rejectTxnVerbs(sql); err != nil {
+		return nil, err
+	}
 	rewritten, err := Rewrite(sql, s.schema)
 	if err != nil {
 		return nil, err
@@ -92,28 +150,65 @@ func (s *Sql) Prepare(sql string) (*sqlite.Stmt, error) {
 
 // QueryRow runs a query returning one row.
 func (s *Sql) QueryRow(sql string, params ...any) ([]sqlite.Value, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	if err := rejectTxnVerbs(sql); err != nil {
+		return nil, err
+	}
 	rewritten, err := Rewrite(sql, s.schema)
 	if err != nil {
 		return nil, err
 	}
-	row, err := s.connection.QueryRow(rewritten, params...)
+	stmt, release, err := s.checkout(sql, rewritten)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := stmt.Bind(params...); err != nil {
+		return nil, sqlErr(err)
+	}
+	has, err := stmt.Step()
 	if err != nil {
 		return nil, sqlErr(err)
 	}
-	return row, nil
+	if !has {
+		return nil, sqlErr(sqlite.ErrNoRows)
+	}
+	return stmt.Columns(), nil
 }
 
 // Query runs a query returning all rows.
 func (s *Sql) Query(sql string, params ...any) ([][]sqlite.Value, error) {
+	if err := s.checkOpen(); err != nil {
+		return nil, err
+	}
+	if err := rejectTxnVerbs(sql); err != nil {
+		return nil, err
+	}
 	rewritten, err := Rewrite(sql, s.schema)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := s.connection.Query(rewritten, params...)
+	stmt, release, err := s.checkout(sql, rewritten)
 	if err != nil {
+		return nil, err
+	}
+	defer release()
+	if err := stmt.Bind(params...); err != nil {
 		return nil, sqlErr(err)
 	}
-	return rows, nil
+	var out [][]sqlite.Value
+	for {
+		has, err := stmt.Step()
+		if err != nil {
+			return nil, sqlErr(err)
+		}
+		if !has {
+			return out, nil
+		}
+		out = append(out, stmt.Columns())
+	}
 }
 
 // LastInsertRowID returns the latest inserted rowid.
@@ -701,12 +796,15 @@ func (db *Database) Read(f func(*Sql) (any, error)) (any, error) {
 	return db.Call(func(c *Core) (any, error) {
 		c.access.Store(AccessRead)
 		v, err := func() (v any, err error) {
+			sql := &Sql{connection: c.connection, schema: &c.schema, access: c.access,
+				stmts: newStmtCache(c.options.StmtCacheSize)}
+			defer sql.closeStmts()
 			defer func() {
 				if recover() != nil {
 					v, err = nil, ErrCallbackPanicked
 				}
 			}()
-			return f(&Sql{connection: c.connection, schema: &c.schema, access: c.access})
+			return f(sql)
 		}()
 		c.access.Store(AccessNone)
 		return v, err
@@ -906,6 +1004,13 @@ func (db *Database) ReplicationEnabled(table string) (bool, error) {
 // Flush checkpoints and waits for durability.
 func (db *Database) Flush() error {
 	_, err := db.Call(func(c *Core) (any, error) { return nil, c.flush() })
+	if err == nil {
+		// Fresh cursors: the checkpoint may have minted local log
+		// entries outside the adapter's write path.
+		if h := db.Replication(); h != nil {
+			h.InvalidateProgress()
+		}
+	}
 	return err
 }
 
@@ -1611,12 +1716,15 @@ func (c *Core) transaction(f func(*Sql) (any, error)) (any, error) {
 	value, err := func() (v any, err error) {
 		c.access.Store(AccessWrite)
 		func() {
+			sql := &Sql{connection: c.connection, schema: &c.schema, intents: &intents, access: c.access,
+				stmts: newStmtCache(c.options.StmtCacheSize)}
+			defer sql.closeStmts()
 			defer func() {
 				if recover() != nil {
 					v, err = nil, ErrCallbackPanicked
 				}
 			}()
-			v, err = f(&Sql{connection: c.connection, schema: &c.schema, intents: &intents, access: c.access})
+			v, err = f(sql)
 		}()
 		c.access.Store(AccessNone)
 		if err != nil {

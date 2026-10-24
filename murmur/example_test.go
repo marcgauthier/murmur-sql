@@ -213,6 +213,111 @@ func Example_searchVector() {
 	// 2
 }
 
+func Example_scan() {
+	dir := exampleDir()
+	defer os.RemoveAll(dir)
+
+	options := murmur.DefaultOptions()
+	options.Mode = murmur.OpenCreateNew
+	db, err := murmur.Open(dir+"/store", exampleKey(), options)
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+
+	if err := db.Migrate(murmur.NewMigration(
+		`CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT NOT NULL)`)); err != nil {
+		panic(err)
+	}
+	if _, err := db.Transaction(func(s *murmur.Sql) (any, error) {
+		return s.ExecuteMany("INSERT INTO users(id, name) VALUES(?, ?)",
+			[]any{1, "ada"},
+			[]any{2, "grace"})
+	}); err != nil {
+		panic(err)
+	}
+	v, err := db.Read(func(s *murmur.Sql) (any, error) {
+		row, err := s.Row("SELECT name FROM users WHERE id = ?", 1)
+		if err != nil {
+			return nil, err
+		}
+		var name string
+		if err := row.Scan(&name); err != nil {
+			return nil, err
+		}
+		rows, err := s.Rows("SELECT id, name FROM users ORDER BY id")
+		if err != nil {
+			return nil, err
+		}
+		defer rows.Close()
+		out := []string{name}
+		for rows.Next() {
+			var id int64
+			var n string
+			if err := rows.Scan(&id, &n); err != nil {
+				return nil, err
+			}
+			out = append(out, fmt.Sprintf("%d=%s", id, n))
+		}
+		return out, rows.Err()
+	})
+	if err != nil {
+		panic(err)
+	}
+	for _, line := range v.([]string) {
+		fmt.Println(line)
+	}
+	// Output:
+	// ada
+	// 1=ada
+	// 2=grace
+}
+
+func Example_stdlib() {
+	dir := exampleDir()
+	defer os.RemoveAll(dir)
+
+	options := murmur.DefaultOptions()
+	options.Mode = murmur.OpenCreateNew
+	db, err := murmur.Open(dir+"/store", exampleKey(), options)
+	if err != nil {
+		panic(err)
+	}
+	defer db.Close()
+	sqldb := db.OpenDB()
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(
+		`CREATE TABLE accounts(id INTEGER PRIMARY KEY, balance INTEGER NOT NULL)`); err != nil {
+		panic(err)
+	}
+	if _, err := sqldb.Exec("INSERT INTO accounts(id, balance) VALUES(1, 100), (2, 100)"); err != nil {
+		panic(err)
+	}
+	tx, err := sqldb.Begin()
+	if err != nil {
+		panic(err)
+	}
+	if _, err := tx.Exec("UPDATE accounts SET balance = balance - 30 WHERE id = 1"); err != nil {
+		panic(err)
+	}
+	if _, err := tx.Exec("UPDATE accounts SET balance = balance + 30 WHERE id = 2"); err != nil {
+		panic(err)
+	}
+	if err := tx.Commit(); err != nil {
+		panic(err)
+	}
+	var a, b int64
+	if err := sqldb.QueryRow("SELECT balance FROM accounts WHERE id = 1").Scan(&a); err != nil {
+		panic(err)
+	}
+	if err := sqldb.QueryRow("SELECT balance FROM accounts WHERE id = 2").Scan(&b); err != nil {
+		panic(err)
+	}
+	fmt.Println(a, b)
+	// Output: 70 130
+}
+
 func Example_backup() {
 	dir := exampleDir()
 	defer os.RemoveAll(dir)

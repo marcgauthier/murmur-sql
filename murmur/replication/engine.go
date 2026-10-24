@@ -43,13 +43,19 @@ type ReplicationMetrics struct {
 
 // PeerDiagnostics describes one connected peer.
 type PeerDiagnostics struct {
-	NodeID            NodeId          `json:"node_id"`
-	Address           *netip.AddrPort `json:"address"`
-	Connected         bool            `json:"connected"`
-	LastSeenMillisAgo *uint64         `json:"last_seen_millis_ago"`
-	SentWatermark     uint64          `json:"sent_watermark"`
-	SchemaAgreed      bool            `json:"schema_agreed"`
-	PushMode          bool            `json:"push_mode"`
+	NodeID                NodeId          `json:"node_id"`
+	Address               *netip.AddrPort `json:"address"`
+	Connected             bool            `json:"connected"`
+	LastSeenMillisAgo     *uint64         `json:"last_seen_millis_ago"`
+	SentWatermark         uint64          `json:"sent_watermark"`
+	SchemaAgreed          bool            `json:"schema_agreed"`
+	PushMode              bool            `json:"push_mode"`
+	LagTxns               uint64          `json:"lag_txns"`
+	OriginsBehind         int             `json:"origins_behind"`
+	LastProgressMillisAgo *uint64         `json:"last_progress_millis_ago"`
+	QueueMessages         int             `json:"queue_messages"`
+	QueueAvailableBytes   int64           `json:"queue_available_bytes"`
+	MemberState           string          `json:"member_state"`
 }
 
 // Status is the engine status snapshot.
@@ -65,6 +71,7 @@ type Status struct {
 	FileEndpoint        *netip.AddrPort    `json:"file_endpoint"`
 	Metrics             ReplicationMetrics `json:"metrics"`
 	PeersDiagnostics    []PeerDiagnostics  `json:"peers_diagnostics"`
+	ObservedDeficit     uint64             `json:"observed_deficit"`
 }
 
 type engineCommandKind int
@@ -312,6 +319,7 @@ type enginePeer struct {
 	fetch         *netip.AddrPort
 	send          *queueSender
 	progress      map[NodeId]uint64
+	observed      map[NodeId]uint64
 	lastSeen      time.Time
 	push          bool
 	lazy          bool
@@ -321,6 +329,7 @@ type enginePeer struct {
 	resentAt      map[NodeId]time.Time
 	resent        map[NodeId]uint64
 	ackAnyAt      *time.Time
+	progressAt    *time.Time
 	bulkLagSince  *time.Time
 	pushOrigin    *NodeId
 	schemaAcked   *schemaStamp
@@ -413,6 +422,7 @@ type engineCore struct {
 	incomingNoneAt   *time.Time
 	missingMu        sync.Mutex
 	missingCache     *missingEntry
+	lastSeedErrLog   time.Time
 
 	adaptiveBatch atomic.Int64
 
@@ -588,6 +598,7 @@ func (c *engineCore) run() {
 	fileTick := time.NewTicker(fileInterval)
 	defer fileTick.Stop()
 	seeds := append([]netip.AddrPort(nil), c.config.Bootstrap...)
+	seedHosts := append([]string(nil), c.config.BootstrapHosts...)
 	snapshotReceiptCursor := 0
 
 	incoming := make(chan quicConn, 16)
@@ -683,7 +694,7 @@ loop:
 				c.requestProgress()
 			}
 		case <-bootstrap.C:
-			c.bootstrapTick(&seeds)
+			c.bootstrapTick(&seeds, seedHosts)
 		case <-apply.C:
 			if err := Maintain(c.backend, NowMillis()); err != nil {
 				c.recordError(err)
@@ -760,9 +771,20 @@ loop:
 			break loop
 		}
 		// Publish diagnostics without holding the status lock across waits.
+		// Local heads come from the cached backend read; a failure leaves
+		// lag at zero rather than failing status.
 		now := time.Now()
+		heads, _ := c.progress()
+		c.viewMu.Lock()
+		memberCount := len(c.view.Members)
+		states := make(map[NodeId]Member, len(c.view.Members))
+		for id, m := range c.view.Members {
+			states[id] = m
+		}
+		c.viewMu.Unlock()
 		c.peersMu.Lock()
 		diagnostics := make([]PeerDiagnostics, 0, len(c.peers))
+		seen := make([]map[NodeId]uint64, 0, len(c.peers))
 		for id, p := range c.peers {
 			var addr *netip.AddrPort
 			if parsed, err := netip.ParseAddrPort(p.conn.RemoteAddr().String()); err == nil {
@@ -773,17 +795,31 @@ loop:
 			if now.Before(p.lastSeen) {
 				ago = 0
 			}
+			var progressAgo *uint64
+			if p.progressAt != nil {
+				pa := uint64(now.Sub(*p.progressAt).Milliseconds())
+				if now.Before(*p.progressAt) {
+					pa = 0
+				}
+				progressAgo = &pa
+			}
+			lag, behind := lagBehind(heads, p.progress)
+			seen = append(seen, p.observed)
+			m, known := states[id]
 			diagnostics = append(diagnostics, PeerDiagnostics{
 				NodeID: id, Address: addr, Connected: !connClosed(p.conn),
 				LastSeenMillisAgo: &ago, SentWatermark: p.sent[id],
 				SchemaAgreed: p.schemaAcked != nil, PushMode: p.push,
+				LagTxns: lag, OriginsBehind: behind,
+				LastProgressMillisAgo: progressAgo,
+				QueueMessages:         len(p.send.data) + len(p.send.control),
+				QueueAvailableBytes:   p.send.Available(),
+				MemberState:           memberStateName(m.State, known),
 			})
 		}
 		peerCount := len(c.peers)
+		deficit := observedDeficit(heads, seen)
 		c.peersMu.Unlock()
-		c.viewMu.Lock()
-		memberCount := len(c.view.Members)
-		c.viewMu.Unlock()
 		available := int(c.queueLease.available())
 		c.mutateStatus(func(s *Status) {
 			s.Peers = peerCount
@@ -792,6 +828,7 @@ loop:
 			s.Metrics.StagedTransactions = s.StagedTransactions
 			s.Metrics.QueueAvailableBytes = available
 			s.PeersDiagnostics = diagnostics
+			s.ObservedDeficit = deficit
 		})
 	}
 	// Say goodbye: mark ourselves Left in a final datagram burst.
@@ -914,7 +951,7 @@ func (c *engineCore) evictMinAdmitRemoved() {
 	}
 }
 
-func (c *engineCore) bootstrapTick(seeds *[]netip.AddrPort) {
+func (c *engineCore) bootstrapTick(seeds *[]netip.AddrPort, seedHosts []string) {
 	staleAfter := 3 * c.config.AntiEntropyInterval
 	if staleAfter < 15*time.Second {
 		staleAfter = 15 * time.Second
@@ -926,7 +963,11 @@ func (c *engineCore) bootstrapTick(seeds *[]netip.AddrPort) {
 			delete(c.peers, id)
 		}
 	}
+	peerless := len(c.peers) == 0
 	c.peersMu.Unlock()
+	if peerless {
+		c.refreshNamedSeeds(seeds, seedHosts)
+	}
 	shuffled := append([]netip.AddrPort(nil), *seeds...)
 	rand.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
 	for _, address := range shuffled {
@@ -1392,7 +1433,7 @@ func (c *engineCore) session(conn quicConn, stream quicStream, id NodeId, outgoi
 	}
 	peer := &enginePeer{
 		conn: conn, fetch: fetch, send: send,
-		progress: make(map[NodeId]uint64), lastSeen: time.Now(),
+		progress: make(map[NodeId]uint64), observed: make(map[NodeId]uint64), lastSeen: time.Now(),
 		push: pushCount < c.config.Fanout, outgoing: outgoing,
 		sent: make(map[NodeId]uint64), sentAt: make(map[NodeId]time.Time),
 		resentAt: make(map[NodeId]time.Time), resent: make(map[NodeId]uint64),
@@ -1400,11 +1441,13 @@ func (c *engineCore) session(conn quicConn, stream quicStream, id NodeId, outgoi
 	}
 	if hadOld {
 		peer.progress = old.progress
+		peer.observed = old.observed
 		peer.sent = old.sent
 		peer.sentAt = old.sentAt
 		peer.resentAt = old.resentAt
 		peer.resent = old.resent
 		peer.ackAnyAt = old.ackAnyAt
+		peer.progressAt = old.progressAt
 		peer.bulkLagSince = old.bulkLagSince
 		peer.pushOrigin = old.pushOrigin
 		peer.schemaAcked = old.schemaAcked

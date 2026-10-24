@@ -823,8 +823,12 @@ func (c *engineCore) handleProgress(id NodeId, entries []Progress, send *queueSe
 				peer.ackAnyAt = &now
 			}
 			peer.progress[p.Origin] = p.Applied
+			if p.Observed > peer.observed[p.Origin] {
+				peer.observed[p.Origin] = p.Observed
+			}
 		}
 		peer.lastSeen = now
+		peer.progressAt = &now
 		if peer.lastTouch != nil && now.Sub(*peer.lastTouch) < time.Second {
 			due = false
 		} else {

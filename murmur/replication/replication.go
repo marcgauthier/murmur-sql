@@ -4,6 +4,7 @@
 package replication
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/netip"
@@ -171,6 +172,9 @@ type Backend interface {
 	KeysPage(prefix, after []byte, limit int) ([][]byte, error)
 	// Progress returns durable per-origin progress.
 	Progress() ([]Progress, error)
+	// InvalidateProgress drops cached progress heads after durable
+	// writes, so cursors read fresh.
+	InvalidateProgress()
 	Commit(records []Record) error
 	ImportBridge(header Header, payload []byte) (bool, error)
 	ReleaseOwnership(table string, key []byte, column *string) (bool, error)
@@ -229,15 +233,21 @@ type PolicyColumn struct {
 
 // Config tunes the replication engine.
 type Config struct {
-	Bind                     netip.AddrPort
-	Advertise                *netip.AddrPort
-	Credentials              Credentials
-	SigningKey               [32]byte
-	TrustedOrigins           map[NodeId][32]byte
-	AllowedPeers             map[NodeId]bool
-	AllowedNetworks          []netip.Prefix
-	TrustedSnapshotSources   map[NodeId]bool
-	Bootstrap                []netip.AddrPort
+	Bind                   netip.AddrPort
+	Advertise              *netip.AddrPort
+	Credentials            Credentials
+	SigningKey             [32]byte
+	TrustedOrigins         map[NodeId][32]byte
+	AllowedPeers           map[NodeId]bool
+	AllowedNetworks        []netip.Prefix
+	TrustedSnapshotSources map[NodeId]bool
+	Bootstrap              []netip.AddrPort
+	// BootstrapHosts parallels Bootstrap with the original hostname for
+	// entries configured by name ("" for literals). Same length as
+	// Bootstrap; the engine re-resolves named seeds while peerless.
+	BootstrapHosts []string
+	// SeedResolver resolves bootstrap hostnames; nil uses DNS.
+	SeedResolver             func(ctx context.Context, host string) (netip.Addr, error)
 	Membership               bool
 	Dissemination            Dissemination
 	AcceptRemoteSchema       bool
@@ -309,6 +319,9 @@ func (c *Config) Validate() error {
 		c.SnapshotStagingBytes == 0 || c.SnapshotBytes == 0 ||
 		len(c.Credentials.Chain) == 0 || len(c.Credentials.Roots) == 0 {
 		return invalidErr("inconsistent transport or capacity limits")
+	}
+	if len(c.BootstrapHosts) != 0 && len(c.BootstrapHosts) != len(c.Bootstrap) {
+		return invalidErr("bootstrap hosts must align with bootstrap addresses")
 	}
 	if c.Master && c.SchemaMaster == nil {
 		return invalidErr("schema master requires schema_master")

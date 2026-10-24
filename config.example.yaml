@@ -50,12 +50,16 @@ replication:
   # Local QUIC listen address for peer replication traffic.
   bind: "127.0.0.1:9001"
   # Routable IP:port announced to remote peers (useful behind NAT/containers).
+  # DNS names with explicit ports are accepted and resolved at startup.
   # advertise: "203.0.113.10:9001"
   # Initial remote seed node addresses to connect to on startup.
   # Peers discover other cluster members dynamically via gossip membership.
+  # Seeds accept "host:port" DNS names (resolved at startup, refreshed
+  # while the node has no peers) as well as IP:port literals.
   # bootstrap:
   #   - "203.0.113.11:9001"
   #   - "203.0.113.12:9001"
+  #   - "seed3.example:9001"
   # TLS credentials for mutual TLS over QUIC. The node certificate must contain
   # a URI SAN matching this node's identity: replicateddb://node/<32-hex-node-id>.
   # cert_chain_file: "/etc/murmur/replication.crt"

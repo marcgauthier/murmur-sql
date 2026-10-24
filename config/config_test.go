@@ -45,6 +45,14 @@ func TestStrictConfig(t *testing.T) {
 		"auth:\n  users:\n    - name: 'a'\n      password_hash: 'plaintext'\n",
 		"auth:\n  users:\n    - name: 'a'\n      password_hash: '$argon2id$x'\n    - name: 'a'\n      password_hash: '$argon2id$x'\n",
 		"replication:\n  allowed_networks:\n    - '1.2.3.4/99'\n",
+		"replication:\n  bootstrap:\n    - 'db0.example'\n",
+		"replication:\n  bootstrap:\n    - 'db0.example:0'\n",
+		"replication:\n  bootstrap:\n    - 'db0.example:99999'\n",
+		"replication:\n  bootstrap:\n    - 'db0.example:http'\n",
+		"replication:\n  bootstrap:\n    - 'not a host:9001'\n",
+		"replication:\n  bootstrap:\n    - ':9001'\n",
+		"replication:\n  advertise: 'db0.example'\n",
+		"replication:\n  bind: 'db0.example:9001'\n",
 		"replication:\n  enabled: true\n",
 		"replication:\n  dissemination: 'unknown'\n",
 		"backups:\n  dir: ' '\n",
@@ -55,6 +63,21 @@ func TestStrictConfig(t *testing.T) {
 				t.Fatal("accepted invalid configuration")
 			}
 		})
+	}
+}
+
+// TestHostnameSeeds pins that bootstrap and advertise accept DNS names
+// with explicit ports (validated offline, resolved at startup).
+func TestHostnameSeeds(t *testing.T) {
+	c, e := Parse([]byte("replication:\n  advertise: 'db0.example:9001'\n  bootstrap:\n    - 'db0.example:9001'\n    - 'db1.example:9002'\n    - '203.0.113.11:9001'\n"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if c.Replication.Advertise == nil || *c.Replication.Advertise != "db0.example:9001" {
+		t.Fatalf("advertise = %+v", c.Replication.Advertise)
+	}
+	if len(c.Replication.Bootstrap) != 3 || c.Replication.Bootstrap[1] != "db1.example:9002" {
+		t.Fatalf("bootstrap = %v", c.Replication.Bootstrap)
 	}
 }
 

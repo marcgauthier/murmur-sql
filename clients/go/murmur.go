@@ -50,6 +50,13 @@ type Config struct {
 	ConnectTimeout time.Duration // default 10s
 	MaxOpenConns   int           // optional pool tuning, passed to database/sql
 	MaxIdleConns   int           // optional pool tuning, passed to database/sql
+	// Standbys lists failover servers tried in order after Host/Port.
+	// Transport failures move to the next healthy host and black the
+	// failed host out with exponential backoff; the pool returns to
+	// earlier hosts as they recover. Auth failures never fail over.
+	// Retried statements are at-least-once: an unacknowledged write may
+	// have executed before the failure surfaced.
+	Standbys []HostPort
 }
 
 func (c Config) withDefaults() Config {
@@ -81,6 +88,11 @@ func (c Config) validate() error {
 	if c.Port < 1 || c.Port > 65535 {
 		return fmt.Errorf("murmur: invalid Port %d", c.Port)
 	}
+	for _, s := range c.Standbys {
+		if s.Port < 1 || s.Port > 65535 {
+			return fmt.Errorf("murmur: invalid standby Port %d", s.Port)
+		}
+	}
 	switch c.TLS.Mode {
 	case "", TLSDisable, TLSRequire, TLSVerifyCA, TLSVerifyFull:
 	default:
@@ -96,9 +108,19 @@ func (c Config) validate() error {
 }
 
 func (c Config) connURL() (string, error) {
+	return c.connURLFor(c.Host, c.Port)
+}
+
+func (c Config) connURLFor(host string, port int) (string, error) {
 	c = c.withDefaults()
 	if err := c.validate(); err != nil {
 		return "", err
+	}
+	if host == "" {
+		host = c.Host
+	}
+	if port == 0 {
+		port = c.Port
 	}
 	query := url.Values{}
 	if c.TLS.Mode != "" && c.TLS.Mode != TLSDisable {
@@ -117,11 +139,27 @@ func (c Config) connURL() (string, error) {
 	u := url.URL{
 		Scheme:   "postgres",
 		User:     url.UserPassword(c.User, c.Password),
-		Host:     fmt.Sprintf("%s:%d", c.Host, c.Port),
+		Host:     fmt.Sprintf("%s:%d", host, port),
 		Path:     "/" + c.Database,
 		RawQuery: query.Encode(),
 	}
 	return u.String(), nil
+}
+
+// hosts returns the primary plus standbys with defaults applied and
+// exact duplicates removed.
+func (c Config) hosts() []HostPort {
+	seen := map[HostPort]bool{}
+	var out []HostPort
+	for _, h := range append([]HostPort{{Host: c.Host, Port: c.Port}}, c.Standbys...) {
+		h = h.withDefaults()
+		if seen[h] {
+			continue
+		}
+		seen[h] = true
+		out = append(out, h)
+	}
+	return out
 }
 
 func escapeKey(key string) string {
@@ -166,21 +204,29 @@ func (u unlockConnector) Driver() driver.Driver {
 // Open connects, verifies the server, and unlocks every pooled connection
 // with cfg.Key. Each physical connection runs MURMUR UNLOCK before first
 // use; a wrong key fails Open (and any later reconnect) with code 28000.
+// With cfg.Standbys set, connections fail over across the listed hosts.
 func Open(ctx context.Context, cfg Config) (*sql.DB, error) {
-	connURL, err := cfg.withDefaults().connURL()
-	if err != nil {
+	cfg = cfg.withDefaults()
+	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	key := escapeKey(cfg.Key)
-	connector, err := pq.NewConnector(connURL)
-	if err != nil {
-		return nil, fmt.Errorf("murmur: bad connection string: %w", err)
+	fc := &failoverConnector{}
+	for _, h := range cfg.hosts() {
+		connURL, err := cfg.connURLFor(h.Host, h.Port)
+		if err != nil {
+			return nil, err
+		}
+		connector, err := pq.NewConnector(connURL)
+		if err != nil {
+			return nil, fmt.Errorf("murmur: bad connection string: %w", err)
+		}
+		fc.hosts = append(fc.hosts, failoverHost{
+			addr:      h,
+			connector: unlockConnector{base: connector, key: key},
+		})
 	}
-	unlockConn := unlockConnector{
-		base: connector,
-		key:  key,
-	}
-	db := sql.OpenDB(errorConnector{base: unlockConn})
+	db := sql.OpenDB(errorConnector{base: fc})
 	if cfg.MaxOpenConns > 0 {
 		db.SetMaxOpenConns(cfg.MaxOpenConns)
 	}

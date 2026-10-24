@@ -227,19 +227,22 @@ func replicationConfig(r config.ReplicationConfig) (*replication.Config, error) 
 	}
 	out := replication.NewConfig(bind, replication.Credentials{Chain: pair.Certificate, PrivateKey: append([]byte{}, block.Bytes...), Roots: roots}, signing)
 	clear(signing[:])
+	resolveCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
 	if r.Advertise != nil {
-		v, e := netip.ParseAddrPort(*r.Advertise)
+		v, e := resolveSocket(resolveCtx, *r.Advertise)
 		if e != nil {
 			return nil, e
 		}
 		out.Advertise = &v
 	}
 	for _, s := range r.Bootstrap {
-		v, e := netip.ParseAddrPort(s)
+		v, e := resolveSocket(resolveCtx, s)
 		if e != nil {
 			return nil, e
 		}
 		out.Bootstrap = append(out.Bootstrap, v)
+		out.BootstrapHosts = append(out.BootstrapHosts, seedHostname(s))
 	}
 	out.TrustedOrigins, e = publicKeys(r.TrustedOrigins)
 	if e != nil {

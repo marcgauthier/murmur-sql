@@ -344,7 +344,17 @@ func (a *Adapter) Commit(records []replication.Record) error {
 		}
 		return nil, o.Store.Commit(mutations, spool.DurabilitySync)
 	})
+	if err == nil {
+		a.InvalidateProgress()
+	}
 	return err
+}
+
+// InvalidateProgress drops cached progress heads after durable writes.
+func (a *Adapter) InvalidateProgress() {
+	a.progressMu.Lock()
+	a.progressCache = nil
+	a.progressMu.Unlock()
 }
 
 // ImportBridge ingests a sealed bridge bundle.
@@ -391,6 +401,9 @@ func (a *Adapter) Publish(records []replication.Record) error {
 		o.Clock = clock
 		return nil, nil
 	})
+	if err == nil {
+		a.InvalidateProgress()
+	}
 	return err
 }
 
