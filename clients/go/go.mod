@@ -11,6 +11,7 @@ replace github.com/lib/pq => github.com/marcgauthier/pq v0.0.0-20260820222753-45
 require github.com/marcgauthier/murmur-sql v0.0.0
 
 require (
+	github.com/DataDog/zstd v1.5.7 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
