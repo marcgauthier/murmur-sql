@@ -14,7 +14,7 @@ binaries select the native factory. This integration has not been built or teste
 | Administration | Diagnostics, table flags, search settings, peer/retention/policy/bridge operations | Row contents, ordering, error codes, disabled capabilities |
 | File objects | Engine-backed encrypted upload/download with owned cursors and budgets | Expiry, disconnect, concurrent use, staging, key rotation |
 | Backup/restore | Engine checkpoints, Rust-compatible archives, key-verified restore, trial open and rollback | Crash/failure paths, snapshots, live replication restart |
-| Key rotation | Verify previous key, engine rewrap, update accepted key, flush | Failed flush, restart, session behavior |
+| Key rotation | Verify previous key, engine rewrap, update accepted key, flush, flush-failure rollback, restart recovery, session behavior | None |
 | Offline admin | Native status/inspect/verify/backup/restore/keys and structured output | JSON/human output, identity reassignment, corrupt artifacts |
 | Wire/auth/logging/services | Existing Go shell plus affinity coercions and storage-parent permissions | Regression and elevated deployment tests |
 | Clients and live scenarios | Retained clients and Go server launchers; obsolete engine-missing skip removed | Full integration gate |

@@ -125,6 +125,32 @@ func (f *fixtureEngine) Command(ctx context.Context, id uint64, c engine.Command
 		return engine.Result{Tag: "RESTORE"}, nil
 	case "FLUSH":
 		return engine.Result{Tag: "FLUSH"}, nil
+	case "ROTATE KEY":
+		match := func(v engine.Value) bool {
+			switch t := v.(type) {
+			case []byte:
+				return len(t) == 32 && string(t) == string(f.key[:])
+			case string:
+				return t != "" && t == f.passphrase
+			}
+			return false
+		}
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if !match(c.Arguments[0]) {
+			return engine.Result{}, sqlError("28000", "incorrect key")
+		}
+		switch t := c.Arguments[1].(type) {
+		case []byte:
+			copy(f.key[:], t)
+			f.passphrase = ""
+		case string:
+			f.passphrase = t
+			f.key = [32]byte{}
+		default:
+			return engine.Result{}, sqlError("22023", "key must be bytes or text")
+		}
+		return engine.Result{Tag: "ROTATE"}, nil
 	}
 	return engine.Result{}, engine.ErrUnavailable
 }

@@ -146,12 +146,29 @@ These command families are parsed and executed through the native adapter:
 | Merge policies | `MURMUR POLICY COUNTER_ADD counters value 'key' 1`, `MURMUR POLICY SET_ADD tags values 'key' 'tag'` |
 | Extrema | `MURMUR POLICY MIN readings value 'key' 3`, `MURMUR POLICY MAX readings value 'key' 9` |
 | Bridge ownership | `MURMUR BRIDGE RELEASE items 'key' COLUMN name` |
-| Key rotation | `MURMUR ROTATE KEY 'previous' 'new'` |
+| Key rotation | `MURMUR ROTATE KEY 'previous' 'new'`, `MURMUR ROTATE DATA KEY`, `MURMUR SHOW KEYS`, `MURMUR PRUNE KEYS` |
 | Backups | `MURMUR BACKUP SAVE`, `MURMUR BACKUP LIST`, `MURMUR RESTORE FROM 'name.murmur-backup' KEY 'secret'` |
 
 Vector dimensions are 1–8192, with `l2`, `cosine`, or `l1` distances. Flags accept
 true/false, on/off, yes/no, or 1/0. Non-file administration commands do not accept
 bound parameters; quote literal secrets/names with SQL single-quote escaping.
+
+### Rotation sessions and rollback
+
+Sessions unlocked before a `ROTATE KEY` stay unlocked; only fresh
+`UNLOCK`s must present the new credential. If the envelope rewrap
+succeeds but the trailing flush fails, the server rolls the envelope
+back to the previous credential and reports the flush error, so a
+failed rotation never leaves a half-adopted key; a failed rewrap
+itself leaves the old envelope untouched (reopen with the old
+credential). Data-key rotation needs no rollback: the retired key
+stays valid for old blocks by design.
+
+`MURMUR SHOW KEYS` reports per-data-key state (`active`/`retired`)
+plus live reference counts (segments, blocks, checkpoints,
+in-flight); a retired key with no references is prunable.
+`MURMUR PRUNE KEYS` drops such keys and lists the pruned ids; keys
+still referenced are left untouched, so pruning is safe to retry.
 
 ## Replication lag
 

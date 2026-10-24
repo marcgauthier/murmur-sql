@@ -53,6 +53,8 @@ var commandColumns = map[string]string{
 	"SHOW RETENTION":      "node_id last_seen_millis:i retired origin acknowledged:i collected_transactions:i last_collection_millis:i",
 	"SHOW COLUMNS FTS":    "table column enabled index_name ready rebuilding pending_keys:i queued_bytes:i error",
 	"SHOW COLUMNS VECTOR": "table column enabled dimensions:i distance index_name ready rebuilding pending_keys:i queued_bytes:i error",
+	"SHOW KEYS":           "key_id:i state segments:i blocks:i checkpoints:i inflight:bool",
+	"PRUNE KEYS":          "pruned_key_id:i",
 	"RETENTION COLLECT":   "collected:i", "BRIDGE RELEASE": "released",
 	"BACKUP SAVE": "name size:i", "BACKUP LIST": "name size:i modified", "BACKUP UPLOAD FINISH": "name size:i", "BACKUP DOWNLOAD": "offset:i total:i chunk:b",
 	"FILE LIST": "cursor", "FILE SEARCH": "cursor", "FILE NEXT": "name size:i modified_ms:i sha256 local:bool", "FILE UPLOAD BEGIN": "upload", "FILE UPLOAD FINISH": "name size:i modified_ms:i sha256 local:bool", "FILE DOWNLOAD": "download name size:i", "FILE DOWNLOAD NEXT": "offset:i total:i chunk:b eof:bool",
@@ -172,7 +174,7 @@ func parseCommand(sql string) (commandSpec, error) {
 				return invalid()
 			}
 			take("SHOW METRICS", 2)
-		case "STATUS", "PEERS", "REPLICATION", "RETENTION", "HEAD":
+		case "STATUS", "PEERS", "REPLICATION", "RETENTION", "HEAD", "KEYS":
 			if len(ts) != 2 {
 				return invalid()
 			}
@@ -181,6 +183,10 @@ func parseCommand(sql string) (commandSpec, error) {
 			return invalid()
 		}
 	case "ROTATE":
+		if upper(1) == "DATA" && upper(2) == "KEY" && len(ts) == 3 {
+			take("ROTATE DATA KEY", 3)
+			break
+		}
 		if upper(1) != "KEY" {
 			return invalid()
 		}
@@ -219,6 +225,11 @@ func parseCommand(sql string) (commandSpec, error) {
 			return invalid()
 		}
 		take("RETENTION COLLECT", 2)
+	case "PRUNE":
+		if len(ts) != 2 || upper(1) != "KEYS" {
+			return invalid()
+		}
+		take("PRUNE KEYS", 2)
 	case "WAIT":
 		if upper(1) != "FOR" {
 			return invalid()

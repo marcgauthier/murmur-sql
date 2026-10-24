@@ -124,6 +124,7 @@ func (Factory) Open(ctx context.Context, r engine.OpenRequest) (engine.Database,
 	if e != nil {
 		return nil, 0, translate(e)
 	}
+	options.FaultHooks = r.FaultHooks
 	if emptyDirectory {
 		if e = os.Remove(r.Config.Storage.DataDir); e != nil {
 			return nil, 0, translate(e)
@@ -266,7 +267,58 @@ func (d *database) rotate(ctx context.Context, args []engine.Value) (engine.Resu
 		return engine.Result{}, translate(e)
 	}
 	d.keyHash = credentialHash(next, nextPass)
+	if e := d.db.Flush(); e != nil {
+		// The envelope rotation is durable but data may not be: roll
+		// the envelope back to the previous credential so a failed
+		// rotation never leaves a half-adopted key. Data-key
+		// material is untouched by master rewraps, so the rollback
+		// restores the exact prior envelope.
+		rollback := murmur.KeyCredential(previous[:])
+		if previousPass != "" {
+			rollback = murmur.PassphraseCredential(previousPass)
+		}
+		if rerr := d.db.RotateCredential(rollback); rerr != nil {
+			return engine.Result{}, userError("XX000", fmt.Sprintf("flush failed after rotation and rollback failed; new key remains active: %v / %v", e, rerr))
+		}
+		d.keyHash = credentialHash(previous, previousPass)
+		return engine.Result{}, translate(e)
+	}
+	return engine.Result{Tag: "ROTATE"}, nil
+}
+
+// rotateDataKey retires the active data key: new blocks seal under the
+// successor while old blocks keep decrypting. Unlike master rotation
+// there is no rollback on flush failure: both keys stay valid by
+// design, so a failed flush just needs a retried FLUSH.
+func (d *database) rotateDataKey(ctx context.Context) (engine.Result, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e := d.ready(ctx); e != nil {
+		return engine.Result{}, e
+	}
+	if e := d.db.RotateDataKey(); e != nil {
+		return engine.Result{}, translate(e)
+	}
 	return engine.Result{Tag: "ROTATE"}, translate(d.db.Flush())
+}
+
+// pruneKeys drops retired data keys nothing references and reports the
+// pruned ids, one row each. Referenced keys are left untouched.
+func (d *database) pruneKeys(ctx context.Context) (engine.Result, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if e := d.ready(ctx); e != nil {
+		return engine.Result{}, e
+	}
+	pruned, e := d.db.PruneDataKeys()
+	if e != nil {
+		return engine.Result{}, translate(e)
+	}
+	out := engine.Result{Tag: "PRUNE"}
+	for _, id := range pruned {
+		out.Rows = append(out.Rows, []engine.Value{int64(id)})
+	}
+	return out, nil
 }
 func (d *database) restore(ctx context.Context, args []engine.Value) (engine.Result, error) {
 	d.mu.Lock()

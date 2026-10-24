@@ -8,6 +8,7 @@ import (
 	"fmt"
 
 	"github.com/marcgauthier/murmur-sql/config"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 const (
@@ -73,7 +74,10 @@ type OpenRequest struct {
 	// Passphrase carries a non-hex unlock secret. When set it selects
 	// passphrase protection (Argon2id for new stores, the envelope KDF
 	// for existing ones); otherwise Key is the raw master key.
-	Passphrase     string
+	Passphrase string
+	// FaultHooks injects storage faults for failure-path tests. It is
+	// nil in production.
+	FaultHooks     *spool.FaultHooks
 	TableFlagsSink func(map[string]bool) error
 }
 type OpenOutcome uint8

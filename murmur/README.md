@@ -73,6 +73,11 @@ Stores created before passphrase support keep the legacy mapping
 to a passphrase migrates the envelope to Argon2id; afterwards the
 legacy mapping is rejected.
 
+`RotateDataKey` retires the active data key without rewriting stored
+blocks; `KeyReferences` reports per-key live references for progress
+tracking, and `PruneDataKeys` drops retired keys nothing references
+(a safe no-op while references remain).
+
 ## Replication
 
 Replication is off unless `Options.Replication` is set. Each node needs a

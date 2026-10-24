@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/marcgauthier/murmur-sql/config"
@@ -225,5 +228,133 @@ func TestAdminProviderOpen(t *testing.T) {
 	}
 	if _, err := (Factory{}).Admin(ctx, engine.AdminRequest{Operation: "keys", DataDir: dir + "/data", KeyProviderURI: "bogus:x"}); err == nil {
 		t.Fatal("bad provider uri accepted")
+	}
+}
+
+// TestRotateRollsBackOnFlushFailure pins the failed-flush rollback: a
+// rotation whose envelope persisted but whose flush fails reports the
+// flush error, keeps the previous credential live, and reopens under
+// the old credential afterwards.
+func TestRotateRollsBackOnFlushFailure(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Storage.DataDir = dir + "/data"
+	var failFlush atomic.Bool
+	hooks := &spool.FaultHooks{
+		SegmentSync: func() error {
+			if failFlush.Swap(false) {
+				return errors.New("injected segment sync failure")
+			}
+			return nil
+		},
+	}
+	ctx := context.Background()
+	db, _, err := Factory{}.Open(ctx, engine.OpenRequest{Config: cfg, Passphrase: "old-secret", FaultHooks: hooks})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if _, err := db.Migrate(ctx, "CREATE TABLE kv(k TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL)"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if _, err := db.Execute(ctx, "INSERT INTO kv VALUES ('a', '1')", nil); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	if _, err := db.Command(ctx, 1, engine.Command{Operation: "FLUSH"}); err != nil {
+		t.Fatalf("flush before rotation: %v", err)
+	}
+	failFlush.Store(true)
+	_, err = db.Command(ctx, 1, engine.Command{Operation: "ROTATE KEY", Arguments: []engine.Value{"old-secret", "new-secret"}})
+	if err == nil || !strings.Contains(err.Error(), "injected segment sync failure") {
+		t.Fatalf("rotate returned %v, want injected flush failure", err)
+	}
+	var zero [32]byte
+	if err := db.Unlock(ctx, zero, "old-secret"); err != nil {
+		t.Fatalf("unlock with rolled-back key: %v", err)
+	}
+	if err := db.Unlock(ctx, zero, "new-secret"); err == nil {
+		t.Fatal("rolled-forward key unlocked after rollback")
+	}
+	// Close drains through the spool, which replays the uncommitted
+	// group error; locks release either way, so reopen proves the
+	// envelope state.
+	if err := db.Close(ctx); err != nil && !strings.Contains(err.Error(), "injected segment sync failure") {
+		t.Fatalf("close returned %v", err)
+	}
+	reopened, _, err := (Factory{}).Open(ctx, engine.OpenRequest{Config: cfg, Passphrase: "old-secret"})
+	if err != nil {
+		t.Fatalf("reopen with old secret: %v", err)
+	}
+	defer reopened.Close(ctx)
+	res, err := reopened.Execute(ctx, "SELECT v FROM kv WHERE k = 'a'", nil)
+	if err != nil {
+		t.Fatalf("select after reopen: %v", err)
+	}
+	if len(res.Rows) != 1 || len(res.Rows[0]) != 1 || fmt.Sprintf("%v", res.Rows[0][0]) != "1" {
+		t.Fatalf("rows = %+v, want [[1]]", res.Rows)
+	}
+	if _, _, err := (Factory{}).Open(ctx, engine.OpenRequest{Config: cfg, Passphrase: "new-secret"}); err == nil {
+		t.Fatal("reopen with rolled-back secret succeeded")
+	}
+}
+
+// TestDataKeyCommands pins the operator surface: ROTATE DATA KEY retires
+// a key, SHOW KEYS reports per-key state and references, and PRUNE KEYS
+// reports nothing while the retired key is still referenced.
+func TestDataKeyCommands(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultConfig()
+	cfg.Storage.DataDir = dir + "/data"
+	ctx := context.Background()
+	var key [32]byte
+	for i := range key {
+		key[i] = byte(i + 1)
+	}
+	db, _, err := Factory{}.Open(ctx, engine.OpenRequest{Config: cfg, Key: key})
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer db.Close(ctx)
+	if _, err := db.Migrate(ctx, "CREATE TABLE kv(k TEXT NOT NULL PRIMARY KEY, v TEXT NOT NULL)"); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	if _, err := db.Execute(ctx, "INSERT INTO kv VALUES ('a', '1')", nil); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+	res, err := db.Command(ctx, 1, engine.Command{Operation: "SHOW KEYS"})
+	if err != nil {
+		t.Fatalf("show keys: %v", err)
+	}
+	if len(res.Rows) != 1 || res.Rows[0][1] != "active" {
+		t.Fatalf("rows = %+v, want one active key", res.Rows)
+	}
+	if _, err := db.Command(ctx, 2, engine.Command{Operation: "ROTATE DATA KEY"}); err != nil {
+		t.Fatalf("rotate data key: %v", err)
+	}
+	res, err = db.Command(ctx, 3, engine.Command{Operation: "SHOW KEYS"})
+	if err != nil {
+		t.Fatalf("show keys: %v", err)
+	}
+	if len(res.Rows) != 2 {
+		t.Fatalf("rows = %+v, want two keys", res.Rows)
+	}
+	states := map[string]int64{}
+	for _, row := range res.Rows {
+		if len(row) != 6 {
+			t.Fatalf("row = %+v, want six columns", row)
+		}
+		states[row[1].(string)] = row[3].(int64)
+	}
+	if _, ok := states["active"]; !ok {
+		t.Fatalf("no active key in %+v", res.Rows)
+	}
+	if blocks, ok := states["retired"]; !ok || blocks == 0 {
+		t.Fatalf("retired key blocks = %d, want referenced", blocks)
+	}
+	res, err = db.Command(ctx, 4, engine.Command{Operation: "PRUNE KEYS"})
+	if err != nil {
+		t.Fatalf("prune keys: %v", err)
+	}
+	if res.Tag != "PRUNE" || len(res.Rows) != 0 {
+		t.Fatalf("prune = %+v, want empty PRUNE", res)
 	}
 }

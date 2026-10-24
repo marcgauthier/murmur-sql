@@ -1147,6 +1147,30 @@ func (db *Database) KeyInventory() spool.KeyInventory {
 	return db.inner.store.KeyInventory()
 }
 
+// KeyReferences scans authoritative segments and reports per-data-key
+// references: which keys still protect blocks, and where. The scan
+// costs about as much as a startup load; it backs progress reporting,
+// not the write path.
+func (db *Database) KeyReferences() ([]spool.KeyReference, error) {
+	refs, err := db.inner.store.KeyReferences()
+	if err != nil {
+		return nil, keyError(err)
+	}
+	return refs, nil
+}
+
+// PruneDataKeys drops retired data keys that no segment, checkpoint,
+// or in-flight seal references, and reports the pruned ids. Keys
+// still referenced are left untouched, so pruning is always safe to
+// retry: it returns an empty slice when nothing is prunable yet.
+func (db *Database) PruneDataKeys() ([]uint32, error) {
+	pruned, err := db.inner.store.PruneDataKeys()
+	if err != nil {
+		return nil, keyError(err)
+	}
+	return pruned, nil
+}
+
 // Schema returns the current schema.
 func (db *Database) Schema() (*Schema, error) {
 	v, err := db.Call(func(c *Core) (any, error) { s := CloneSchema(c.schema); return &s, nil })

@@ -14,14 +14,21 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/marcgauthier/murmur-sql/engine"
 	"github.com/marcgauthier/murmur-sql/murmur"
 	"github.com/marcgauthier/murmur-sql/murmur/replication"
-	"github.com/marcgauthier/murmur-sql/engine"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 func (d *database) Command(ctx context.Context, id uint64, c engine.Command) (engine.Result, error) {
 	if c.Operation == "ROTATE KEY" {
 		return d.rotate(ctx, c.Arguments)
+	}
+	if c.Operation == "ROTATE DATA KEY" {
+		return d.rotateDataKey(ctx)
+	}
+	if c.Operation == "PRUNE KEYS" {
+		return d.pruneKeys(ctx)
 	}
 	if c.Operation == "RESTORE DIRECTORY" {
 		return d.restore(ctx, c.Arguments)
@@ -66,6 +73,8 @@ func (d *database) Command(ctx context.Context, id uint64, c engine.Command) (en
 		if e == nil {
 			out.Rows = [][]engine.Value{{string(raw)}}
 		}
+	case "SHOW KEYS":
+		out.Rows, err = d.keyStatus()
 	case "SHOW TABLES REPLICATION":
 		var schema *murmur.Schema
 		schema, err = d.db.Schema()
@@ -381,6 +390,31 @@ func snake(s string) string {
 	}
 	return b.String()
 }
+
+// keyStatus reports per-data-key migration progress: state plus live
+// reference counts. A retired key with no references is prunable.
+func (d *database) keyStatus() ([][]engine.Value, error) {
+	inv := d.db.KeyInventory()
+	refs, err := d.db.KeyReferences()
+	if err != nil {
+		return nil, err
+	}
+	byID := map[uint32]spool.KeyReference{}
+	for _, r := range refs {
+		byID[r.KeyID] = r
+	}
+	var rows [][]engine.Value
+	for _, k := range inv.DataKeys {
+		state := "retired"
+		if k.Status == spool.KeyStatusActive {
+			state = "active"
+		}
+		r := byID[k.ID]
+		rows = append(rows, []engine.Value{int64(k.ID), state, int64(r.SegmentFiles), int64(r.Blocks), int64(r.Checkpoints), r.Inflight})
+	}
+	return rows, nil
+}
+
 func statusJSON(s murmur.Status) map[string]any {
 	return map[string]any{"search_indexes": s.SearchIndexes, "committed": s.Committed, "durable": s.Durable, "pending_bytes": s.PendingBytes, "storage_error": s.StorageError, "checkpoint_pause": durationJSON(s.CheckpointPause), "closed": s.Closed, "open_progress": s.OpenProgress, "sqlite": s.Sqlite, "spool": jsonFields(reflect.ValueOf(s.Spool)), "scheduler": jsonFields(reflect.ValueOf(s.Scheduler)), "replication": s.Replication}
 }
