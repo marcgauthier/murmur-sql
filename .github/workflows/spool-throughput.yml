@@ -35,11 +35,11 @@ jobs:
             cases:=[]testCase{}
             for _,writers:=range []int{1,16} {
               cases=append(cases,
-                testCase{"AES + deflate, random, 128B",128,writers,100000,false,false,false},
-                testCase{"AES + deflate, random, 1KB",1024,writers,100000,false,false,false},
-                testCase{"AES + deflate, zeros, 1KB",1024,writers,100000,true,false,false},
-                testCase{"AES + no compression, random, 1KB",1024,writers,100000,false,false,true},
-                testCase{"plaintext + deflate, random, 1KB",1024,writers,100000,false,true,false},
+                testCase{"AES + deflate, random, 128B",128,writers,1000000,false,false,false},
+                testCase{"AES + deflate, random, 1KB",1024,writers,1000000,false,false,false},
+                testCase{"AES + deflate, zeros, 1KB",1024,writers,1000000,true,false,false},
+                testCase{"AES + no compression, random, 1KB",1024,writers,1000000,false,false,true},
+                testCase{"plaintext + deflate, random, 1KB",1024,writers,1000000,false,true,false},
               )
             }
             fmt.Printf("Mode | Writers | Size | Records/s | Raw MiB/s | Disk MiB | Raw/Disk | Elapsed\n")
@@ -88,5 +88,5 @@ jobs:
           go run /tmp/spool-capacity.go
       - name: Existing built-in Spool benchmarks
         run: |
-          go test -run '^$' -bench '^Benchmark(PutWriters|FlushThroughput)$' -benchtime=100000x -count=1 -timeout=15m ./murmur/spool
+          go test -run '^$' -bench '^Benchmark(PutWriters|FlushThroughput)$' -benchtime=1000000x -count=1 -timeout=15m ./murmur/spool
           go test -run '^$' -bench '^BenchmarkGroupSyncWrites$' -benchtime=200x -count=1 -timeout=15m ./murmur/spool
