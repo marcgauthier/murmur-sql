@@ -259,6 +259,61 @@ func (ix *index) keysWithPrefix(prefix []byte) [][]byte {
 	return keys
 }
 
+// liveKeyVersions returns every live key with prefix plus its latest
+// logical sequence, sorted by raw key bytes. Deleted keys are
+// excluded. Each shard is copied under its own read lock; concurrent
+// commits may interleave between shards, so callers needing a global
+// snapshot must quiesce writers or read from a checkpoint.
+func (ix *index) liveKeyVersions(prefix []byte) []LiveKeyVersion {
+	bits, ok := namespaceBits(prefix)
+	spref := string(prefix)
+	var out []LiveKeyVersion
+	for i := range ix.shards {
+		sh := &ix.shards[i]
+		if !sh.mayMatch(bits, ok) {
+			continue
+		}
+		sh.mu.RLock()
+		for k, loc := range sh.values {
+			if strings.HasPrefix(k, spref) {
+				out = append(out, LiveKeyVersion{Key: []byte(k), Sequence: loc.Sequence})
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	slices.SortFunc(out, func(a, b LiveKeyVersion) int { return bytes.Compare(a.Key, b.Key) })
+	return out
+}
+
+// scanLiveKeys calls fn for every live key with prefix in shard order
+// (not sorted), copying one shard at a time so peak memory tracks the
+// largest shard's matches rather than the total. A non-nil fn error
+// aborts the scan. Key bytes are fresh copies per call.
+func (ix *index) scanLiveKeys(prefix []byte, fn func(LiveKeyVersion) error) error {
+	bits, ok := namespaceBits(prefix)
+	spref := string(prefix)
+	for i := range ix.shards {
+		sh := &ix.shards[i]
+		if !sh.mayMatch(bits, ok) {
+			continue
+		}
+		sh.mu.RLock()
+		var batch []LiveKeyVersion
+		for k, loc := range sh.values {
+			if strings.HasPrefix(k, spref) {
+				batch = append(batch, LiveKeyVersion{Key: []byte(k), Sequence: loc.Sequence})
+			}
+		}
+		sh.mu.RUnlock()
+		for _, kv := range batch {
+			if err := fn(kv); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
 // keysPage returns at most limit sorted live keys with prefix,
 // exclusively after after (nil starts at the beginning).
 func (ix *index) keysPage(prefix, after []byte, limit int) [][]byte {
