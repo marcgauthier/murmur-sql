@@ -46,7 +46,10 @@ type Options struct {
 	NodeID           *[16]byte
 	FaultHooks       *spool.FaultHooks
 	OnOpenProgress   func(OpenProgress)
-	Scheduler        SchedulerConfig
+	// Recovery configures the optional disposable recovery cache.
+	// Nil disables the feature (legacy open path).
+	Recovery  *RecoveryOptions
+	Scheduler SchedulerConfig
 }
 
 // DefaultOptions returns the default database options.
@@ -85,6 +88,9 @@ func (o *Options) Validate() error {
 			return invalidErr("%v", err)
 		}
 	}
+	if err := o.Recovery.Validate(); err != nil {
+		return err
+	}
 	if o.CaptureInterval <= 0 ||
 		o.CaptureBytes == 0 ||
 		o.QueueBytes < o.CaptureBytes ||
@@ -113,8 +119,11 @@ type Status struct {
 	CheckpointPause time.Duration
 	Closed          bool
 	OpenProgress    *OpenProgress
-	Sqlite          *SqliteMetrics
-	Spool           *SpoolMetrics
-	Scheduler       *SchedulerSnapshot
-	Replication     *replication.Status
+	// OpenStages carries per-stage open timings. Always populated on
+	// successful open, even without an OnOpenProgress callback.
+	OpenStages  *OpenStageTimings
+	Sqlite      *SqliteMetrics
+	Spool       *SpoolMetrics
+	Scheduler   *SchedulerSnapshot
+	Replication *replication.Status
 }

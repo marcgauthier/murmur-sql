@@ -571,6 +571,7 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			schema := CloneSchema(opened.Schema)
 			cursor := opened.Cursor
 			collectionClock := opened.Clock
+			searchStart := time.Now()
 			search := NewSearchManager(&options)
 			definitions, err := SchemaSearchDefinitions(options.SearchIndexes, &schema)
 			if err != nil {
@@ -594,6 +595,7 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 				return nil, err
 			}
 			search.TakeSearchPublications()
+			progress.RecordStage(StageSearchInit, time.Since(searchStart))
 			status.Mu.Lock()
 			status.Status.SearchIndexes = search.SearchStatus()
 			status.Mu.Unlock()
@@ -614,10 +616,12 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			_ = physical
 			_ = workerDone
 			finalProgress := progress.Finish(nil)
+			stageTimings := progress.StageTimings()
 			status.Mu.Lock()
 			status.Status.Committed = cursor
 			status.Status.Durable = cursor
 			status.Status.OpenProgress = finalProgress
+			status.Status.OpenStages = &stageTimings
 			status.Mu.Unlock()
 			subMgr := NewSubManager(identity.Database, 1024)
 			core := &Core{

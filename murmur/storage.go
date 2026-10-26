@@ -557,6 +557,7 @@ func RecoverCurrent(opened *Opened, progress *OpenProgressReporter) (*sqlite.Con
 		c.Close()
 		return nil, err
 	}
+	insertStart := time.Now()
 	for _, table := range opened.Schema.Tables {
 		if err := c.ExecBatch(table.SQL); err != nil {
 			return fail(sqlErr(err))
@@ -625,7 +626,9 @@ func RecoverCurrent(opened *Opened, progress *OpenProgressReporter) (*sqlite.Con
 		}
 		stmt.Close()
 	}
+	progress.RecordStage(StageRowInsert, time.Since(insertStart))
 	progress.Phase(PhaseIndexing)
+	indexStart := time.Now()
 	for _, sql := range opened.Schema.Indexes {
 		if err := c.ExecBatch(sql); err != nil {
 			return fail(sqlErr(err))
@@ -634,10 +637,13 @@ func RecoverCurrent(opened *Opened, progress *OpenProgressReporter) (*sqlite.Con
 	if err := c.ExecBatch("COMMIT"); err != nil {
 		return fail(sqlErr(err))
 	}
+	progress.RecordStage(StageIndexBuild, time.Since(indexStart))
+	checkStart := time.Now()
 	row, err := c.QueryRow("PRAGMA integrity_check")
 	if err != nil {
 		return fail(sqlErr(err))
 	}
+	progress.RecordStage(StageIntegrityCheck, time.Since(checkStart))
 	if len(row) == 0 || row[0].Str != "ok" {
 		check := ""
 		if len(row) > 0 {
@@ -701,6 +707,7 @@ func OpenStorageWithCredential(path string, cred Credential, o *Options, progres
 	var cursor, sequence uint64
 	var keys [][]byte
 	snapshotLoaded := false
+	spoolStart := time.Now()
 	store, err := spool.OpenAndLoadOrdered(opts, func(records []spool.Record) error {
 		var count uint64
 		for _, r := range records {
@@ -856,6 +863,7 @@ func OpenStorageWithCredential(path string, cred Credential, o *Options, progres
 		}
 		return nil
 	})
+	progress.RecordStage(StageSpoolOpen, time.Since(spoolStart))
 	if err != nil {
 		return nil, keyError(err)
 	}
