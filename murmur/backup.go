@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -25,7 +26,8 @@ func copyFileSync(src, dst string) error {
 	if err := os.WriteFile(dst, data, 0o600); err != nil {
 		return ioErr(err)
 	}
-	f, err := os.Open(dst)
+	// Sync requires a writable handle on Windows.
+	f, err := os.OpenFile(dst, os.O_RDWR, 0)
 	if err != nil {
 		return ioErr(err)
 	}
@@ -37,6 +39,10 @@ func copyFileSync(src, dst string) error {
 }
 
 func syncDir(dir string) error {
+	// Match spool.dirSync: Windows does not support fsync on directories.
+	if runtime.GOOS == "windows" {
+		return nil
+	}
 	_ = os.Chmod(dir, 0o700)
 	f, err := os.Open(dir)
 	if err != nil {
