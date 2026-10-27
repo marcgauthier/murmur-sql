@@ -95,6 +95,26 @@ func (s *LogicalStore) KeysWithPrefix(prefix []byte) [][]byte {
 	return s.store.KeysWithPrefix(prefix)
 }
 
+// LiveKeyVersions returns every committed live key with prefix and
+// its latest logical sequence, sorted by raw key bytes. Piece keys
+// and tombstones are excluded by the caller's prefix or liveness.
+func (s *LogicalStore) LiveKeyVersions(prefix []byte) ([]spool.LiveKeyVersion, error) {
+	versions, err := s.store.LiveKeyVersions(prefix)
+	if err != nil {
+		return nil, storageErr("%v", err)
+	}
+	return versions, nil
+}
+
+// ScanLiveKeyVersions calls fn once per committed live key with
+// prefix in shard order; see spool for stability caveats.
+func (s *LogicalStore) ScanLiveKeyVersions(prefix []byte, fn func(spool.LiveKeyVersion) error) error {
+	if err := s.store.ScanLiveKeyVersions(prefix, fn); err != nil {
+		return storageErr("%v", err)
+	}
+	return nil
+}
+
 // Get reads a logical value, reassembling split blobs.
 func (s *LogicalStore) Get(key []byte) ([]byte, error) {
 	value, err := s.store.Get(key)

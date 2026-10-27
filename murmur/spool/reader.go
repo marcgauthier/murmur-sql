@@ -100,3 +100,48 @@ func (s *Store) KeysWithPrefix(prefix []byte) [][]byte {
 func (s *Store) KeysPage(prefix, after []byte, limit int) [][]byte {
 	return s.idx.keysPage(prefix, after, limit)
 }
+
+// LiveKeyVersion pairs a committed live key with its latest logical
+// sequence. Sequences order versions of a key: every new committed
+// mutation advances them, while compaction, key rotation, and reopen
+// preserve them.
+type LiveKeyVersion struct {
+	Key      []byte
+	Sequence uint64
+}
+
+// LiveKeyVersions returns every committed live key with prefix and its
+// latest logical sequence, sorted by raw key bytes. Deleted keys are
+// excluded; no value is read. Key bytes are copies the caller owns.
+//
+// Each shard is copied under its own read lock, so concurrent commits
+// may interleave between shards. Callers that need a global snapshot
+// must quiesce writers (as during open, before the worker starts) or
+// read from a Checkpoint. Under concurrency every returned pair is a
+// real committed version, but the set may mix moments.
+//
+// The scan is one pass over the index and holds O(N) memory for N
+// matching keys. For bounded memory over huge key spaces use
+// ScanLiveKeyVersions and sort externally.
+func (s *Store) LiveKeyVersions(prefix []byte) ([]LiveKeyVersion, error) {
+	if s.closed.Load() {
+		return nil, ErrClosed
+	}
+	return s.idx.liveKeyVersions(prefix), nil
+}
+
+// ScanLiveKeyVersions calls fn once per committed live key with
+// prefix, in shard order (not sorted), copying one shard at a time so
+// peak memory tracks the largest shard's matches rather than the
+// total. The same stability caveats as LiveKeyVersions apply. A
+// non-nil fn error aborts the scan and is returned; key bytes are
+// fresh per call and must be copied to retain.
+func (s *Store) ScanLiveKeyVersions(prefix []byte, fn func(LiveKeyVersion) error) error {
+	if s.closed.Load() {
+		return ErrClosed
+	}
+	if fn == nil {
+		return fmt.Errorf("spool: nil scan callback")
+	}
+	return s.idx.scanLiveKeys(prefix, fn)
+}

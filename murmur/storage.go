@@ -360,6 +360,10 @@ const (
 	WorkRotate
 	WorkRotateMasterKey
 	WorkStop
+	// WorkBuildRecovery captures a checkpoint for the background
+	// recovery-cache builder. Appended last so existing values keep
+	// their order.
+	WorkBuildRecovery
 )
 
 // ExportResult carries a worker export reply.
@@ -398,6 +402,9 @@ type Work struct {
 	MasterKey  []byte
 	Passphrase string
 	StopReply  chan<- error
+	// RecoveryBuildReply carries the WorkBuildRecovery checkpoint.
+	// Destination doubles as the recovery directory for that kind.
+	RecoveryBuildReply chan<- RecoveryBuildResult
 }
 
 // Opened is an open storage handle owned by the worker thread.
@@ -557,6 +564,7 @@ func RecoverCurrent(opened *Opened, progress *OpenProgressReporter) (*sqlite.Con
 		c.Close()
 		return nil, err
 	}
+	insertStart := time.Now()
 	for _, table := range opened.Schema.Tables {
 		if err := c.ExecBatch(table.SQL); err != nil {
 			return fail(sqlErr(err))
@@ -625,7 +633,9 @@ func RecoverCurrent(opened *Opened, progress *OpenProgressReporter) (*sqlite.Con
 		}
 		stmt.Close()
 	}
+	progress.RecordStage(StageRowInsert, time.Since(insertStart))
 	progress.Phase(PhaseIndexing)
+	indexStart := time.Now()
 	for _, sql := range opened.Schema.Indexes {
 		if err := c.ExecBatch(sql); err != nil {
 			return fail(sqlErr(err))
@@ -634,10 +644,13 @@ func RecoverCurrent(opened *Opened, progress *OpenProgressReporter) (*sqlite.Con
 	if err := c.ExecBatch("COMMIT"); err != nil {
 		return fail(sqlErr(err))
 	}
+	progress.RecordStage(StageIndexBuild, time.Since(indexStart))
+	checkStart := time.Now()
 	row, err := c.QueryRow("PRAGMA integrity_check")
 	if err != nil {
 		return fail(sqlErr(err))
 	}
+	progress.RecordStage(StageIntegrityCheck, time.Since(checkStart))
 	if len(row) == 0 || row[0].Str != "ok" {
 		check := ""
 		if len(row) > 0 {
@@ -701,6 +714,7 @@ func OpenStorageWithCredential(path string, cred Credential, o *Options, progres
 	var cursor, sequence uint64
 	var keys [][]byte
 	snapshotLoaded := false
+	spoolStart := time.Now()
 	store, err := spool.OpenAndLoadOrdered(opts, func(records []spool.Record) error {
 		var count uint64
 		for _, r := range records {
@@ -856,6 +870,7 @@ func OpenStorageWithCredential(path string, cred Credential, o *Options, progres
 		}
 		return nil
 	})
+	progress.RecordStage(StageSpoolOpen, time.Since(spoolStart))
 	if err != nil {
 		return nil, keyError(err)
 	}
@@ -1258,6 +1273,12 @@ func StartStorage(opened *Opened, o *Options, status *StatusState) (*spool.Store
 					w.BarrierReply <- storageErr("%s", *failed)
 				} else {
 					w.BarrierReply <- opened.Store.Flush()
+				}
+			case WorkBuildRecovery:
+				if failed != nil {
+					w.RecoveryBuildReply <- RecoveryBuildResult{Err: storageErr("%s", *failed)}
+				} else {
+					w.RecoveryBuildReply <- buildRecoveryCheckpoint(opened, w.Destination)
 				}
 			case WorkExport:
 				if failed != nil {

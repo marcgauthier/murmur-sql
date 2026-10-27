@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -485,6 +486,7 @@ type Inner struct {
 	identity      Identity
 	subMgr        *SubManager
 	scheduler     *WriterScheduler
+	recovery      *recoveryScheduler
 	active        atomic.Bool
 	writerGID     atomic.Int64
 }
@@ -543,12 +545,14 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		store     *spool.Store
 		subMgr    *SubManager
 		writerGID int64
+		recovery  RecoveryRestoreOutcome
 		err       error
 	}
 	startCh := make(chan startResult, 1)
 	status := &StatusState{}
 	progress := NewOpenProgressReporter(options.OnOpenProgress)
 	threadDone := make(chan struct{})
+	var restoreOutcome RecoveryRestoreOutcome
 	go func() {
 		defer close(threadDone)
 		core, err := func() (*Core, error) {
@@ -560,7 +564,8 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 				credCopy.Key[i] = 0
 			}
 			credCopy.Passphrase = ""
-			connection, err := RecoverCurrent(opened, progress)
+			connection, outcome, err := RecoverFastOrLegacy(opened, options.Recovery, filepath.Join(path, "recovery"), progress)
+			restoreOutcome = outcome
 			if err != nil {
 				opened.Close()
 				return nil, err
@@ -571,6 +576,7 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			schema := CloneSchema(opened.Schema)
 			cursor := opened.Cursor
 			collectionClock := opened.Clock
+			searchStart := time.Now()
 			search := NewSearchManager(&options)
 			definitions, err := SchemaSearchDefinitions(options.SearchIndexes, &schema)
 			if err != nil {
@@ -594,6 +600,7 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 				return nil, err
 			}
 			search.TakeSearchPublications()
+			progress.RecordStage(StageSearchInit, time.Since(searchStart))
 			status.Mu.Lock()
 			status.Status.SearchIndexes = search.SearchStatus()
 			status.Mu.Unlock()
@@ -614,10 +621,31 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			_ = physical
 			_ = workerDone
 			finalProgress := progress.Finish(nil)
+			stageTimings := progress.StageTimings()
 			status.Mu.Lock()
 			status.Status.Committed = cursor
 			status.Status.Durable = cursor
 			status.Status.OpenProgress = finalProgress
+			status.Status.OpenStages = &stageTimings
+			if options.Recovery.IsEnabled() {
+				var ageSeconds float64
+				if restoreOutcome.CacheCreatedUnixNano > 0 {
+					ageSeconds = time.Since(time.Unix(0, int64(restoreOutcome.CacheCreatedUnixNano))).Seconds()
+					if ageSeconds < 0 {
+						ageSeconds = 0
+					}
+				}
+				status.Status.Recovery = &RecoveryStatus{
+					Outcome:         restoreOutcome.Outcome.String(),
+					Reason:          restoreOutcome.Reason,
+					Generation:      restoreOutcome.Generation,
+					ChangedRows:     restoreOutcome.ChangedRows,
+					TotalRows:       restoreOutcome.TotalRows,
+					CacheBytes:      restoreOutcome.CacheBytes,
+					CaptureCursor:   restoreOutcome.CaptureCursor,
+					CacheAgeSeconds: ageSeconds,
+				}
+			}
 			status.Mu.Unlock()
 			subMgr := NewSubManager(identity.Database, 1024)
 			core := &Core{
@@ -639,7 +667,7 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			startCh <- startResult{err: err}
 			return
 		}
-		startCh <- startResult{identity: core.identity, worker: core.worker, store: core.store, subMgr: core.subMgr, writerGID: curGoroutineID()}
+		startCh <- startResult{identity: core.identity, worker: core.worker, store: core.store, subMgr: core.subMgr, writerGID: curGoroutineID(), recovery: restoreOutcome}
 		for {
 			delay := core.captureInterval()
 			if elapsed := time.Since(core.lastCapture); elapsed < delay {
@@ -703,6 +731,18 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		threadDone: threadDone, status: status,
 		identity: started.identity, subMgr: started.subMgr,
 	}}
+	if options.Recovery.IsEnabled() {
+		normalized := options.Recovery.WithDefaults()
+		normalized.Enabled = true
+		recoveryDir := filepath.Join(path, "recovery")
+		// A previous crash may have left an unpublished staging
+		// directory. No build is running yet, so sweeping stale
+		// .building-* dirs is safe; published generations and
+		// CURRENT are never touched.
+		cleanupStaleBuildDirs(recoveryDir)
+		database.inner.recovery = newRecoveryScheduler(normalized, started.worker,
+			started.store, recoveryDir, options.CompressionLevel)
+	}
 	database.inner.writerGID.Store(started.writerGID)
 	if flags != nil {
 		if len(flags) > 0 {
@@ -728,6 +768,11 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		database.inner.replicationMu.Lock()
 		database.inner.replication = handle
 		database.inner.replicationMu.Unlock()
+	}
+	// The database is available from here; queue a recovery build
+	// when the cache missed or went stale, without waiting for it.
+	if database.inner.recovery != nil && options.Recovery.AutoBuild && recoveryNeedsBuild(started.recovery) {
+		database.inner.recovery.Trigger()
 	}
 	return database, nil
 }
@@ -1300,6 +1345,15 @@ func (db *Database) Status() Status {
 		s.Replication = &replicationStatus
 	}
 	db.inner.replicationMu.Unlock()
+	if s.Recovery != nil && db.inner.recovery != nil {
+		// The open-time restore summary is stored; the background
+		// build status is live. Copy before attaching.
+		cp := *s.Recovery
+		if build := db.inner.recovery.Status(); !build.Started.IsZero() {
+			cp.LastBuild = &build
+		}
+		s.Recovery = &cp
+	}
 	return s
 }
 
@@ -1397,6 +1451,11 @@ func (db *Database) Close() error {
 		return nil
 	}
 	db.inner.status.Mu.Unlock()
+	// Stop the recovery builder first: it may hold a checkpoint the
+	// storage worker shutdown below would strand.
+	if db.inner.recovery != nil {
+		db.inner.recovery.Stop()
+	}
 	db.inner.subMgr.Close()
 	db.inner.scheduler.Close()
 	db.inner.replicationMu.Lock()

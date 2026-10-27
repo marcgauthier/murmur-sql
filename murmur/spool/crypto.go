@@ -41,6 +41,25 @@ const (
 // full info is prefix || storeID || contextID.
 const keysEncInfo = "spool/keys-enc/v3/"
 
+// recoveryKeyInfo binds HKDF-derived recovery-cache keys to their
+// purpose. Data keys are unique per store, so the constant purpose
+// string suffices for separation from block encryption.
+const recoveryKeyInfo = "spool/recovery/v1"
+
+// deriveRecoveryKey derives the purpose-separated recovery-cache key
+// for one data key. The recovery cache never reuses raw block key
+// material.
+func deriveRecoveryKey(dataKey [32]byte) ([32]byte, error) {
+	var out [32]byte
+	dk, err := hkdf.Key(sha256.New, dataKey[:], nil, recoveryKeyInfo, 32)
+	if err != nil {
+		return out, fmt.Errorf("spool: recovery hkdf: %w", err)
+	}
+	copy(out[:], dk)
+	wipe(dk)
+	return out, nil
+}
+
 // blockCrypt seals and opens block payloads. In algoNone mode the
 // "seal" appends a CRC32-Castagnoli instead of an AEAD tag.
 type blockCrypt struct {

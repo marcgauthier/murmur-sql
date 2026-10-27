@@ -45,6 +45,21 @@ type EngineConfig struct {
 	StorageWorkers   uint64          `yaml:"storage_workers" json:"storage_workers"`
 	DataKeyMaxAge    *Duration       `yaml:"data_key_max_age" json:"data_key_max_age"`
 	Scheduler        SchedulerConfig `yaml:"scheduler" json:"scheduler"`
+	Recovery         RecoveryConfig  `yaml:"recovery" json:"recovery"`
+}
+
+// RecoveryConfig controls the optional disposable recovery cache:
+// sorted, compressed row runs rebuilt from Spool to accelerate
+// restarts. Disabled by default; enabling never changes the
+// authoritative storage format.
+type RecoveryConfig struct {
+	Enabled           bool     `yaml:"enabled" json:"enabled"`
+	AutoBuild         bool     `yaml:"auto_build" json:"auto_build"`
+	BuildInterval     Duration `yaml:"build_interval" json:"build_interval"`
+	TargetRunBytes    Bytes    `yaml:"target_run_bytes" json:"target_run_bytes"`
+	TargetBlockBytes  Bytes    `yaml:"target_block_bytes" json:"target_block_bytes"`
+	MaxBuildMemory    Bytes    `yaml:"max_build_memory" json:"max_build_memory"`
+	RetainGenerations int      `yaml:"retain_generations" json:"retain_generations"`
 }
 
 type SchedulerConfig struct {
@@ -212,6 +227,19 @@ func DefaultEngineConfig() EngineConfig {
 		CompressionLevel: 3,
 		StorageWorkers:   2,
 		Scheduler:        DefaultSchedulerConfig(),
+		Recovery:         DefaultRecoveryConfig(),
+	}
+}
+
+func DefaultRecoveryConfig() RecoveryConfig {
+	return RecoveryConfig{
+		Enabled:           false,
+		AutoBuild:         true,
+		BuildInterval:     Duration((3600) * 1e9),
+		TargetRunBytes:    256 << 20,
+		TargetBlockBytes:  256 << 10,
+		MaxBuildMemory:    256 << 20,
+		RetainGenerations: 2,
 	}
 }
 

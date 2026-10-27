@@ -13,6 +13,7 @@ type OpenProgressReporter struct {
 	phaseSince time.Time
 	lastEmit   time.Time
 	progress   OpenProgress
+	stages     OpenStageTimings
 	callback   func(OpenProgress)
 	has        bool
 }
@@ -106,6 +107,38 @@ func (r *OpenProgressReporter) AddRows(inserted, skipped uint64) {
 	if now.Sub(r.lastEmit) >= 200*time.Millisecond {
 		r.emitLocked(now)
 	}
+}
+
+// RecordStage accumulates d into the named open stage. Unknown stages
+// are ignored. Always recorded, even for silent reporters, so stage
+// timings stay available without a progress callback.
+func (r *OpenProgressReporter) RecordStage(stage OpenStage, d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch stage {
+	case StageSpoolOpen:
+		r.stages.SpoolOpen += d
+	case StageRowInsert:
+		r.stages.RowInsert += d
+	case StageIndexBuild:
+		r.stages.IndexBuild += d
+	case StageIntegrityCheck:
+		r.stages.IntegrityCheck += d
+	case StageSearchInit:
+		r.stages.SearchInit += d
+	case StageRecoveryDiff:
+		r.stages.RecoveryDiff += d
+	}
+}
+
+// StageTimings returns the accumulated per-stage open timings.
+func (r *OpenProgressReporter) StageTimings() OpenStageTimings {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stages
 }
 
 // Snapshot returns current progress, if reporting.

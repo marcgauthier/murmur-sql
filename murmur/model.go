@@ -409,6 +409,64 @@ type OpenProgress struct {
 	Error          *string
 }
 
+// OpenStage names one timed stage of database open.
+type OpenStage int
+
+const (
+	// StageSpoolOpen covers spool.OpenAndLoadOrdered: segment scan,
+	// index rebuild, and logical history replay.
+	StageSpoolOpen OpenStage = iota
+	// StageRowInsert covers RecoverCurrent table creation and the
+	// sequential per-row SQLite insert loop.
+	StageRowInsert
+	// StageIndexBuild covers secondary index creation plus COMMIT.
+	StageIndexBuild
+	// StageIntegrityCheck covers PRAGMA integrity_check.
+	StageIntegrityCheck
+	// StageSearchInit covers search-index registration and refresh.
+	StageSearchInit
+	// StageRecoveryDiff covers cache/index discovery plus the
+	// key-version overlay merge on the fast restore path. Zero on
+	// legacy restores.
+	StageRecoveryDiff
+)
+
+// String renders the stage name.
+func (s OpenStage) String() string {
+	switch s {
+	case StageSpoolOpen:
+		return "SpoolOpen"
+	case StageRowInsert:
+		return "RowInsert"
+	case StageIndexBuild:
+		return "IndexBuild"
+	case StageIntegrityCheck:
+		return "IntegrityCheck"
+	case StageSearchInit:
+		return "SearchInit"
+	case StageRecoveryDiff:
+		return "RecoveryDiff"
+	}
+	return "Unknown"
+}
+
+// OpenStageTimings is a structured summary of per-stage open costs. It
+// stays out of the OpenProgress wire format so stage instrumentation
+// cannot break existing progress consumers.
+type OpenStageTimings struct {
+	SpoolOpen      time.Duration
+	RowInsert      time.Duration
+	IndexBuild     time.Duration
+	IntegrityCheck time.Duration
+	SearchInit     time.Duration
+	RecoveryDiff   time.Duration
+}
+
+// Total returns the sum of all recorded stage timings.
+func (t OpenStageTimings) Total() time.Duration {
+	return t.SpoolOpen + t.RowInsert + t.IndexBuild + t.IntegrityCheck + t.SearchInit + t.RecoveryDiff
+}
+
 // SqliteMetrics carries in-memory SQLite resource and size diagnostics.
 type SqliteMetrics struct {
 	MemoryUsedBytes       int64

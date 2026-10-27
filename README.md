@@ -33,4 +33,5 @@ Low-level SQLite and zstd implementations are vendored directly in `murmur/third
 - [Engine adapter and ownership](docs/ENGINE.md)
 - [Testing instructions and current verification status](docs/TESTING.md)
 - [Parity checklist](docs/PARITY.md)
+- [Recovery cache](docs/RECOVERY.md)
 - [Dependencies](VENDORS.md)
