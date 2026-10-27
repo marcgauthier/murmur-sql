@@ -26,7 +26,7 @@ func recoveryTestOptions() Options {
 
 // waitRecoveryBuild waits for the running build to finish and returns
 // its status, failing on timeout or build error.
-func waitRecoveryBuild(t *testing.T, db *Database, timeout time.Duration) RecoveryBuildStatus {
+func waitRecoveryBuild(t testing.TB, db *Database, timeout time.Duration) RecoveryBuildStatus {
 	t.Helper()
 	if db.inner.recovery == nil {
 		t.Fatal("recovery scheduler not started")

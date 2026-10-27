@@ -327,13 +327,9 @@ func recoveryCipherFor(store *spool.Store, encrypted bool) (*recovery.Cipher, st
 // encoded primary key already carried by RowMeta.
 func recoveryRowFromRecord(key, value []byte, seq uint64, tables map[string]*Table) (recovery.Row, error) {
 	var zero recovery.Row
-	rest, ok := strings.CutPrefix(string(key), recoveryRowPrefix)
-	if !ok {
-		return zero, fmt.Errorf("murmur: bad row key %q", key)
-	}
-	table, _, ok := strings.Cut(rest, "/")
-	if !ok || table == "" || len(table) > recovery.MaxTableIDLen {
-		return zero, fmt.Errorf("murmur: bad row table %q", key)
+	table, err := parseRecoveryRowTable(key)
+	if err != nil {
+		return zero, err
 	}
 	if _, ok := tables[table]; !ok {
 		return zero, fmt.Errorf("murmur: row for unknown table %q", table)

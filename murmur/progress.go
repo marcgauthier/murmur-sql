@@ -129,6 +129,8 @@ func (r *OpenProgressReporter) RecordStage(stage OpenStage, d time.Duration) {
 		r.stages.IntegrityCheck += d
 	case StageSearchInit:
 		r.stages.SearchInit += d
+	case StageRecoveryDiff:
+		r.stages.RecoveryDiff += d
 	}
 }
 

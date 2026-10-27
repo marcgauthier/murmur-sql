@@ -425,6 +425,10 @@ const (
 	StageIntegrityCheck
 	// StageSearchInit covers search-index registration and refresh.
 	StageSearchInit
+	// StageRecoveryDiff covers cache/index discovery plus the
+	// key-version overlay merge on the fast restore path. Zero on
+	// legacy restores.
+	StageRecoveryDiff
 )
 
 // String renders the stage name.
@@ -440,6 +444,8 @@ func (s OpenStage) String() string {
 		return "IntegrityCheck"
 	case StageSearchInit:
 		return "SearchInit"
+	case StageRecoveryDiff:
+		return "RecoveryDiff"
 	}
 	return "Unknown"
 }
@@ -453,11 +459,12 @@ type OpenStageTimings struct {
 	IndexBuild     time.Duration
 	IntegrityCheck time.Duration
 	SearchInit     time.Duration
+	RecoveryDiff   time.Duration
 }
 
 // Total returns the sum of all recorded stage timings.
 func (t OpenStageTimings) Total() time.Duration {
-	return t.SpoolOpen + t.RowInsert + t.IndexBuild + t.IntegrityCheck + t.SearchInit
+	return t.SpoolOpen + t.RowInsert + t.IndexBuild + t.IntegrityCheck + t.SearchInit + t.RecoveryDiff
 }
 
 // SqliteMetrics carries in-memory SQLite resource and size diagnostics.

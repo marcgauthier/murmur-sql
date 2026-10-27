@@ -56,6 +56,11 @@ func (s recoveryFixtureSpec) totalRows() int { return s.Docs + s.Events + s.Pair
 
 var recoveryTitles = []string{"alpha", "beta", "gamma", "delta", "omega", "note", "draft", "final"}
 
+// newFixtureRNG returns the deterministic fixture generator.
+func newFixtureRNG() *rand.Rand {
+	return rand.New(rand.NewSource(recoveryBaselineSeed))
+}
+
 // buildRecoveryFixture migrates the schema and loads the deterministic
 // dataset described by spec, then flushes.
 func buildRecoveryFixture(t testing.TB, db *Database, spec recoveryFixtureSpec) {
@@ -63,7 +68,19 @@ func buildRecoveryFixture(t testing.TB, db *Database, spec recoveryFixtureSpec) 
 	if err := db.Migrate(NewMigration(recoveryBaselineDDL)); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	rng := rand.New(rand.NewSource(recoveryBaselineSeed))
+	insertFixtureRows(t, db, newFixtureRNG(), spec)
+	if spec.Mutate {
+		applyRecoveryMutations(t, db, newFixtureRNG(), spec)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+}
+
+// insertFixtureRows loads the deterministic inserts of spec without
+// migrating or mutating.
+func insertFixtureRows(t testing.TB, db *Database, rng *rand.Rand, spec recoveryFixtureSpec) {
+	t.Helper()
 	const batch = 5000
 	for start := 0; start < spec.Docs; start += batch {
 		end := min(start+batch, spec.Docs)
@@ -88,12 +105,6 @@ func buildRecoveryFixture(t testing.TB, db *Database, spec recoveryFixtureSpec) 
 			rows = append(rows, []any{i % 100, fmt.Sprintf("b-%d", i), int64(i)})
 		}
 		execManyMust(t, db, "INSERT INTO pairs (a, b, n) VALUES (?, ?, ?)", rows)
-	}
-	if spec.Mutate {
-		applyRecoveryMutations(t, db, rng, spec)
-	}
-	if err := db.Flush(); err != nil {
-		t.Fatalf("flush: %v", err)
 	}
 }
 

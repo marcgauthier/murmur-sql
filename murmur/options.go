@@ -121,7 +121,10 @@ type Status struct {
 	OpenProgress    *OpenProgress
 	// OpenStages carries per-stage open timings. Always populated on
 	// successful open, even without an OnOpenProgress callback.
-	OpenStages  *OpenStageTimings
+	OpenStages *OpenStageTimings
+	// Recovery summarizes the fast-or-legacy restore. Set only when
+	// the recovery feature is enabled.
+	Recovery    *RecoveryStatus
 	Sqlite      *SqliteMetrics
 	Spool       *SpoolMetrics
 	Scheduler   *SchedulerSnapshot

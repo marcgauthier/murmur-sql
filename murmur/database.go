@@ -545,12 +545,14 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		store     *spool.Store
 		subMgr    *SubManager
 		writerGID int64
+		recovery  RecoveryRestoreOutcome
 		err       error
 	}
 	startCh := make(chan startResult, 1)
 	status := &StatusState{}
 	progress := NewOpenProgressReporter(options.OnOpenProgress)
 	threadDone := make(chan struct{})
+	var restoreOutcome RecoveryRestoreOutcome
 	go func() {
 		defer close(threadDone)
 		core, err := func() (*Core, error) {
@@ -562,7 +564,8 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 				credCopy.Key[i] = 0
 			}
 			credCopy.Passphrase = ""
-			connection, err := RecoverCurrent(opened, progress)
+			connection, outcome, err := RecoverFastOrLegacy(opened, options.Recovery, filepath.Join(path, "recovery"), progress)
+			restoreOutcome = outcome
 			if err != nil {
 				opened.Close()
 				return nil, err
@@ -624,6 +627,14 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			status.Status.Durable = cursor
 			status.Status.OpenProgress = finalProgress
 			status.Status.OpenStages = &stageTimings
+			if options.Recovery.IsEnabled() {
+				status.Status.Recovery = &RecoveryStatus{
+					Outcome:     restoreOutcome.Outcome.String(),
+					Generation:  restoreOutcome.Generation,
+					ChangedRows: restoreOutcome.ChangedRows,
+					TotalRows:   restoreOutcome.TotalRows,
+				}
+			}
 			status.Mu.Unlock()
 			subMgr := NewSubManager(identity.Database, 1024)
 			core := &Core{
@@ -645,7 +656,7 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			startCh <- startResult{err: err}
 			return
 		}
-		startCh <- startResult{identity: core.identity, worker: core.worker, store: core.store, subMgr: core.subMgr, writerGID: curGoroutineID()}
+		startCh <- startResult{identity: core.identity, worker: core.worker, store: core.store, subMgr: core.subMgr, writerGID: curGoroutineID(), recovery: restoreOutcome}
 		for {
 			delay := core.captureInterval()
 			if elapsed := time.Since(core.lastCapture); elapsed < delay {
@@ -741,9 +752,9 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		database.inner.replication = handle
 		database.inner.replicationMu.Unlock()
 	}
-	// The database is available from here; queue the first recovery
-	// build without waiting for it.
-	if database.inner.recovery != nil && options.Recovery.AutoBuild {
+	// The database is available from here; queue a recovery build
+	// when the cache missed or went stale, without waiting for it.
+	if database.inner.recovery != nil && options.Recovery.AutoBuild && recoveryNeedsBuild(started.recovery) {
 		database.inner.recovery.Trigger()
 	}
 	return database, nil
