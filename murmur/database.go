@@ -628,11 +628,22 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 			status.Status.OpenProgress = finalProgress
 			status.Status.OpenStages = &stageTimings
 			if options.Recovery.IsEnabled() {
+				var ageSeconds float64
+				if restoreOutcome.CacheCreatedUnixNano > 0 {
+					ageSeconds = time.Since(time.Unix(0, int64(restoreOutcome.CacheCreatedUnixNano))).Seconds()
+					if ageSeconds < 0 {
+						ageSeconds = 0
+					}
+				}
 				status.Status.Recovery = &RecoveryStatus{
-					Outcome:     restoreOutcome.Outcome.String(),
-					Generation:  restoreOutcome.Generation,
-					ChangedRows: restoreOutcome.ChangedRows,
-					TotalRows:   restoreOutcome.TotalRows,
+					Outcome:         restoreOutcome.Outcome.String(),
+					Reason:          restoreOutcome.Reason,
+					Generation:      restoreOutcome.Generation,
+					ChangedRows:     restoreOutcome.ChangedRows,
+					TotalRows:       restoreOutcome.TotalRows,
+					CacheBytes:      restoreOutcome.CacheBytes,
+					CaptureCursor:   restoreOutcome.CaptureCursor,
+					CacheAgeSeconds: ageSeconds,
 				}
 			}
 			status.Mu.Unlock()
@@ -723,8 +734,14 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 	if options.Recovery.IsEnabled() {
 		normalized := options.Recovery.WithDefaults()
 		normalized.Enabled = true
+		recoveryDir := filepath.Join(path, "recovery")
+		// A previous crash may have left an unpublished staging
+		// directory. No build is running yet, so sweeping stale
+		// .building-* dirs is safe; published generations and
+		// CURRENT are never touched.
+		cleanupStaleBuildDirs(recoveryDir)
 		database.inner.recovery = newRecoveryScheduler(normalized, started.worker,
-			started.store, filepath.Join(path, "recovery"), options.CompressionLevel)
+			started.store, recoveryDir, options.CompressionLevel)
 	}
 	database.inner.writerGID.Store(started.writerGID)
 	if flags != nil {
@@ -1328,6 +1345,15 @@ func (db *Database) Status() Status {
 		s.Replication = &replicationStatus
 	}
 	db.inner.replicationMu.Unlock()
+	if s.Recovery != nil && db.inner.recovery != nil {
+		// The open-time restore summary is stored; the background
+		// build status is live. Copy before attaching.
+		cp := *s.Recovery
+		if build := db.inner.recovery.Status(); !build.Started.IsZero() {
+			cp.LastBuild = &build
+		}
+		s.Recovery = &cp
+	}
 	return s
 }
 

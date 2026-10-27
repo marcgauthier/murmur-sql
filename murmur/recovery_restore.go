@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"sync/atomic"
 	"time"
 
 	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
@@ -47,17 +48,42 @@ func (o RecoveryOutcome) String() string {
 // RecoveryRestoreOutcome details one fast-or-legacy restore.
 type RecoveryRestoreOutcome struct {
 	Outcome     RecoveryOutcome
+	Reason      string // cache miss reason; set on legacy-fallback
 	Generation  uint64
 	ChangedRows uint64
 	TotalRows   uint64
+	// CacheBytes, CaptureCursor and CacheCreatedUnixNano describe the
+	// generation used on a cache hit; zero otherwise.
+	CacheBytes           uint64
+	CaptureCursor        uint64
+	CacheCreatedUnixNano uint64
 }
 
 // RecoveryStatus is the Status-surface restore summary.
 type RecoveryStatus struct {
 	Outcome     string
+	Reason      string
 	Generation  uint64
 	ChangedRows uint64
 	TotalRows   uint64
+	// CacheBytes and CaptureCursor describe the generation used on a
+	// cache hit. CacheAgeSeconds is the generation's age at open.
+	CacheBytes      uint64
+	CaptureCursor   uint64
+	CacheAgeSeconds float64
+	// LastBuild is the latest background build status, refreshed on
+	// every Status call. Nil when the scheduler never ran.
+	LastBuild *RecoveryBuildStatus
+}
+
+// recoveryFallbackTotal counts cache misses that routed to legacy
+// recovery in this process.
+var recoveryFallbackTotal atomic.Uint64
+
+// RecoveryFallbackTotal reports how many opens fell back to legacy
+// recovery because the cache was missing or unusable.
+func RecoveryFallbackTotal() uint64 {
+	return recoveryFallbackTotal.Load()
 }
 
 // recoveryStaleThreshold is the changed-row ratio above which a
@@ -103,7 +129,8 @@ func RecoverFastOrLegacy(opened *Opened, cfg *RecoveryOptions, recoveryDir strin
 		return nil, RecoveryRestoreOutcome{Outcome: RecoveryFailed}, err
 	}
 	conn, legacyErr := RecoverCurrent(opened, progress)
-	return conn, RecoveryRestoreOutcome{Outcome: RecoveryLegacyFallback}, legacyErr
+	recoveryFallbackTotal.Add(1)
+	return conn, RecoveryRestoreOutcome{Outcome: RecoveryLegacyFallback, Reason: fastErr.Error()}, legacyErr
 }
 
 // recoverFast validates the best cache generation, reconciles it
@@ -143,11 +170,22 @@ func recoverFast(opened *Opened, opts RecoveryOptions, recoveryDir string, progr
 		return nil, zero, err // already *fastRestoreError from the loader
 	}
 	return conn, RecoveryRestoreOutcome{
-		Outcome:     RecoveryCacheHit,
-		Generation:  gen.Manifest.GenerationID,
-		ChangedRows: uint64(len(overlay)),
-		TotalRows:   totalRows,
+		Outcome:              RecoveryCacheHit,
+		Generation:           gen.Manifest.GenerationID,
+		ChangedRows:          uint64(len(overlay)),
+		TotalRows:            totalRows,
+		CacheBytes:           manifestBytes(gen.Manifest),
+		CaptureCursor:        gen.Manifest.CaptureCursor,
+		CacheCreatedUnixNano: gen.Manifest.CreatedUnixNano,
 	}, nil
+}
+
+func manifestBytes(m *recovery.Manifest) uint64 {
+	var total uint64
+	for i := range m.Files {
+		total += m.Files[i].Size
+	}
+	return total
 }
 
 func indexRowCount(m *recovery.Manifest) uint64 {

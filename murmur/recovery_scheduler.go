@@ -2,9 +2,13 @@ package murmur
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/marcgauthier/murmur-sql/murmur/recovery"
 	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
@@ -22,9 +26,11 @@ type RecoveryBuildStatus struct {
 }
 
 // recoveryScheduler runs single-flight background recovery builds:
-// one worker checkpoint request plus off-thread conversion. Disk
-// headroom and CPU throttling are PR5 hardening; every build failure
-// already fails closed (no cache, legacy path unaffected).
+// one worker checkpoint request plus off-thread conversion. Builds
+// are bounded by MaxBuildMemory (spilling to encrypted temp runs)
+// and throttled by BuildInterval; every build failure fails closed
+// (recorded in status, legacy path unaffected), including out-of-disk
+// and unwritable-directory failures mid-build.
 type recoveryScheduler struct {
 	opts             RecoveryOptions
 	worker           chan<- Work
@@ -41,6 +47,29 @@ type recoveryScheduler struct {
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
+}
+
+// cleanupStaleBuildDirs removes unpublished .building-* staging
+// directories left by crashed builds. Published generations,
+// CURRENT, and anything else are never touched. Best effort:
+// errors are ignored because a leftover staging dir only wastes
+// disk, and the next build uses a fresh random name.
+func cleanupStaleBuildDirs(recoveryDir string) {
+	entries, err := os.ReadDir(recoveryDir)
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		if !e.IsDir() || !strings.HasPrefix(name, recovery.BuildingPrefix) {
+			continue
+		}
+		// Refuse symlinks and anything outside the recovery dir.
+		if e.Type()&os.ModeSymlink != 0 {
+			continue
+		}
+		_ = os.RemoveAll(filepath.Join(recoveryDir, name))
+	}
 }
 
 func newRecoveryScheduler(opts RecoveryOptions, worker chan<- Work, store *spool.Store, recoveryDir string, compressionLevel int) *recoveryScheduler {
