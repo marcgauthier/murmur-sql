@@ -37,6 +37,19 @@ engine:
     remote_share: 10
     max_debt: "1s"
     maintenance_reserve_every: 100
+  # Optional disposable recovery cache: sorted, compressed row runs
+  # rebuilt from Spool in the background to accelerate restarts.
+  # Disabled by default. Enabling never changes the authoritative
+  # storage format; deleting <data_dir>/recovery is always safe
+  # (the next open falls back to legacy recovery and rebuilds).
+  recovery:
+    enabled: false
+    auto_build: true
+    build_interval: "1h"
+    target_run_bytes: "256MiB"
+    target_block_bytes: "256KiB"
+    max_build_memory: "256MiB"
+    retain_generations: 2
 
 # Users allowed to open Postgres-wire sessions. Passwords are Argon2 hashes,
 # never plaintext; generate one with `murmur-admin hash-password`.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"sort"
@@ -754,4 +755,122 @@ func TestRecoveryRowFromRecord(t *testing.T) {
 	if _, err := recoveryRowFromRecord(goodKey, []byte("garbage"), 99, tables); err == nil {
 		t.Fatal("bad payload accepted")
 	}
+}
+
+// commitLatency runs n single-row commit transactions and returns
+// each commit's latency in milliseconds.
+func commitLatency(b *testing.B, db *Database, rng *rand.Rand, docs, n int) []float64 {
+	b.Helper()
+	out := make([]float64, 0, n)
+	for i := 0; i < n; i++ {
+		id := recoveryDocID(rng.Intn(max(docs, 1)))
+		start := time.Now()
+		if _, err := db.Transaction(func(sql *Sql) (any, error) {
+			_, err := sql.Execute("UPDATE docs SET score = ? WHERE id = ?", rng.Int63(), id)
+			return nil, err
+		}); err != nil {
+			b.Fatalf("commit: %v", err)
+		}
+		out = append(out, float64(time.Since(start).Microseconds())/1000)
+	}
+	return out
+}
+
+func latencyPercentile(sorted []float64, p float64) float64 {
+	if len(sorted) == 0 {
+		return 0
+	}
+	idx := int(p * float64(len(sorted)-1))
+	return sorted[idx]
+}
+
+func reportLatency(b *testing.B, prefix string, lat []float64, elapsed time.Duration) {
+	b.Helper()
+	sort.Float64s(lat)
+	b.ReportMetric(float64(len(lat))/elapsed.Seconds(), prefix+"_ops")
+	b.ReportMetric(latencyPercentile(lat, 0.50), prefix+"_p50_ms")
+	b.ReportMetric(latencyPercentile(lat, 0.95), prefix+"_p95_ms")
+	b.ReportMetric(latencyPercentile(lat, 0.99), prefix+"_p99_ms")
+}
+
+// BenchmarkRecoveryBuildUnderWrites compares single-commit ingestion
+// latency with the builder idle vs running on a 100k-row store, then
+// verifies the post-build reopen still hits the cache.
+func BenchmarkRecoveryBuildUnderWrites(b *testing.B) {
+	benchmarkBuildUnderWrites(b, 3)
+}
+
+// BenchmarkRecoveryBuildUnderWritesZstd1 is the same workload with
+// the recovery codec at zstd level 1, to quantify codec CPU in the
+// ingestion interference.
+func BenchmarkRecoveryBuildUnderWritesZstd1(b *testing.B) {
+	benchmarkBuildUnderWrites(b, 1)
+}
+
+func benchmarkBuildUnderWrites(b *testing.B, compressionLevel int) {
+	spec := recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}
+	dir := b.TempDir()
+	path := filepath.Join(dir, "db")
+	db := openRecoveryDB(b, path, OpenCreateNew)
+	buildRecoveryFixture(b, db, spec)
+	if err := db.Close(); err != nil {
+		b.Fatalf("close: %v", err)
+	}
+	options := recoveryTestOptions()
+	options.CompressionLevel = compressionLevel
+	options.Recovery.AutoBuild = false
+	options.Recovery.BuildInterval = 0
+	db2, err := Open(path, testKey(), options)
+	if err != nil {
+		b.Fatalf("open: %v", err)
+	}
+	rng := newFixtureRNG()
+	start := time.Now()
+	base := commitLatency(b, db2, rng, spec.Docs, 1000)
+	baseElapsed := time.Since(start)
+	if err := db2.Flush(); err != nil {
+		b.Fatalf("flush: %v", err)
+	}
+	db2.inner.recovery.Trigger()
+	var during []float64
+	start = time.Now()
+	for i := 0; db2.inner.recovery.Status().Running || i < 500; i++ {
+		id := recoveryDocID(rng.Intn(max(spec.Docs, 1)))
+		op := time.Now()
+		if _, err := db2.Transaction(func(sql *Sql) (any, error) {
+			_, err := sql.Execute("UPDATE docs SET score = ? WHERE id = ?", rng.Int63(), id)
+			return nil, err
+		}); err != nil {
+			b.Fatalf("commit during build: %v", err)
+		}
+		during = append(during, float64(time.Since(op).Microseconds())/1000)
+	}
+	duringElapsed := time.Since(start)
+	st := waitRecoveryBuild(b, db2, 600*time.Second)
+	if st.Err != "" {
+		b.Fatalf("build: %s", st.Err)
+	}
+	if err := db2.Flush(); err != nil {
+		b.Fatalf("flush: %v", err)
+	}
+	wantCounts, wantSpots := probeRecoveryState(b, db2)
+	if err := db2.Close(); err != nil {
+		b.Fatalf("close: %v", err)
+	}
+	reportLatency(b, "base", base, baseElapsed)
+	reportLatency(b, "during", during, duringElapsed)
+	b.ReportMetric(st.Seconds, "build_s")
+	b.ReportMetric(float64(len(during)), "during_commits")
+	// The overlapping writes must reconcile through the overlay.
+	db3, err := Open(path, testKey(), options)
+	if err != nil {
+		b.Fatalf("reopen: %v", err)
+	}
+	defer db3.Close()
+	rst := db3.Status()
+	if rst.Recovery == nil || rst.Recovery.Outcome != "cache-hit" {
+		b.Fatalf("outcome = %+v, want cache-hit", rst.Recovery)
+	}
+	b.ReportMetric(float64(rst.Recovery.ChangedRows), "changed")
+	verifyRecoveryProbe(b, db3, wantCounts, wantSpots)
 }

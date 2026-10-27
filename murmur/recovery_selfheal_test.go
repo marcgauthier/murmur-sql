@@ -1,14 +1,19 @@
 package murmur
 
 import (
+	"bytes"
+	"crypto/sha256"
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/marcgauthier/murmur-sql/murmur/internal/sqlite"
 	"github.com/marcgauthier/murmur-sql/murmur/recovery"
+	"github.com/marcgauthier/murmur-sql/murmur/spool"
 )
 
 // waitBuildAny waits for the current/last build to finish and returns
@@ -585,6 +590,316 @@ func TestBackupExcludesRecoveryCache(t *testing.T) {
 		t.Fatalf("outcome = %+v, want cache-hit", rs)
 	}
 	assertSnapshotsEqual(t, snapshotRecoveryState(t, db4), before, "restored rebuilt")
+}
+
+// Replicated rows merge through the cache path: node B builds its
+// cache while syncing, reopens through a hit, and serves rows from
+// both nodes exactly like the legacy path.
+func TestReplicationWithRecoveryCache(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping live replication test in short mode")
+	}
+	dir := t.TempDir()
+	idA, idB := compatNodeID(0xA1), compatNodeID(0xB2)
+	dbID := compatNodeID(0xD4)
+	configs := compatConfigs(t, [][16]byte{idA, idB})
+
+	dbAOptions := DefaultOptions()
+	dbAOptions.Mode = OpenCreateNew
+	dbAOptions.DatabaseID = &dbID
+	dbAOptions.Replication = configs[0]
+	dbA, err := Open(dir+"/a", testKey(), dbAOptions)
+	if err != nil {
+		t.Fatalf("open A: %v", err)
+	}
+	defer dbA.Close()
+
+	dbBOptions := recoveryTestOptions()
+	dbBOptions.Mode = OpenCreateNew
+	dbBOptions.DatabaseID = &dbID
+	dbBOptions.Replication = configs[1]
+	dbBOptions.Recovery.BuildInterval = 0
+	dbB, err := Open(dir+"/b", testKey(), dbBOptions)
+	if err != nil {
+		t.Fatalf("open B: %v", err)
+	}
+	for _, db := range []*Database{dbA, dbB} {
+		if err := db.Migrate(NewMigration(coreTestDDL)); err != nil {
+			t.Fatalf("migrate: %v", err)
+		}
+		if err := db.SetReplication("users", true); err != nil {
+			t.Fatalf("enable replication: %v", err)
+		}
+	}
+	execMust(t, dbA, "INSERT INTO users (id, name, score) VALUES (1, 'ada', 10)")
+	if err := dbA.Flush(); err != nil {
+		t.Fatalf("flush A: %v", err)
+	}
+	dbA.inner.replicationMu.Lock()
+	handleA := dbA.inner.replication
+	dbA.inner.replicationMu.Unlock()
+	dbB.inner.replicationMu.Lock()
+	handleB := dbB.inner.replication
+	dbB.inner.replicationMu.Unlock()
+	if handleA == nil || handleB == nil {
+		t.Fatal("replication handles missing")
+	}
+	addrA, addrB := handleA.Status().Address, handleB.Status().Address
+	if err := handleA.AddPeer(*addrB); err != nil {
+		t.Fatalf("add peer B: %v", err)
+	}
+	if err := handleB.AddPeer(*addrA); err != nil {
+		t.Fatalf("add peer A: %v", err)
+	}
+	deadline := time.Now().Add(60 * time.Second)
+	for compatRowCount(t, dbB, 1) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("row 1 never arrived on B")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	execMust(t, dbB, "INSERT INTO users (id, name, score) VALUES (2, 'grace', 20)")
+	if err := dbB.Flush(); err != nil {
+		t.Fatalf("flush B: %v", err)
+	}
+	deadline = time.Now().Add(60 * time.Second)
+	for compatRowCount(t, dbA, 2) == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("row 2 never arrived on A")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// B's open auto-triggered a build of the pre-migration schema;
+	// rebuild after sync so the cache captures migrated + synced rows.
+	if st := waitRecoveryBuild(t, dbB, 60*time.Second); st.Err != "" {
+		t.Fatalf("build on B: %s", st.Err)
+	}
+	dbB.inner.recovery.Trigger()
+	if st := waitRecoveryBuild(t, dbB, 60*time.Second); st.Err != "" {
+		t.Fatalf("rebuild on B: %s", st.Err)
+	}
+	if err := dbB.Close(); err != nil {
+		t.Fatalf("close B: %v", err)
+	}
+	reopenOptions := recoveryTestOptions()
+	reopenOptions.DatabaseID = &dbID
+	reopenOptions.Replication = configs[1]
+	dbB2, err := Open(dir+"/b", testKey(), reopenOptions)
+	if err != nil {
+		t.Fatalf("reopen B: %v", err)
+	}
+	defer dbB2.Close()
+	if rs := recoveryStatus(t, dbB2); rs.Outcome != "cache-hit" {
+		t.Fatalf("outcome = %+v, want cache-hit", rs)
+	}
+	if n := compatRowCount(t, dbB2, 1); n != 1 {
+		t.Fatalf("row 1 count = %d, want 1", n)
+	}
+	if n := compatRowCount(t, dbB2, 2); n != 1 {
+		t.Fatalf("row 2 count = %d, want 1", n)
+	}
+}
+
+// Local-only tables ride the cache path like replicated ones.
+func TestFastRestoreLocalOnlyTable(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	db := openRecoveryDB(t, path, OpenCreateNew)
+	buildRecoveryFixture(t, db, recoveryFixtureSpec{Docs: 50, Events: 50, Pairs: 20})
+	if err := db.SetReplication("pairs", false); err != nil {
+		t.Fatalf("set local-only: %v", err)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	before := snapshotRecoveryState(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db2, err := Open(path, testKey(), recoveryTestOptions())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if st := waitRecoveryBuild(t, db2, 60*time.Second); st.Err != "" {
+		t.Fatalf("build: %s", st.Err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db3, err := Open(path, testKey(), recoveryTestOptions())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db3.Close()
+	if rs := recoveryStatus(t, db3); rs.Outcome != "cache-hit" {
+		t.Fatalf("outcome = %+v, want cache-hit", rs)
+	}
+	assertSnapshotsEqual(t, snapshotRecoveryState(t, db3), before, "local-only")
+}
+
+// With an encrypted store, no database value appears in plaintext
+// anywhere under recovery/.
+func TestRecoveryCacheHasNoPlaintext(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	db := openRecoveryDB(t, path, OpenCreateNew)
+	buildRecoveryFixture(t, db, recoveryFixtureSpec{Docs: 30, Events: 30, Pairs: 10})
+	marker := "SECRET-MARKER-9f8e7d6c5b4a"
+	if _, err := db.Transaction(func(sql *Sql) (any, error) {
+		_, err := sql.Execute("INSERT INTO docs (id, title, score) VALUES (?, ?, ?)",
+			recoveryDocID(777000), marker, 1)
+		return nil, err
+	}); err != nil {
+		t.Fatalf("insert marker: %v", err)
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db2, err := Open(path, testKey(), recoveryTestOptions())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if st := waitRecoveryBuild(t, db2, 60*time.Second); st.Err != "" {
+		t.Fatalf("build: %s", st.Err)
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	recoveryDir := filepath.Join(path, "recovery")
+	var files []string
+	err = filepath.WalkDir(recoveryDir, func(p string, e os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !e.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("no cache files to scan")
+	}
+	for _, f := range files {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		if bytes.Contains(raw, []byte(marker)) {
+			t.Fatalf("plaintext marker in %s", f)
+		}
+	}
+}
+
+// A spool fault during checkpoint capture fails the build (recorded
+// in status) without harming the database; clearing the fault lets
+// the next build succeed.
+func TestRecoveryBuildCheckpointFault(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	db := openRecoveryDB(t, path, OpenCreateNew)
+	buildRecoveryFixture(t, db, recoveryFixtureSpec{Docs: 50, Events: 50, Pairs: 10})
+	before := snapshotRecoveryState(t, db)
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	faults := &spool.FaultHooks{
+		CheckpointLink: func() error { return errors.New("injected link fault") },
+	}
+	options := recoveryTestOptions()
+	options.Recovery.AutoBuild = false
+	options.Recovery.BuildInterval = 0
+	options.FaultHooks = faults
+	db2, err := Open(path, testKey(), options)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	db2.inner.recovery.Trigger()
+	st := waitBuildAny(t, db2, 60*time.Second)
+	if st.Err == "" || !strings.Contains(st.Err, "injected link fault") {
+		t.Fatalf("build status = %+v, want injected fault", st)
+	}
+	assertSnapshotsEqual(t, snapshotRecoveryState(t, db2), before, "checkpoint fault")
+	faults.CheckpointLink = nil
+	db2.inner.recovery.Trigger()
+	if st := waitRecoveryBuild(t, db2, 60*time.Second); st.Err != "" {
+		t.Fatalf("rebuild after fault: %s", st.Err)
+	}
+	if _, err := os.Stat(filepath.Join(path, "recovery", "CURRENT")); err != nil {
+		t.Fatalf("CURRENT missing after rebuild: %v", err)
+	}
+}
+
+// Foreground ingestion never touches the recovery cache: file bytes
+// are bit-identical across commits.
+func TestRecoveryNoForegroundWrites(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	db := openRecoveryDB(t, path, OpenCreateNew)
+	buildRecoveryFixture(t, db, recoveryFixtureSpec{Docs: 50, Events: 50, Pairs: 10})
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	options := recoveryTestOptions()
+	options.Recovery.AutoBuild = false
+	db2, err := Open(path, testKey(), options)
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	db2.inner.recovery.Trigger()
+	if st := waitRecoveryBuild(t, db2, 60*time.Second); st.Err != "" {
+		t.Fatalf("build: %s", st.Err)
+	}
+	recoveryDir := filepath.Join(path, "recovery")
+	hashDir := func() map[string][32]byte {
+		out := map[string][32]byte{}
+		err := filepath.WalkDir(recoveryDir, func(p string, e os.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if e.IsDir() {
+				return nil
+			}
+			raw, err := os.ReadFile(p)
+			if err != nil {
+				return err
+			}
+			rel, _ := filepath.Rel(recoveryDir, p)
+			out[rel] = sha256.Sum256(raw)
+			return nil
+		})
+		if err != nil {
+			t.Fatalf("walk: %v", err)
+		}
+		return out
+	}
+	before := hashDir()
+	rng := newFixtureRNG()
+	for i := 0; i < 100; i++ {
+		id := recoveryDocID(rng.Intn(50))
+		if _, err := db2.Transaction(func(sql *Sql) (any, error) {
+			_, err := sql.Execute("UPDATE docs SET score = ? WHERE id = ?", rng.Int63(), id)
+			return nil, err
+		}); err != nil {
+			t.Fatalf("commit: %v", err)
+		}
+	}
+	if err := db2.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	after := hashDir()
+	if !reflect.DeepEqual(before, after) {
+		t.Fatal("recovery cache changed during foreground ingestion")
+	}
+	if err := db2.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
 }
 
 // Status surfaces the restore outcome plus cache size, capture

@@ -543,7 +543,7 @@ func buildRecoveryFixtureRowsOnly(t *testing.T, db *Database, spec recoveryFixtu
 	}
 }
 
-func benchmarkCacheOpen(b *testing.B, spec recoveryFixtureSpec, stale bool) {
+func benchmarkCacheOpen(b *testing.B, spec recoveryFixtureSpec, stalePct int) {
 	dir := b.TempDir()
 	path := filepath.Join(dir, "db")
 	db := openRecoveryDB(b, path, OpenCreateNew)
@@ -562,12 +562,12 @@ func benchmarkCacheOpen(b *testing.B, spec recoveryFixtureSpec, stale bool) {
 	if err := db2.Close(); err != nil {
 		b.Fatalf("close: %v", err)
 	}
-	if stale {
+	if stalePct > 0 {
 		dbm, err := Open(path, testKey(), DefaultOptions())
 		if err != nil {
 			b.Fatalf("open: %v", err)
 		}
-		applyCacheStaleWrites(b, dbm, spec)
+		applyCacheStaleWrites(b, dbm, spec, stalePct)
 		if err := dbm.Close(); err != nil {
 			b.Fatalf("close: %v", err)
 		}
@@ -582,13 +582,19 @@ func benchmarkCacheOpen(b *testing.B, spec recoveryFixtureSpec, stale bool) {
 		b.Fatalf("close: %v", err)
 	}
 	b.ResetTimer()
+	// Timed opens never auto-rebuild: a stale-enough hit would
+	// otherwise trigger a background build and Close would wait for
+	// it, polluting the reopen timing and de-staling later iters.
+	timed := recoveryTestOptions()
+	timed.Recovery.AutoBuild = false
+	cacheBytes := dirSizeBytes(b, filepath.Join(path, "recovery"))
 	var stages OpenStageTimings
 	var wall time.Duration
 	var changed uint64
 	var heapAlloc, heapSys uint64
 	for i := 0; i < b.N; i++ {
 		start := time.Now()
-		rdb, err := Open(path, testKey(), recoveryTestOptions())
+		rdb, err := Open(path, testKey(), timed)
 		wall = time.Since(start)
 		if err != nil {
 			b.Fatalf("reopen: %v", err)
@@ -621,14 +627,29 @@ func benchmarkCacheOpen(b *testing.B, spec recoveryFixtureSpec, stale bool) {
 	b.ReportMetric(float64(stages.SearchInit.Milliseconds()), "search_ms")
 	b.ReportMetric(float64(heapAlloc)/(1<<20), "heap_mb")
 	b.ReportMetric(float64(heapSys)/(1<<20), "sys_mb")
+	b.ReportMetric(float64(cacheBytes)/(1<<20), "cache_mb")
 }
 
-// applyCacheStaleWrites applies ~1% updates, ~1% inserts, ~1% deletes.
-func applyCacheStaleWrites(tb testing.TB, db *Database, spec recoveryFixtureSpec) {
+// applyCacheStaleWrites mutates docs rows after the cache build:
+// pct% each of updates, inserts and deletes, except pct >= 100
+// which updates every row (worst-case full overlay).
+func applyCacheStaleWrites(tb testing.TB, db *Database, spec recoveryFixtureSpec, pct int) {
 	tb.Helper()
-	pct := func(n int) int { return max(n/100, 1) }
-	updates, inserts, deletes := pct(spec.Docs), pct(spec.Docs), pct(spec.Docs)
 	rng := newFixtureRNG()
+	if pct >= 100 {
+		if _, err := db.Transaction(func(sql *Sql) (any, error) {
+			_, err := sql.Execute("UPDATE docs SET score = score + 1")
+			return nil, err
+		}); err != nil {
+			tb.Fatalf("stale writes: %v", err)
+		}
+		if err := db.Flush(); err != nil {
+			tb.Fatalf("flush: %v", err)
+		}
+		return
+	}
+	n := max(spec.Docs*pct/100, 1)
+	updates, inserts, deletes := n, n, n
 	if _, err := db.Transaction(func(sql *Sql) (any, error) {
 		for i := 0; i < updates; i++ {
 			id := recoveryDocID(rng.Intn(max(spec.Docs, 1)))
@@ -659,17 +680,25 @@ func applyCacheStaleWrites(tb testing.TB, db *Database, spec recoveryFixtureSpec
 }
 
 func BenchmarkRecoveryCacheExact_100k(b *testing.B) {
-	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}, false)
+	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}, 0)
 }
 
 func BenchmarkRecoveryCacheStale_100k(b *testing.B) {
-	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}, true)
+	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}, 1)
+}
+
+func BenchmarkRecoveryCacheStale10_100k(b *testing.B) {
+	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}, 10)
+}
+
+func BenchmarkRecoveryCacheStale100_100k(b *testing.B) {
+	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 60000, Events: 30000, Pairs: 10000}, 100)
 }
 
 func BenchmarkRecoveryCacheExact_1M(b *testing.B) {
-	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 600000, Events: 300000, Pairs: 100000}, false)
+	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 600000, Events: 300000, Pairs: 100000}, 0)
 }
 
 func BenchmarkRecoveryCacheStale_1M(b *testing.B) {
-	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 600000, Events: 300000, Pairs: 100000}, true)
+	benchmarkCacheOpen(b, recoveryFixtureSpec{Docs: 600000, Events: 300000, Pairs: 100000}, 1)
 }

@@ -126,6 +126,19 @@ func BuildOptions(c config.Config, mode murmur.OpenMode) (murmur.Options, error)
 	o.Scheduler.RemoteShare = e.Scheduler.RemoteShare
 	o.Scheduler.MaxDebt = time.Duration(e.Scheduler.MaxDebt)
 	o.Scheduler.MaintenanceReserveEvery = e.Scheduler.MaintenanceReserveEvery
+	re := e.Recovery
+	ro := murmur.DefaultRecoveryOptions()
+	ro.Enabled = re.Enabled
+	ro.AutoBuild = re.AutoBuild
+	ro.BuildInterval = time.Duration(re.BuildInterval)
+	ro.TargetRunBytes = int64(re.TargetRunBytes)
+	ro.MaxBuildMemory = int64(re.MaxBuildMemory)
+	ro.TargetBlockBytes, err = integer(uint64(re.TargetBlockBytes))
+	if err != nil {
+		return o, err
+	}
+	ro.RetainGenerations = re.RetainGenerations
+	o.Recovery = &ro
 	if e.DataKeyMaxAge != nil {
 		v := time.Duration(*e.DataKeyMaxAge)
 		o.DataKeyMaxAge = &v

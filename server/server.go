@@ -18,7 +18,7 @@ import (
 	"github.com/marcgauthier/murmur-sql/engine"
 )
 
-const Version = "1.0.0-go"
+const Version = "1.1.0-go"
 const PGVersion = "16.6-murmur-" + Version
 
 type Server struct {
