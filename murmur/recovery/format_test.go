@@ -442,7 +442,7 @@ func collectIndex(t *testing.T, s *IndexStream) []*IndexEntry {
 func TestSorterMemoryAndSpill(t *testing.T) {
 	c := testCipher(t)
 	for _, maxBytes := range []int64{1 << 30, 2048} {
-		s, err := NewSorter(ByteOrder, maxBytes, t.TempDir(), c, compression.MustZstd(3),
+		s, err := NewSorter("test", ByteOrder, maxBytes, t.TempDir(), c, compression.MustZstd(3),
 			testDBID(), 1, testDigest())
 		if err != nil {
 			t.Fatalf("sorter: %v", err)
@@ -492,7 +492,7 @@ func TestSorterMemoryAndSpill(t *testing.T) {
 func TestSorterSpillsAreEncrypted(t *testing.T) {
 	c := testCipher(t)
 	dir := t.TempDir()
-	s, err := NewSorter(ByteOrder, 1024, dir, c, compression.MustZstd(3),
+	s, err := NewSorter("test", ByteOrder, 1024, dir, c, compression.MustZstd(3),
 		testDBID(), 1, testDigest())
 	if err != nil {
 		t.Fatalf("sorter: %v", err)
@@ -1086,6 +1086,68 @@ func TestFilePermissions(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatalf("walk: %v", err)
+	}
+}
+
+func TestNextGenerationID(t *testing.T) {
+	dir := t.TempDir()
+	if id, err := NextGenerationID(filepath.Join(dir, "missing")); err != nil || id != 1 {
+		t.Fatalf("missing dir = (%d, %v)", id, err)
+	}
+	if id, err := NextGenerationID(dir); err != nil || id != 1 {
+		t.Fatalf("empty dir = (%d, %v)", id, err)
+	}
+	for _, name := range []string{"generation-00000001", "generation-00000007", "CURRENT", ".building-x"} {
+		if name == "CURRENT" {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if err := os.Mkdir(filepath.Join(dir, name), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if id, err := NextGenerationID(dir); err != nil || id != 8 {
+		t.Fatalf("populated dir = (%d, %v)", id, err)
+	}
+}
+
+func TestBlockRecordBound(t *testing.T) {
+	c := testCipher(t)
+	var buf bytes.Buffer
+	aad := func(block uint32) []byte {
+		return BlockAAD(testDBID(), 1, testDigest(), "test", block)
+	}
+	w := newBlockWriter(&buf, c, compression.None, "test", aad, MaxBlockPlain)
+	if err := w.Add([]byte("k"), make([]byte, MaxBlockPlain+1)); err == nil {
+		t.Fatal("oversized record accepted")
+	}
+	// Two over-half-max records split across blocks, both readable.
+	rec := make([]byte, MaxBlockPlain/2+16)
+	if err := w.Add([]byte("a"), rec); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := w.Add([]byte("b"), rec); err != nil {
+		t.Fatalf("add: %v", err)
+	}
+	if err := w.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	r := newBlockReader(&buf, c, compression.None, "test", aad, MaxBlockPlain)
+	blocks := 0
+	for {
+		_, _, _, _, err := r.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("next: %v", err)
+		}
+		blocks++
+	}
+	if blocks != 2 {
+		t.Fatalf("blocks = %d, want 2", blocks)
 	}
 }
 

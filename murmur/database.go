@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
@@ -485,6 +486,7 @@ type Inner struct {
 	identity      Identity
 	subMgr        *SubManager
 	scheduler     *WriterScheduler
+	recovery      *recoveryScheduler
 	active        atomic.Bool
 	writerGID     atomic.Int64
 }
@@ -707,6 +709,12 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		threadDone: threadDone, status: status,
 		identity: started.identity, subMgr: started.subMgr,
 	}}
+	if options.Recovery.IsEnabled() {
+		normalized := options.Recovery.WithDefaults()
+		normalized.Enabled = true
+		database.inner.recovery = newRecoveryScheduler(normalized, started.worker,
+			started.store, filepath.Join(path, "recovery"), options.CompressionLevel)
+	}
 	database.inner.writerGID.Store(started.writerGID)
 	if flags != nil {
 		if len(flags) > 0 {
@@ -732,6 +740,11 @@ func openInner(path string, cred Credential, options Options, flags map[string]b
 		database.inner.replicationMu.Lock()
 		database.inner.replication = handle
 		database.inner.replicationMu.Unlock()
+	}
+	// The database is available from here; queue the first recovery
+	// build without waiting for it.
+	if database.inner.recovery != nil && options.Recovery.AutoBuild {
+		database.inner.recovery.Trigger()
 	}
 	return database, nil
 }
@@ -1401,6 +1414,11 @@ func (db *Database) Close() error {
 		return nil
 	}
 	db.inner.status.Mu.Unlock()
+	// Stop the recovery builder first: it may hold a checkpoint the
+	// storage worker shutdown below would strand.
+	if db.inner.recovery != nil {
+		db.inner.recovery.Stop()
+	}
 	db.inner.subMgr.Close()
 	db.inner.scheduler.Close()
 	db.inner.replicationMu.Lock()

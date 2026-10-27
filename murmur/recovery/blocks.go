@@ -38,10 +38,19 @@ func newBlockWriter(dst io.Writer, cipher *Cipher, codec compression.Codec, file
 }
 
 // Add buffers one record, flushing a full block when the plaintext
-// target is reached.
+// target is reached. Blocks never exceed MaxBlockPlain so every
+// written block stays readable; oversized single records fail.
 func (w *blockWriter) Add(key, record []byte) error {
 	if len(record) == 0 {
 		return fmt.Errorf("recovery: empty record for %s", w.file)
+	}
+	if len(record) > MaxBlockPlain {
+		return fmt.Errorf("recovery: record exceeds block bound for %s", w.file)
+	}
+	if len(w.plain) > 0 && len(w.plain)+len(record) > MaxBlockPlain {
+		if err := w.Flush(); err != nil {
+			return err
+		}
 	}
 	w.plain = append(w.plain, record...)
 	if w.rows == 0 {

@@ -360,6 +360,10 @@ const (
 	WorkRotate
 	WorkRotateMasterKey
 	WorkStop
+	// WorkBuildRecovery captures a checkpoint for the background
+	// recovery-cache builder. Appended last so existing values keep
+	// their order.
+	WorkBuildRecovery
 )
 
 // ExportResult carries a worker export reply.
@@ -398,6 +402,9 @@ type Work struct {
 	MasterKey  []byte
 	Passphrase string
 	StopReply  chan<- error
+	// RecoveryBuildReply carries the WorkBuildRecovery checkpoint.
+	// Destination doubles as the recovery directory for that kind.
+	RecoveryBuildReply chan<- RecoveryBuildResult
 }
 
 // Opened is an open storage handle owned by the worker thread.
@@ -1266,6 +1273,12 @@ func StartStorage(opened *Opened, o *Options, status *StatusState) (*spool.Store
 					w.BarrierReply <- storageErr("%s", *failed)
 				} else {
 					w.BarrierReply <- opened.Store.Flush()
+				}
+			case WorkBuildRecovery:
+				if failed != nil {
+					w.RecoveryBuildReply <- RecoveryBuildResult{Err: storageErr("%s", *failed)}
+				} else {
+					w.RecoveryBuildReply <- buildRecoveryCheckpoint(opened, w.Destination)
 				}
 			case WorkExport:
 				if failed != nil {

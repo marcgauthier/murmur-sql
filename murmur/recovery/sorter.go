@@ -18,6 +18,7 @@ import (
 type Sorter struct {
 	less         LessFunc
 	maxBytes     int64
+	tag          string
 	dir          string
 	cipher       *Cipher
 	codec        compression.Codec
@@ -32,9 +33,14 @@ type Sorter struct {
 }
 
 // NewSorter builds a sorter spilling into dir (created if missing).
-func NewSorter(less LessFunc, maxBytes int64, dir string, cipher *Cipher, codec compression.Codec, dbID [16]byte, generation uint64, schemaDigest [32]byte) (*Sorter, error) {
+// Tag names this sorter's spill files; sorters sharing a directory
+// must use distinct tags.
+func NewSorter(tag string, less LessFunc, maxBytes int64, dir string, cipher *Cipher, codec compression.Codec, dbID [16]byte, generation uint64, schemaDigest [32]byte) (*Sorter, error) {
 	if less == nil {
 		return nil, fmt.Errorf("recovery: nil sort comparator")
+	}
+	if !validSorterTag(tag) {
+		return nil, fmt.Errorf("recovery: bad sorter tag %q", tag)
 	}
 	if maxBytes <= 0 {
 		return nil, fmt.Errorf("recovery: bad sorter memory bound %d", maxBytes)
@@ -45,8 +51,21 @@ func NewSorter(less LessFunc, maxBytes int64, dir string, cipher *Cipher, codec 
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("recovery: spill dir: %w", err)
 	}
-	return &Sorter{less: less, maxBytes: maxBytes, dir: dir, cipher: cipher, codec: codec,
+	return &Sorter{tag: tag, less: less, maxBytes: maxBytes, dir: dir, cipher: cipher, codec: codec,
 		dbID: dbID, generation: generation, schemaDigest: schemaDigest}, nil
+}
+
+func validSorterTag(tag string) bool {
+	if tag == "" || len(tag) > 32 {
+		return false
+	}
+	for i := 0; i < len(tag); i++ {
+		c := tag[i]
+		if c != '-' && (c < 'a' || c > 'z') && (c < '0' || c > '9') {
+			return false
+		}
+	}
+	return true
 }
 
 // Add buffers one row (copied). Rows breaching per-field bounds fail
@@ -83,7 +102,7 @@ func (s *Sorter) Buffered() int { return len(s.buf) }
 
 func (s *Sorter) flushSpill() error {
 	sort.Slice(s.buf, func(i, j int) bool { return s.less(s.buf[i], s.buf[j]) })
-	name := fmt.Sprintf(".spill-%05d.tmp", s.seq)
+	name := fmt.Sprintf(".spill-%s-%05d.tmp", s.tag, s.seq)
 	s.seq++
 	path := filepath.Join(s.dir, name)
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)

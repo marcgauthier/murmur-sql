@@ -119,7 +119,7 @@ func NewWriter(cfg WriterConfig) (*Writer, error) {
 	if staging == "" {
 		return nil, fmt.Errorf("recovery: cannot allocate staging dir")
 	}
-	rows, err := NewSorter(cfg.Less, cfg.MaxMemory, staging, cfg.Cipher, cfg.Codec,
+	rows, err := NewSorter("rows", cfg.Less, cfg.MaxMemory, staging, cfg.Cipher, cfg.Codec,
 		cfg.DatabaseID, cfg.GenerationID, cfg.SchemaDigest)
 	if err != nil {
 		_ = os.RemoveAll(staging)
@@ -313,7 +313,7 @@ func (w *Writer) hook(stage PublishStage) error {
 // build drains the row sorter into runs plus the sorted index, writes
 // the manifest, and syncs staging.
 func (w *Writer) build() (*Manifest, error) {
-	indexSorter, err := NewSorter(IndexOrder, w.cfg.MaxMemory, w.staging, w.cfg.Cipher,
+	indexSorter, err := NewSorter("index", IndexOrder, w.cfg.MaxMemory, w.staging, w.cfg.Cipher,
 		w.cfg.Codec, w.cfg.DatabaseID, w.cfg.GenerationID, w.cfg.SchemaDigest)
 	if err != nil {
 		return nil, err

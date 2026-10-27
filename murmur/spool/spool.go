@@ -880,6 +880,50 @@ func (s *Store) currentDataKey() (uint32, [32]byte, bool) {
 	return s.ring.currentKey()
 }
 
+// CurrentRecoveryKey returns the current data-key id plus the
+// purpose-separated recovery-cache key derived from it. The recovery
+// cache encrypts with the derived key (never raw block material) and
+// records the id as its key reference. Data-key rotation leaves
+// retired ids resolvable until pruned; pruning an id referenced by a
+// cache generation invalidates that generation (callers fall back to
+// legacy recovery and rebuild). It fails on unencrypted stores.
+func (s *Store) CurrentRecoveryKey() (uint32, [32]byte, error) {
+	var zero [32]byte
+	if s.closed.Load() {
+		return 0, zero, ErrClosed
+	}
+	if s.ring == nil {
+		return 0, zero, fmt.Errorf("spool: recovery key requires encryption")
+	}
+	id, key, ok := s.ring.currentKey()
+	if !ok {
+		return 0, zero, fmt.Errorf("spool: no current data key: %w", ErrCorrupt)
+	}
+	derived, err := deriveRecoveryKey(key)
+	if err != nil {
+		return 0, zero, err
+	}
+	return id, derived, nil
+}
+
+// RecoveryKey derives the recovery-cache key for a retained data-key
+// id. Unknown (pruned) ids fail so the caller invalidates the cache
+// generation referencing them.
+func (s *Store) RecoveryKey(id uint32) ([32]byte, error) {
+	var zero [32]byte
+	if s.closed.Load() {
+		return zero, ErrClosed
+	}
+	if s.ring == nil {
+		return zero, fmt.Errorf("spool: recovery key requires encryption")
+	}
+	key, ok := s.ring.byID(id)
+	if !ok {
+		return zero, fmt.Errorf("spool: unknown data key %d: %w", id, ErrCorrupt)
+	}
+	return deriveRecoveryKey(key)
+}
+
 // recordFlushErr stashes the latest background flush error.
 func (s *Store) recordFlushErr(err error) {
 	s.flushErrMu.Lock()

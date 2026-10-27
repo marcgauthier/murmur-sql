@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 )
@@ -356,6 +357,32 @@ func ParseGenerationDir(name string) (uint64, bool) {
 // so arbitrary ids stay valid file names.
 func RunFileName(tableID string, seq int) string {
 	return fmt.Sprintf("table-%x-%05d.rrun", tableID, seq)
+}
+
+// NextGenerationID returns one past the highest generation id under
+// dir (1 when none exist). Callers publish with the returned id and
+// retry on collision.
+func NextGenerationID(dir string) (uint64, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 1, nil
+		}
+		return 0, fmt.Errorf("recovery: scan recovery dir: %w", err)
+	}
+	var max uint64
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if id, ok := ParseGenerationDir(e.Name()); ok && id > max {
+			max = id
+		}
+	}
+	if max == ^uint64(0) {
+		return 0, fmt.Errorf("recovery: generation id space exhausted")
+	}
+	return max + 1, nil
 }
 
 // FormatCurrent renders the CURRENT pointer: generation name plus the

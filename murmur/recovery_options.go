@@ -55,12 +55,11 @@ func (r *RecoveryOptions) IsEnabled() bool {
 }
 
 // WithDefaults fills unset numeric fields from DefaultRecoveryOptions,
-// preserving explicitly set values. The receiver is not modified.
+// preserving explicitly set values. BuildInterval is never filled: zero
+// keeps periodic/throttle rebuilds disabled. The receiver is not
+// modified.
 func (r RecoveryOptions) WithDefaults() RecoveryOptions {
 	def := DefaultRecoveryOptions()
-	if r.BuildInterval == 0 {
-		r.BuildInterval = def.BuildInterval
-	}
 	if r.TargetRunBytes == 0 {
 		r.TargetRunBytes = def.TargetRunBytes
 	}
