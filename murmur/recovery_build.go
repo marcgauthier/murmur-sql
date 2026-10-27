@@ -20,6 +20,11 @@ import (
 // Row-record prefix scanned by the recovery builder.
 const recoveryRowPrefix = "04/meta/row/"
 
+// Blob-piece prefix reassembled by the recovery builder. Large logical
+// values split into 11/blob/ pieces at commit time; the checkpoint
+// scan reunites them before caching.
+const recoveryBlobPrefix = "11/blob/"
+
 // recoveryKeyRefPrefix tags recovery key references with their spool
 // data-key id: "spool-key:<id>".
 const recoveryKeyRefPrefix = "spool-key:"
@@ -196,21 +201,53 @@ func runRecoveryBuild(ctx context.Context, res RecoveryBuildResult, store *spool
 	if err != nil {
 		return zero, err
 	}
+	rowPrefix := []byte(recoveryRowPrefix)
+	blobPrefix := []byte(recoveryBlobPrefix)
+	pending := map[string]*pendingBlob{}
+	// orphans holds pieces that arrived before their row descriptor
+	// (Load does not promise key order) or belong to non-row blobs.
+	orphans := map[string][]byte{}
+	finishRow := func(key, value []byte, seq uint64) error {
+		row, err := recoveryRowFromRecord(key, value, seq, tables)
+		if err != nil {
+			return err
+		}
+		return w.Add(row)
+	}
 	collect := func(records []spool.Record) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		for i := range records {
 			rec := &records[i]
-			if rec.Deleted || !strings.HasPrefix(string(rec.Key), recoveryRowPrefix) {
+			if rec.Deleted {
 				continue
 			}
-			row, err := recoveryRowFromRecord(rec.Key, rec.Value, rec.Sequence, tables)
-			if err != nil {
-				return err
-			}
-			if err := w.Add(row); err != nil {
-				return err
+			switch {
+			case bytes.HasPrefix(rec.Key, blobPrefix):
+				key, value, seq, done, err := stashBlobPiece(pending, orphans, rec.Key, rec.Value)
+				if err != nil {
+					return err
+				}
+				if done {
+					if err := finishRow(key, value, seq); err != nil {
+						return err
+					}
+				}
+			case bytes.HasPrefix(rec.Key, rowPrefix):
+				resolved, split, desc, err := resolveRowValue(rec.Value)
+				if err != nil {
+					return err
+				}
+				if !split {
+					if err := finishRow(rec.Key, resolved, rec.Sequence); err != nil {
+						return err
+					}
+					continue
+				}
+				if err := stashBlobDescriptor(pending, rec.Key, rec.Sequence, desc); err != nil {
+					return err
+				}
 			}
 		}
 		return nil
@@ -226,6 +263,24 @@ func runRecoveryBuild(ctx context.Context, res RecoveryBuildResult, store *spool
 	if err := spool.LoadWithOptions(loadOpts, collect); err != nil {
 		_ = w.Abort()
 		return zero, err
+	}
+	// Adopt pieces that arrived before their descriptors.
+	for key, piece := range orphans {
+		rkey, rvalue, rseq, done, err := stashBlobPiece(pending, nil, []byte(key), piece)
+		if err != nil {
+			_ = w.Abort()
+			return zero, err
+		}
+		if done {
+			if err := finishRow(rkey, rvalue, rseq); err != nil {
+				_ = w.Abort()
+				return zero, err
+			}
+		}
+	}
+	if len(pending) > 0 {
+		_ = w.Abort()
+		return zero, fmt.Errorf("murmur: incomplete blob reassembly (%d rows)", len(pending))
 	}
 	m, err := w.Finish()
 	if err != nil {
@@ -300,4 +355,95 @@ func recoveryRowFromRecord(key, value []byte, seq uint64, tables map[string]*Tab
 		return zero, fmt.Errorf("murmur: metadata key collision")
 	}
 	return recovery.Row{Table: table, Sort: meta.Key, Key: key, Seq: seq, Data: value}, nil
+}
+
+// resolveRowValue maps a checkpoint row value to its cache payload:
+// raw values pass through, inline descriptors unwrap, and split
+// values report split=true with their descriptor for reassembly.
+func resolveRowValue(value []byte) (resolved []byte, split bool, desc *blobDescriptor, err error) {
+	desc, err = splitDescriptor(value)
+	if err != nil {
+		return nil, false, nil, err
+	}
+	if desc == nil {
+		return value, false, nil, nil
+	}
+	if desc.inline {
+		return desc.value, false, nil, nil
+	}
+	return nil, true, desc, nil
+}
+
+// pendingBlob accumulates one split row value during the checkpoint
+// scan. Piece keys sort contiguously per row, so at most one row's
+// pieces are ever buffered.
+type pendingBlob struct {
+	key    []byte
+	seq    uint64
+	desc   blobDescriptor
+	pieces [][]byte
+	filled int
+}
+
+func stashBlobDescriptor(pending map[string]*pendingBlob, key []byte, seq uint64, desc *blobDescriptor) error {
+	if desc.count != (desc.bytes+blobPiece-1)/blobPiece || desc.bytes > blobMax || desc.bytes <= 0 {
+		return fmt.Errorf("murmur: blob descriptor bounds")
+	}
+	id := hashHex(key)
+	if _, dup := pending[id]; dup {
+		return fmt.Errorf("murmur: duplicate blob descriptor")
+	}
+	pending[id] = &pendingBlob{key: append([]byte(nil), key...), seq: seq,
+		desc: *desc, pieces: make([][]byte, desc.count)}
+	return nil
+}
+
+// stashBlobPiece files one piece; when its row completes it returns
+// the reassembled value with done=true. Pieces whose descriptor is
+// not yet known are parked in orphans (nil drops them); digest
+// mismatches (stale pieces) are always ignored.
+func stashBlobPiece(pending map[string]*pendingBlob, orphans map[string][]byte, pieceKey, piece []byte) (key, value []byte, seq uint64, done bool, err error) {
+	rest, ok := strings.CutPrefix(string(pieceKey), recoveryBlobPrefix)
+	if !ok {
+		return nil, nil, 0, false, nil
+	}
+	parts := strings.Split(rest, "/")
+	if len(parts) != 3 {
+		return nil, nil, 0, false, nil
+	}
+	pend, ok := pending[parts[0]]
+	if !ok {
+		if orphans != nil {
+			orphans[string(pieceKey)] = append([]byte(nil), piece...)
+		}
+		return nil, nil, 0, false, nil
+	}
+	if parts[1] != hexEncode(pend.desc.digest[:]) {
+		return nil, nil, 0, false, nil
+	}
+	index, aerr := strconv.Atoi(parts[2])
+	if aerr != nil || index < 0 || index >= pend.desc.count || pend.pieces[index] != nil {
+		return nil, nil, 0, false, fmt.Errorf("murmur: bad blob piece")
+	}
+	pend.pieces[index] = append([]byte(nil), piece...)
+	pend.filled++
+	if pend.filled < pend.desc.count {
+		return nil, nil, 0, false, nil
+	}
+	out := make([]byte, 0, pend.desc.bytes)
+	for i := 0; i < pend.desc.count; i++ {
+		want := blobPiece
+		if rest := pend.desc.bytes - i*blobPiece; rest < want {
+			want = rest
+		}
+		if len(pend.pieces[i]) != want {
+			return nil, nil, 0, false, fmt.Errorf("murmur: blob piece length")
+		}
+		out = append(out, pend.pieces[i]...)
+	}
+	if hash(out) != pend.desc.digest {
+		return nil, nil, 0, false, fmt.Errorf("murmur: blob digest")
+	}
+	delete(pending, parts[0])
+	return pend.key, out, pend.seq, true, nil
 }

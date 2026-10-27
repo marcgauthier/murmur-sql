@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/marcgauthier/murmur-sql/murmur/internal/postcard"
 	"github.com/marcgauthier/murmur-sql/murmur/recovery"
 )
 
@@ -540,6 +541,184 @@ func TestRecoveryKeyRef(t *testing.T) {
 		if !tc.ok && err == nil {
 			t.Fatalf("parse %q accepted", tc.ref)
 		}
+	}
+}
+
+func TestResolveRowValue(t *testing.T) {
+	raw := []byte("raw-rowmeta")
+	got, split, _, err := resolveRowValue(raw)
+	if err != nil || split || !bytes.Equal(got, raw) {
+		t.Fatalf("raw = (%q, %v, %v)", got, split, err)
+	}
+	inline := append(append([]byte(nil), blobMagic...),
+		encodeOne(func(e *postcard.Encoder) {
+			encodeDescriptor(e, blobDescriptor{inline: true, value: []byte("inner")})
+		})...)
+	got, split, _, err = resolveRowValue(inline)
+	if err != nil || split || string(got) != "inner" {
+		t.Fatalf("inline = (%q, %v, %v)", got, split, err)
+	}
+	desc := blobDescriptor{bytes: 100, digest: hash([]byte("x")), count: 2}
+	wrapped := append(append([]byte(nil), blobMagic...),
+		encodeOne(func(e *postcard.Encoder) { encodeDescriptor(e, desc) })...)
+	_, split, gotDesc, err := resolveRowValue(wrapped)
+	if err != nil || !split || gotDesc == nil || gotDesc.count != 2 {
+		t.Fatalf("split = (%v, %+v, %v)", split, gotDesc, err)
+	}
+	if _, _, _, err := resolveRowValue(append(append([]byte(nil), blobMagic...), 0xff)); err == nil {
+		t.Fatal("bad descriptor accepted")
+	}
+}
+
+func TestStashBlobRoundTrip(t *testing.T) {
+	value := bytes.Repeat([]byte("0123456789abcdef"), 5000) // 80KB: 2 pieces
+	digest := hash(value)
+	desc := blobDescriptor{bytes: len(value), digest: digest, count: 2}
+	rowKey := []byte("04/meta/row/T1/abc123")
+	pending := map[string]*pendingBlob{}
+	if err := stashBlobDescriptor(pending, rowKey, 7, &desc); err != nil {
+		t.Fatalf("stash descriptor: %v", err)
+	}
+	// Unknown pieces park as orphans; stale digests are ignored.
+	orphans := map[string][]byte{}
+	if _, _, _, done, err := stashBlobPiece(pending, orphans, []byte("11/blob/unknown/00/00000000"), value); err != nil || done {
+		t.Fatalf("unknown piece = (%v, %v)", done, err)
+	}
+	if len(orphans) != 1 {
+		t.Fatalf("orphans = %d, want 1", len(orphans))
+	}
+	staleKey := []byte("11/blob/" + hashHex(rowKey) + "/" + strings.Repeat("0", 64) + "/00000000")
+	if _, _, _, done, err := stashBlobPiece(pending, nil, staleKey, value); err != nil || done {
+		t.Fatalf("stale piece = (%v, %v)", done, err)
+	}
+	// Real pieces complete the row (out of order).
+	p0 := pieceKey(rowKey, digest, 0)
+	p1 := pieceKey(rowKey, digest, 1)
+	if _, _, _, done, err := stashBlobPiece(pending, nil, p1, value[blobPiece:]); err != nil || done {
+		t.Fatalf("piece 1 = (%v, %v)", done, err)
+	}
+	key, out, seq, done, err := stashBlobPiece(pending, nil, p0, value[:blobPiece])
+	if err != nil || !done {
+		t.Fatalf("piece 0 = (%v, %v)", done, err)
+	}
+	if !bytes.Equal(key, rowKey) || !bytes.Equal(out, value) || seq != 7 {
+		t.Fatal("reassembled mismatch")
+	}
+	if len(pending) != 0 {
+		t.Fatal("pending not drained")
+	}
+	// Bad bounds and indexes fail closed.
+	bad := blobDescriptor{bytes: 10, digest: digest, count: 99}
+	if err := stashBlobDescriptor(map[string]*pendingBlob{}, rowKey, 1, &bad); err == nil {
+		t.Fatal("bad bounds accepted")
+	}
+	pending2 := map[string]*pendingBlob{}
+	if err := stashBlobDescriptor(pending2, rowKey, 1, &desc); err != nil {
+		t.Fatalf("stash: %v", err)
+	}
+	badIdx := []byte("11/blob/" + hashHex(rowKey) + "/" + hexEncode(digest[:]) + "/00000005")
+	if _, _, _, _, err := stashBlobPiece(pending2, nil, badIdx, value); err == nil {
+		t.Fatal("bad index accepted")
+	}
+	// Piece before descriptor: parks, then adopts.
+	pending3 := map[string]*pendingBlob{}
+	orphans3 := map[string][]byte{}
+	if _, _, _, done, err := stashBlobPiece(pending3, orphans3, p0, value[:blobPiece]); err != nil || done {
+		t.Fatalf("early piece = (%v, %v)", done, err)
+	}
+	if err := stashBlobDescriptor(pending3, rowKey, 7, &desc); err != nil {
+		t.Fatalf("late descriptor: %v", err)
+	}
+	if _, _, _, done, err := stashBlobPiece(pending3, nil, p1, value[blobPiece:]); err != nil || done {
+		t.Fatalf("piece 1 = (%v, %v)", done, err)
+	}
+	_, out2, _, done2, err := stashBlobPiece(pending3, nil, p0, orphans3[string(p0)])
+	if err != nil || !done2 || !bytes.Equal(out2, value) {
+		t.Fatalf("adopted piece = (%v, %v)", done2, err)
+	}
+}
+
+func TestRecoveryBuildLargeRow(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "db")
+	db := openRecoveryDB(t, path, OpenCreateNew)
+	if err := db.Migrate(NewMigration(`CREATE TABLE big (
+		id INTEGER NOT NULL PRIMARY KEY,
+		payload BLOB NOT NULL
+	)`)); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	big := bytes.Repeat([]byte("0123456789abcdef"), 1<<16) // 1MB: forces split
+	small := []byte("tiny")
+	for i, payload := range [][]byte{big, small} {
+		if _, err := db.Transaction(func(sql *Sql) (any, error) {
+			return sql.Execute("INSERT INTO big (id, payload) VALUES (?, ?)", i+1, payload)
+		}); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+	}
+	if err := db.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	before := dumpRecoveryRows(t, db, "SELECT id, payload FROM big ORDER BY id")
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	db2, err := Open(path, testKey(), recoveryTestOptions())
+	if err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	defer db2.Close()
+	st := waitRecoveryBuild(t, db2, 60*time.Second)
+	if st.Rows != 2 {
+		t.Fatalf("rows = %d, want 2", st.Rows)
+	}
+	g := openTestGeneration(t, db2, filepath.Join(path, "recovery"))
+	rs, err := g.OpenRuns()
+	if err != nil {
+		t.Fatalf("open runs: %v", err)
+	}
+	var cached []*recovery.Row
+	for {
+		r, err := rs.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			t.Fatalf("stream: %v", err)
+		}
+		cached = append(cached, r)
+	}
+	if err := rs.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if len(cached) != 2 {
+		t.Fatalf("streamed %d rows", len(cached))
+	}
+	schema, err := currentTestSchema(db2)
+	if err != nil {
+		t.Fatalf("schema: %v", err)
+	}
+	var tableID string
+	for _, tbl := range schema.Tables {
+		if tbl.Name == "big" {
+			tableID = tbl.ID
+		}
+	}
+	want := toSet(strings.Split(strings.TrimSuffix(before, "\n"), "\n"))
+	got := toSet(dumpCachedTable(t, schema, tableID, cached))
+	if len(got) != len(want) {
+		t.Fatalf("cached %d rows, want %d", len(got), len(want))
+	}
+	for line, n := range want {
+		if got[line] != n {
+			t.Fatal("large-row cached mismatch")
+		}
+	}
+	// Legacy state still matches.
+	after := dumpRecoveryRows(t, db2, "SELECT id, payload FROM big ORDER BY id")
+	if after != before {
+		t.Fatal("large-row data mismatch after build")
 	}
 }
 
